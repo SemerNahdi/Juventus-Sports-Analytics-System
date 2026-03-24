@@ -14,30 +14,27 @@
 </head>
 <body>
     <div class="app-container">
-        <!-- Sidebar Navigation (Visual Only) -->
-        <nav class="sidebar glass">
-            <div class="brand">
-                <div class="logo"></div>
-                <h2>JUVE<br><span>ANALYTICS</span></h2>
-            </div>
-            <ul class="nav-links">
-                <li class="active"><i class="icon-dashboard"></i> Dashboard</li>
-                <!-- <li><i class="icon-player"></i> Player Profiles</li>
-                <li><i class="icon-reports"></i> Reports</li>
-                <li><i class="icon-settings"></i> Settings</li>
-            </ul> -->
-        </nav>
-
         <!-- Main Content Area -->
         <main class="main-content">
             <!-- Header -->
             <header class="top-nav glass">
+                <div class="brand">
+                    <img src="juventus Logo.png" alt="Juventus Logo" class="brand-logo">
+                    <h2>JUVE <span>ANALYTICS</span></h2>
+                </div>
                 <div class="player-info" id="playerInfo">
                     <h1>Player Analysis</h1>
-                    <p class="subtitle" id="sessionInfo">Loading session data...</p>
                 </div>
                 <div class="actions">
-                    <button class="btn btn-primary">Export Report</button>
+                    <div class="theme-switch-wrapper">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon sun-icon"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M22 12h2"/><path d="m4.93 19.07 1.41-1.41"/><path d="m17.66 6.34 1.41-1.41"/></svg>
+                        <label class="theme-switch" for="checkbox">
+                            <input type="checkbox" id="checkbox" />
+                            <div class="slider round"></div>
+                        </label>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon moon-icon"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+                    </div>
+                    <button class="btn btn-primary" id="exportBtn">Export Report</button>
                 </div>
             </header>
 
@@ -46,6 +43,7 @@
                 
                 <!-- Video Section -->
                 <section class="video-section card glass span-8">
+                    <div class="info-tag" data-tooltip="Visual feedback showing tracked joints and dynamic hazard alerts.">i</div>
                     <div class="card-header">
                         <h3>Annotated Feed</h3>
                         <span class="badge live">LIVE</span>
@@ -61,44 +59,101 @@
                 <!-- KPI Summary Cards -->
                 <section class="kpi-section span-4 grid-column">
                     <div class="kpi-card glass risk-low" id="riskCard">
+                        <div class="info-tag" data-tooltip="Probability of injury/fall based on biomechanical anomalies.">i</div>
                         <div class="kpi-icon"></div>
                         <div class="kpi-details">
                             <h4>Peak Risk Score</h4>
-                            <h2 id="kpiRisk">--/100</h2>
+                            <div class="kpi-main">
+                                <h2 id="kpiRisk">--/100</h2>
+                                <div id="riskTrend" class="trend-indicator"></div>
+                            </div>
                             <p id="kpiRiskLabel">Overall Risk: --</p>
                         </div>
                     </div>
                     
                     <div class="kpi-card glass">
+                        <div class="info-tag" data-tooltip="Top velocity reached during the recorded movement.">i</div>
                         <div class="kpi-icon speed"></div>
                         <div class="kpi-details">
                             <h4>Max Speed</h4>
-                            <h2 id="kpiSpeed">-- m/s</h2>
+                            <div class="kpi-main">
+                                <h2 id="kpiSpeed">-- m/s</h2>
+                                <div id="speedTrend" class="trend-indicator"></div>
+                            </div>
                             <p id="kpiSpeedLabel">Avg: -- m/s</p>
                         </div>
                     </div>
                     
                     <div class="kpi-card glass">
+                        <div class="info-tag" data-tooltip="Calculated energy expenditure based on body mass and movement intensity.">i</div>
                         <div class="kpi-icon energy"></div>
                         <div class="kpi-details">
                             <h4>Est. Energy Burn</h4>
-                            <h2 id="kpiEnergy">-- kcal/hr</h2>
+                            <div class="kpi-main">
+                                <h2 id="kpiEnergy">-- kcal/hr</h2>
+                                <div id="energyTrend" class="trend-indicator"></div>
+                            </div>
                             <p id="kpiDistance">Dist: -- m</p>
                         </div>
                     </div>
 
                     <div class="kpi-card glass">
+                        <div class="info-tag" data-tooltip="Balance between left and right stride lengths. 100% is perfect symmetry.">i</div>
                         <div class="kpi-icon gait"></div>
                         <div class="kpi-details">
                             <h4>Gait Symmetry</h4>
-                            <h2 id="kpiSymmetry">-- %</h2>
+                            <div class="kpi-main">
+                                <h2 id="kpiSymmetry">-- %</h2>
+                                <div id="symmetryTrend" class="trend-indicator"></div>
+                            </div>
                             <p id="kpiCadence">Cadence: -- spm</p>
                         </div>
                     </div>
                 </section>
 
+                <!-- Detailed Gait Metrics Grid -->
+                <section class="span-12 card glass">
+                    <div class="info-tag" data-tooltip="Session-wide biomechanical averages.">i</div>
+                    <div class="card-header">
+                        <h3>Detailed Gait Biometrics</h3>
+                        <span class="subtitle">Extracted from bio.csv analysis</span>
+                    </div>
+                    <div class="gait-grid">
+                        <div class="gait-card">
+                            <div class="info-tag" data-tooltip="Lateral distance between feet.">i</div>
+                            <h5>Step Width</h5>
+                            <span class="value" id="valStepWidth">-- m</span>
+                        </div>
+                        <div class="gait-card">
+                            <div class="info-tag" data-tooltip="Torso lateral deviation.">i</div>
+                            <h5>Trunk Lean</h5>
+                            <span class="value" id="valTrunkLean">--°</span>
+                        </div>
+                        <div class="gait-card">
+                            <div class="info-tag" data-tooltip="Time both feet are on ground.">i</div>
+                            <h5>Double Support</h5>
+                            <span class="value" id="valDoubleSupport">--%</span>
+                        </div>
+                        <div class="gait-card">
+                            <div class="info-tag" data-tooltip="Pelvic axial rotation.">i</div>
+                            <h5>Pelvic Rotation</h5>
+                            <span class="value" id="valPelvicRot">--°</span>
+                        </div>
+                        <div class="gait-card">
+                            <div class="info-tag" data-tooltip="Front/Back torso lean.">i</div>
+                            <h5>Trunk Sagittal</h5>
+                            <span class="value" id="valTrunkSag">--°</span>
+                        </div>
+                        <div class="gait-card">
+                            <div class="info-tag" data-tooltip="Arm movement range.">i</div>
+                            <h5>Arm Swing</h5>
+                            <span class="value" id="valArmSwing">--°</span>
+                        </div>
+                    </div>
+                </section>
                 <!-- Charts Section -->
                 <section class="chart-section span-6 card glass">
+                    <div class="info-tag" data-tooltip="Session speed and acceleration profiles.">i</div>
                     <div class="card-header">
                         <h3>Speed & Acceleration Metrics</h3>
                     </div>
@@ -108,6 +163,7 @@
                 </section>
 
                 <section class="chart-section span-6 card glass">
+                    <div class="info-tag" data-tooltip="Real-time risk scores and estimated joint stress levels.">i</div>
                     <div class="card-header">
                         <h3>Risk Analysis over Time</h3>
                     </div>
@@ -116,7 +172,29 @@
                     </div>
                 </section>
 
+                <!-- Refined Gait Analytics Section -->
+                <section class="chart-section span-6 card glass">
+                    <div class="info-tag" data-tooltip="Comparison of stride reach and step frequency (Cadence). Important for efficiency.">i</div>
+                    <div class="card-header">
+                        <h3>Gait Rhythm (Stride vs. Cadence)</h3>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="rhythmChart"></canvas>
+                    </div>
+                </section>
+
+                <section class="chart-section span-6 card glass">
+                    <div class="info-tag" data-tooltip="Balance between foot-ground contact (Step) and aerial phase (Flight).">i</div>
+                    <div class="card-header">
+                        <h3>Step Timing (Step vs. Flight)</h3>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="timingChart"></canvas>
+                    </div>
+                </section>
+
                 <section class="chart-section span-12 card glass">
+                    <div class="info-tag" data-tooltip="Dynamic knee angle tracking comparing left vs right flexion.">i</div>
                     <div class="card-header">
                         <h3>Knee Joint Angles (Flexion)</h3>
                     </div>
