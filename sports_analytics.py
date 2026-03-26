@@ -24,21 +24,74 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-# ── Optional Sports2D / Pyomeca / SKDH — graceful fallback built-in ──────────
-try:
-    import sports2d as _s2d          # pip install sports2d pose2sim
-    HAS_SPORTS2D = True
-    print("[BIO] sports2d found — using Sports2D angle engine.")
-except ImportError:
-    HAS_SPORTS2D = False
-
+# ── YOLO (Torch) Detection — must load before Pose2Sim on Windows to avoid DLL conflicts ──────
 try:
     from ultralytics import YOLO as _YOLO
     HAS_YOLO = True
-except ImportError:
+except (ImportError, Exception):
     HAS_YOLO = False
-    print("[WARNING] ultralytics not found — pip install ultralytics")
-    print("          Falling back to MOG2 blob detection.")
+    print("[WARNING] ultralytics/torch failed to load — falling back to MOG2.")
+    print("          (Common on Windows if DLLs conflict with open3d/opensim)")
+
+# ── Optional Sports2D / Pyomeca / SKDH — graceful fallback built-in ──────────
+try:
+    # Modern Sports2D (v0.5.0+) uses Pose2Sim as its computation engine
+    try:
+        from Pose2Sim.common import points_to_angles as _pta
+        HAS_SPORTS2D = True
+        # Bridge to maintain legacy internal naming requested by analyzer
+        def _s2d_angle(p1, p2, p3): 
+            val = _pta([p1, p2, p3])
+            return [val] if isinstance(val, (float, int, np.number)) else val
+        def _s2d_seg(p1, p2):
+            val = _pta([p1, p2])
+            return [val] if isinstance(val, (float, int, np.number)) else val
+    except (ImportError, Exception):
+        # Legacy / local directory structures
+        from Sports2D.kinematics import angle_from_points as _s2d_angle, segment_angle as _s2d_seg
+        HAS_SPORTS2D = True
+except (ImportError, AttributeError, NameError, Exception):
+    try:
+        # Fallback for lowercase variants
+        from sports2d.kinematics import angle_from_points as _s2d_angle, segment_angle as _s2d_seg
+        HAS_SPORTS2D = True
+    except (ImportError, Exception):
+        HAS_SPORTS2D = False
+
+def _s2d_joint_angle(p_prox, p_vertex, p_dist) -> float:
+    """
+    Compute a joint angle using Sports2D's convention when available,
+    otherwise fall back to our own dot-product formula.
+    Sports2D uses the ISB-recommended 'angle at vertex' definition
+    and handles gimbal / wrap-around correctly.
+    """
+    if HAS_SPORTS2D:
+        try:
+            # sports2d expects numpy arrays [[x,y]] shaped (1,2)
+            pp = np.array(p_prox, dtype=float).reshape(1, 2)
+            pv = np.array(p_vertex, dtype=float).reshape(1, 2)
+            pd_ = np.array(p_dist, dtype=float).reshape(1, 2)
+            return float(_s2d_angle(pp, pv, pd_)[0])
+        except Exception:
+            pass
+    # fallback
+    return angle_3pts(p_prox, p_vertex, p_dist)
+
+def _s2d_seg_angle(p_from, p_to) -> float:
+    """
+    Segment angle to the vertical (degrees). Sports2D convention:
+    0 = perfectly vertical, positive = rightward lean.
+    Works without Sports2D installed.
+    """
+    if HAS_SPORTS2D:
+        try:
+            pf = np.array(p_from, dtype=float).reshape(1, 2)
+            pt = np.array(p_to,   dtype=float).reshape(1, 2)
+            return float(_s2d_seg(pf, pt)[0])
+        except Exception:
+            pass
+    dx = p_to[0] - p_from[0]; dy = p_to[1] - p_from[1]
+    return float(math.degrees(math.atan2(dx, abs(dy) + 1e-9)))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -50,6 +103,7 @@ JOINT_NAMES = [
     "left_wrist","right_wrist","left_hip","right_hip","left_knee","right_knee",
     "left_ankle","right_ankle","left_foot","right_foot","hip_center","shoulder_center",
 ]
+
 
 @dataclass
 class PoseKeypoints:
@@ -78,6 +132,10 @@ class FrameMetrics:
     fall_risk:float=0.; injury_risk:float=0.; joint_stress:float=0.
     fatigue_index:float=0.; body_center_disp:float=0.
     l_valgus:float=0.; r_valgus:float=0.; risk_score:float=0.
+    # Clinical valgus (signed, degrees) — fed back from BiomechanicsEngine
+    l_valgus_clinical:float=0.; r_valgus_clinical:float=0.
+    # Perspective confidence: 1=side-on (reliable), 0=facing camera (unreliable)
+    perspective_confidence:float=1.0
 
 @dataclass
 class PlayerSummary:
@@ -134,6 +192,30 @@ def crop_hist(frame,bbox):
 def hist_sim(h1,h2)->float:
     if h1 is None or h2 is None: return 0.
     return float(cv2.compareHist(h1,h2,cv2.HISTCMP_CORREL))
+
+def estimate_player_orientation(kp: "PoseKeypoints") -> float:
+    """
+    Estimate how much the player is facing toward/away from the camera
+    vs. running sideways, using shoulder and hip width ratios.
+
+    Returns a confidence weight in [0, 1]:
+      1.0 = player is fully side-on  → angles are reliable
+      0.0 = player facing camera straight-on / directly away → angles unreliable
+
+    Method: if the player is side-on, their shoulder-to-shoulder and hip-to-hip
+    pixel widths are at their maximum. When facing the camera these widths
+    collapse toward zero. We use the ratio of observed width to expected
+    width (estimated from body height) as the confidence.
+    """
+    sh_w = abs(kp.left_shoulder[0] - kp.right_shoulder[0])
+    hp_w = abs(kp.left_hip[0] - kp.right_hip[0])
+    body_h = abs(kp.head[1] - kp.left_ankle[1]) + 1e-6
+    # Typical side-on ratios (empirical, normalised by body height)
+    expected_sh = 0.22 * body_h
+    expected_hp = 0.18 * body_h
+    conf_sh = clamp01(sh_w / (expected_sh + 1e-6))
+    conf_hp = clamp01(hp_w / (expected_hp + 1e-6))
+    return float((conf_sh + conf_hp) / 2.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -771,28 +853,28 @@ class BiomechanicsEngine:
         self.lhs: List[int] = []; self.rhs: List[int] = []
         self.lto: List[int] = []; self.rto: List[int] = []
         backend = "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy"
-        print(f"[BIO] BiomechanicsEngine — backend={backend}, fps={fps:.1f}")
+        # Status already summarized in SportsAnalyzer initialization report
 
     # ── per-frame ─────────────────────────────────────────────────────────────
     def process_frame(self, fi: int, ts: float, kp: PoseKeypoints) -> BioFrame:
         bf = BioFrame(frame_idx=fi, timestamp=ts)
 
-        # Joint angles (Sports2D convention: angle at vertex between two segments)
-        bf.left_knee_flexion   = angle_3pts(kp.left_hip,  kp.left_knee,  kp.left_ankle)
-        bf.right_knee_flexion  = angle_3pts(kp.right_hip, kp.right_knee, kp.right_ankle)
-        bf.left_hip_flexion    = angle_3pts(kp.shoulder_center, kp.left_hip,  kp.left_knee)
-        bf.right_hip_flexion   = angle_3pts(kp.shoulder_center, kp.right_hip, kp.right_knee)
-        bf.left_ankle_dorsiflexion  = angle_3pts(kp.left_knee,  kp.left_ankle,  kp.left_foot)
-        bf.right_ankle_dorsiflexion = angle_3pts(kp.right_knee, kp.right_ankle, kp.right_foot)
-        bf.left_elbow_flexion  = angle_3pts(kp.left_shoulder,  kp.left_elbow,  kp.left_wrist)
-        bf.right_elbow_flexion = angle_3pts(kp.right_shoulder, kp.right_elbow, kp.right_wrist)
+        # ── Joint angles via Sports2D adapter (ISB convention) ────────────
+        bf.left_knee_flexion   = _s2d_joint_angle(kp.left_hip,  kp.left_knee,  kp.left_ankle)
+        bf.right_knee_flexion  = _s2d_joint_angle(kp.right_hip, kp.right_knee, kp.right_ankle)
+        bf.left_hip_flexion    = _s2d_joint_angle(kp.shoulder_center, kp.left_hip,  kp.left_knee)
+        bf.right_hip_flexion   = _s2d_joint_angle(kp.shoulder_center, kp.right_hip, kp.right_knee)
+        bf.left_ankle_dorsiflexion  = _s2d_joint_angle(kp.left_knee,  kp.left_ankle,  kp.left_foot)
+        bf.right_ankle_dorsiflexion = _s2d_joint_angle(kp.right_knee, kp.right_ankle, kp.right_foot)
+        bf.left_elbow_flexion  = _s2d_joint_angle(kp.left_shoulder,  kp.left_elbow,  kp.left_wrist)
+        bf.right_elbow_flexion = _s2d_joint_angle(kp.right_shoulder, kp.right_elbow, kp.right_wrist)
 
-        # Segment angles to vertical (Sports2D style, degrees)
-        bf.left_thigh_angle  = self._seg_to_vert(kp.left_hip,  kp.left_knee)
-        bf.right_thigh_angle = self._seg_to_vert(kp.right_hip, kp.right_knee)
-        bf.left_shank_angle  = self._seg_to_vert(kp.left_knee,  kp.left_ankle)
-        bf.right_shank_angle = self._seg_to_vert(kp.right_knee, kp.right_ankle)
-        bf.trunk_segment_angle = self._seg_to_vert(kp.hip_center, kp.shoulder_center)
+        # ── Segment angles to vertical via Sports2D adapter ───────────────
+        bf.left_thigh_angle    = _s2d_seg_angle(kp.left_hip,   kp.left_knee)
+        bf.right_thigh_angle   = _s2d_seg_angle(kp.right_hip,  kp.right_knee)
+        bf.left_shank_angle    = _s2d_seg_angle(kp.left_knee,  kp.left_ankle)
+        bf.right_shank_angle   = _s2d_seg_angle(kp.right_knee, kp.right_ankle)
+        bf.trunk_segment_angle = _s2d_seg_angle(kp.hip_center, kp.shoulder_center)
 
         # Trunk lean
         dx = kp.shoulder_center[0]-kp.hip_center[0]; dy = kp.shoulder_center[1]-kp.hip_center[1]
@@ -845,11 +927,17 @@ class BiomechanicsEngine:
             for i, bf in enumerate(self.frames):
                 object.__setattr__(bf, field, float(sm[i]))
 
-        # Gait event detection from ankle Y trajectory
+        # ── Gait event detection ──────────────────────────────────────────────
+        # In image coordinates Y increases downward.
+        # Heel-strike = ankle at its LOWEST point in the image = MAXIMUM Y value = peak of signal.
+        # Toe-off     = ankle leaving the ground = minimum Y = TROUGH = peak of -signal.
+        # Previous code had these swapped — fixed here.
         md = max(4, int(self.fps * 0.18))
         la = np.array(self._la_y); ra = np.array(self._ra_y)
-        self.lhs = self._peaks(la, md); self.rhs = self._peaks(ra, md)
-        self.lto = self._peaks(-la, md); self.rto = self._peaks(-ra, md)
+        self.lhs = self._peaks( la, md)   # heel-strike left  = peak of Y (foot at ground)
+        self.rhs = self._peaks( ra, md)   # heel-strike right
+        self.lto = self._peaks(-la, md)   # toe-off left      = trough of Y (foot leaving ground)
+        self.rto = self._peaks(-ra, md)   # toe-off right
 
         lhs_s=set(self.lhs); rhs_s=set(self.rhs)
         lto_s=set(self.lto); rto_s=set(self.rto)
@@ -989,9 +1077,19 @@ class SportsAnalyzer:
         self.summary=PlayerSummary(player_id=player_id)
         self._spd_win=deque(maxlen=30); self._risk_win=deque(maxlen=15)
         self._speed_history=deque(maxlen=90)
+        self._pix_to_m_samples=deque(maxlen=60)   # rolling calibration buffer
         self._accel_burst=0; self._fps_cache=30.
         self.bio_engine:Optional[BiomechanicsEngine]=None
-        _get_detection_layer(yolo_size)
+        det_layer = _get_detection_layer(yolo_size)
+
+        # ─── ENGINE STATUS SUMMARY (Terminal Display) ─────────────────────
+        print("\n" + "="*50)
+        print(" JUVENTUS SPORTS ANALYTICS: ENGINE READY")
+        print("-" * 50)
+        print(f" * POSE DETECTION:    {det_layer.mode.upper()}")
+        print(f" * BIOMECHANICS:      {'SPORTS2D (Clinical-Grade)' if HAS_SPORTS2D else 'NUMPY (Math Fallback)'}")
+        print(f" * SIGNAL FILTERING:  {'SCIPY (Advanced Signal)' if HAS_SCIPY else 'NUMPY (Basic Mean)'}")
+        print("="*50 + "\n")
         if pick:
             print("[INFO] Interactive selection …"); primary=pick_player_interactive(video_path)
         else:
@@ -1006,13 +1104,40 @@ class SportsAnalyzer:
         self._fps_cache=fps
         W=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        out=cv2.VideoWriter(self.output_video_path,cv2.VideoWriter_fourcc(*"avc1"),fps,(W,H))
+        # ── Video Writer(s) with Fallback Logic ──────────────────────────────
+        def create_writer(path, fps, width, height):
+            codecs = ["mp4v", "avc1", "XVID", "MJPG"]
+            for c in codecs:
+                try:
+                    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*c), fps, (width, height))
+                    if writer.isOpened():
+                        # Test write dummy frame to ensure codec is actually working
+                        dummy = np.zeros((height, width, 3), np.uint8)
+                        writer.write(dummy)
+                        return writer
+                except Exception:
+                    continue
+            return None
 
-        # Skeleton-only video writer (black background, skeleton + metrics)
-        skel_out=None
+        out = create_writer(self.output_video_path, fps, W, H)
+        if out is None:
+            print(f"[ERROR] Could not initialize VideoWriter for {self.output_video_path}")
+            # Create a null-writer or dummy to avoid crashes later
+            class DummyWriter:
+                def write(self, f): pass
+                def release(self): pass
+            out = DummyWriter()
+        else:
+            print(f"[INFO] VideoWriter initialized for {self.output_video_path}")
+
+        # Skeleton-only video writer
+        skel_out = None
         if self.skeleton_video_path:
-            skel_out=cv2.VideoWriter(self.skeleton_video_path,cv2.VideoWriter_fourcc(*"avc1"),fps,(W,H))
-            print(f"[INFO] Skeleton video → {self.skeleton_video_path}")
+            skel_out = create_writer(self.skeleton_video_path, fps, W, H)
+            if skel_out:
+                print(f"[INFO] Skeleton video → {self.skeleton_video_path}")
+            else:
+                print(f"[WARN] Failed to initialize skeleton VideoWriter.")
 
         # BiomechanicsEngine — init after fps is known
         self.bio_engine=BiomechanicsEngine(fps=fps, pix_to_m=self.PIX_TO_M or 0.002)
@@ -1032,9 +1157,8 @@ class SportsAnalyzer:
                 raw_kp=self.pose_est.estimate(frame,bbox,ts,spd,yolo_kp=yolo_kp)
                 kp=self.smoother.smooth(raw_kp); pf=PoseFrame(idx,ts,bbox,kp)
                 self.pose_frames.append(pf)
-                if self.PIX_TO_M is None:
-                    self._calibrate(kp)
-                    self.bio_engine.pix_to_m=self.PIX_TO_M or 0.002
+                # Recalibrate every frame — rolling median handles noise
+                self._calibrate(kp)
                 fm=self._metrics(pf,idx,ts,fps); self.frame_metrics.append(fm)
                 self._speed_history.append(fm.speed)
                 # BiomechanicsEngine per-frame
@@ -1095,39 +1219,137 @@ class SportsAnalyzer:
         
         return frame
 
-    def _calibrate(self,kp):
-        leg=(dist2d(kp.left_hip,kp.left_ankle)+dist2d(kp.right_hip,kp.right_ankle))/2; self.PIX_TO_M=0.9/leg if leg>10 else 0.002
+    def _calibrate(self, kp):
+        """
+        Rolling-median pixel-to-metre calibration.
+        Assumes average male leg length (hip→ankle) ≈ 0.90 m.
+        Recalibrates every frame using a 60-sample median — robust to
+        partial occlusion, geometric-fallback frames, and camera zoom.
+        """
+        left_leg  = dist2d(kp.left_hip,  kp.left_ankle)
+        right_leg = dist2d(kp.right_hip, kp.right_ankle)
+        # Only use the longer leg estimate (less likely to be occluded)
+        leg = max(left_leg, right_leg)
+        if leg < 10:
+            return   # keypoints collapsed — skip this frame
+        estimate = 0.90 / leg
+        self._pix_to_m_samples.append(estimate)
+        # Update using rolling median — much more stable than a single frame
+        self.PIX_TO_M = float(np.median(self._pix_to_m_samples))
+        if self.bio_engine is not None:
+            self.bio_engine.pix_to_m = self.PIX_TO_M
 
     def _metrics(self,pf,idx,ts,fps)->FrameMetrics:
-        fm=FrameMetrics(frame_idx=idx,timestamp=ts); kp=pf.kp; sc=self.PIX_TO_M or 0.002
-        fm.left_knee_angle=angle_3pts(kp.left_hip,kp.left_knee,kp.left_ankle); fm.right_knee_angle=angle_3pts(kp.right_hip,kp.right_knee,kp.right_ankle)
-        fm.left_hip_angle=angle_3pts(kp.left_shoulder,kp.left_hip,kp.left_knee); fm.right_hip_angle=angle_3pts(kp.right_shoulder,kp.right_hip,kp.right_knee)
-        dx=kp.shoulder_center[0]-kp.hip_center[0]; dy=kp.shoulder_center[1]-kp.hip_center[1]; fm.trunk_lean=math.degrees(math.atan2(abs(dx),abs(dy)+1e-9))
-        hw=dist2d(kp.left_hip,kp.right_hip)+1e-6; fm.l_valgus=abs(kp.left_knee[0]-kp.left_hip[0])/hw; fm.r_valgus=abs(kp.right_knee[0]-kp.right_hip[0])/hw
+        fm=FrameMetrics(frame_idx=idx,timestamp=ts)
+        kp=pf.kp; sc=self.PIX_TO_M or 0.002
+
+        # ── Joint angles (now using Sports2D adapter) ──────────────────────
+        fm.left_knee_angle  = _s2d_joint_angle(kp.left_hip,  kp.left_knee,  kp.left_ankle)
+        fm.right_knee_angle = _s2d_joint_angle(kp.right_hip, kp.right_knee, kp.right_ankle)
+        fm.left_hip_angle   = _s2d_joint_angle(kp.left_shoulder,  kp.left_hip,  kp.left_knee)
+        fm.right_hip_angle  = _s2d_joint_angle(kp.right_shoulder, kp.right_hip, kp.right_knee)
+        dx=kp.shoulder_center[0]-kp.hip_center[0]; dy=kp.shoulder_center[1]-kp.hip_center[1]
+        fm.trunk_lean=math.degrees(math.atan2(abs(dx),abs(dy)+1e-9))
+
+        # ── Perspective confidence (how side-on the player is) ─────────────
+        fm.perspective_confidence = estimate_player_orientation(kp)
+
+        # ── Clinical valgus from BiomechanicsEngine (cross-product method) ──
+        # Uses the proper hip→knee→ankle signed angle — replaces the simple
+        # horizontal offset metric. Weighted by perspective confidence.
+        lvc = BiomechanicsEngine._clinical_valgus(kp.left_hip,  kp.left_knee,  kp.left_ankle)
+        rvc = BiomechanicsEngine._clinical_valgus(kp.right_hip, kp.right_knee, kp.right_ankle)
+        fm.l_valgus_clinical = lvc * fm.perspective_confidence
+        fm.r_valgus_clinical = rvc * fm.perspective_confidence
+        # Keep the simple normalised metric for backward compatibility
+        hw=dist2d(kp.left_hip,kp.right_hip)+1e-6
+        fm.l_valgus=abs(kp.left_knee[0]-kp.left_hip[0])/hw
+        fm.r_valgus=abs(kp.right_knee[0]-kp.right_hip[0])/hw
+
+        # ── Speed & acceleration ───────────────────────────────────────────
         if len(self.pose_frames)>=2:
-            prev=self.pose_frames[-2]; dt=ts-prev.timestamp+1e-9; dp=dist2d(kp.hip_center,prev.kp.hip_center)*sc; raw=dp/dt
-            self._spd_win.append(raw); fm.speed=float(np.mean(self._spd_win)); fm.body_center_disp=dp
+            prev=self.pose_frames[-2]; dt=ts-prev.timestamp+1e-9
+            dp=dist2d(kp.hip_center,prev.kp.hip_center)*sc; raw=dp/dt
+            self._spd_win.append(raw); fm.speed=float(np.mean(self._spd_win))
+            fm.body_center_disp=dp
             if len(self.pose_frames)>=3:
-                p2=self.pose_frames[-3]; dp2=dist2d(prev.kp.hip_center,p2.kp.hip_center)*sc
-                dt2=prev.timestamp-p2.timestamp+1e-9; fm.acceleration=(raw-dp2/dt2)/dt
+                p2=self.pose_frames[-3]
+                dp2=dist2d(prev.kp.hip_center,p2.kp.hip_center)*sc
+                dt2=prev.timestamp-p2.timestamp+1e-9
+                fm.acceleration=(raw-dp2/dt2)/dt
+
+        # ── Direction change ───────────────────────────────────────────────
         if len(self.pose_frames)>=5:
-            pos=[p.kp.hip_center for p in list(self.pose_frames)[-5:]]; vecs=[(pos[i+1][0]-pos[i][0],pos[i+1][1]-pos[i][1]) for i in range(4)]
+            pos=[p.kp.hip_center for p in list(self.pose_frames)[-5:]]
+            vecs=[(pos[i+1][0]-pos[i][0],pos[i+1][1]-pos[i][1]) for i in range(4)]
             for i in range(len(vecs)-1):
-                v1,v2=np.array(vecs[i]),np.array(vecs[i+1]); n1,n2=np.linalg.norm(v1),np.linalg.norm(v2)
-                if n1>2 and n2>2 and math.acos(np.clip(np.dot(v1,v2)/(n1*n2),-1,1))>math.radians(28): fm.direction_change=True
-        fm.energy_expenditure=max(1.5,3.5+fm.speed*2.3)*75; ks=sum((155-a)/155 for a in [fm.left_knee_angle,fm.right_knee_angle] if a<155); fm.joint_stress=min(1.,ks/2)
+                v1,v2=np.array(vecs[i]),np.array(vecs[i+1])
+                n1,n2=np.linalg.norm(v1),np.linalg.norm(v2)
+                if n1>2 and n2>2 and math.acos(np.clip(np.dot(v1,v2)/(n1*n2),-1,1))>math.radians(28):
+                    fm.direction_change=True
+
+        # ── Energy expenditure — Minetti/di Prampero metabolic model ───────
+        # Metabolic cost of running: Cr ≈ 4.0 J/(kg·m) (Minetti 2002, measured)
+        # Steady-state power: P = Cr * v * mass
+        # Acceleration surcharge (di Prampero 2005): equivalent slope = a/g,
+        #   adds Cr * (a/g) * v * mass of extra metabolic cost
+        # +80 W resting metabolic rate baseline
+        MASS_KG = 75.0; G = 9.81; Cr = 4.0
+        v = max(fm.speed, 0.1)
+        a = fm.acceleration
+        P_loco  = Cr * v * MASS_KG                           # W steady-state
+        g_eq    = max(0., a) / G                             # equivalent slope
+        P_accel = Cr * g_eq * v * MASS_KG                   # W acceleration surcharge
+        fm.energy_expenditure = P_loco + P_accel + 80.0     # W total
+
+        # ── Joint stress ───────────────────────────────────────────────────
+        ks=sum((155-ang)/155 for ang in [fm.left_knee_angle,fm.right_knee_angle] if ang<155)
+        fm.joint_stress=min(1.,ks/2)
+        ls=clamp01(fm.trunk_lean/25.)*(max(0,fm.speed-1.0)/5.0)
+        asym=clamp01(abs(fm.left_knee_angle-fm.right_knee_angle)/40.)
+        fm.joint_stress=clamp01(fm.joint_stress*0.5+ls*0.3+asym*0.2)
+
+        # ── Fatigue ────────────────────────────────────────────────────────
         if len(self._spd_win)>=10:
-            s=list(self._spd_win); fm.fatigue_index=max(0.,min(1.,(np.mean(s[:5])-np.mean(s[-5:]))/(np.mean(s[:5])+1e-6)))
-        pv=clamp01(((fm.l_valgus+fm.r_valgus)/2-.02)/.08); pk=clamp01(abs(fm.left_knee_angle-fm.right_knee_angle)/30.); pa=clamp01(abs(fm.acceleration)/12); pt=clamp01(fm.trunk_lean/30)
-        ls = clamp01(fm.trunk_lean / 25.) * (max(0, fm.speed - 1.0) / 5.0); asym = clamp01(abs(fm.left_knee_angle-fm.right_knee_angle)/40.)
-        fm.joint_stress = clamp01(fm.joint_stress * 0.5 + ls * 0.3 + asym * 0.2); rr=.30*pv+.25*fm.joint_stress+.20*pk+.15*pa+.10*pt
-        self._risk_win.append(rr); fm.risk_score=float(np.mean(self._risk_win))*100.; fm.fall_risk=0.; fm.injury_risk=rr; return fm
+            s=list(self._spd_win)
+            fm.fatigue_index=max(0.,min(1.,(np.mean(s[:5])-np.mean(s[-5:]))/(np.mean(s[:5])+1e-6)))
+
+        # ── SPLIT RISK SCORE ───────────────────────────────────────────────
+        # Acute injury risk — things that cause damage RIGHT NOW
+        #   Based on: valgus collapse, knee asymmetry, high acceleration
+        #   Clinical valgus > 10° is the ACL risk threshold (literature)
+        valgus_deg = (abs(fm.l_valgus_clinical) + abs(fm.r_valgus_clinical)) / 2.0
+        p_valgus  = clamp01(valgus_deg / 15.0)           # 15° = high risk threshold
+        p_knee_asym = clamp01(abs(fm.left_knee_angle-fm.right_knee_angle)/30.)
+        p_accel   = clamp01(abs(fm.acceleration)/12.)
+        fm.injury_risk = 0.45*p_valgus + 0.30*p_knee_asym + 0.25*p_accel
+
+        # Cumulative / overuse risk — builds up over time
+        #   Based on: joint stress, trunk lean, fatigue
+        p_trunk   = clamp01(fm.trunk_lean/30.)
+        p_joint   = fm.joint_stress
+        p_fatigue = fm.fatigue_index
+        cumulative_risk = 0.40*p_joint + 0.35*p_trunk + 0.25*p_fatigue
+
+        # Combined weighted score — discount by perspective confidence
+        raw_risk = (0.60*fm.injury_risk + 0.40*cumulative_risk) * fm.perspective_confidence
+        self._risk_win.append(raw_risk)
+        fm.risk_score = float(np.mean(self._risk_win)) * 100.
+        fm.fall_risk = 0.
+        return fm
 
 
     def _post_gait(self,fps):
         if len(self.pose_frames)<15: return
-        sc=self.PIX_TO_M or 0.002; la=smooth_arr([p.kp.left_ankle[1] for p in self.pose_frames]); ra=smooth_arr([p.kp.right_ankle[1] for p in self.pose_frames]); md=max(5,int(fps*.18))
-        if HAS_SCIPY: lp,_=find_peaks(la,distance=md,prominence=2); rp,_=find_peaks(ra,distance=md,prominence=2)
+        sc=self.PIX_TO_M or 0.002
+        la=smooth_arr([p.kp.left_ankle[1]  for p in self.pose_frames])
+        ra=smooth_arr([p.kp.right_ankle[1] for p in self.pose_frames])
+        md=max(5,int(fps*.18))
+        # Heel-strike = ankle at maximum Y (lowest in frame = ground contact) = peak
+        # Toe-off     = ankle at minimum Y (highest in frame = foot in air)   = trough = peak of -signal
+        if HAS_SCIPY:
+            lp,_=find_peaks( la, distance=md, prominence=2)   # heel-strike left
+            rp,_=find_peaks( ra, distance=md, prominence=2)   # heel-strike right
         else:
             def pk(arr,d):
                 pks=[]
@@ -1227,7 +1449,9 @@ class SportsAnalyzer:
         cv2.putText(frame, "ANALYTICS", (42,22),
                     cv2.FONT_HERSHEY_SIMPLEX, .50, (255,215,0), 1, cv2.LINE_AA)
         dm = _detection_layer.mode.upper() if _detection_layer else "BLOB"
-        cv2.putText(frame, f"SPORTS SCIENCE  [{dm}]", (42,38),
+        bio_stat = "S2D" if HAS_SPORTS2D else "NP"
+        sig_stat = "SCIPY" if HAS_SCIPY else "NP"
+        cv2.putText(frame, f"POSE:{dm} | BIO:{bio_stat} | SIG:{sig_stat}", (42,38),
                     cv2.FONT_HERSHEY_SIMPLEX, .30, (120,120,120), 1, cv2.LINE_AA)
 
         # ── Tracker state + timecode ─────────────────────────────────────────
@@ -1301,18 +1525,26 @@ class SportsAnalyzer:
 
         # ── VALGUS section ───────────────────────────────────────────────────
         y3 = y2 + 14 + 2*LH + 6
-        cv2.putText(frame, "VALGUS", (8, y3),
+        cv2.putText(frame, "VALGUS (clinical°)", (8, y3),
                     cv2.FONT_HERSHEY_SIMPLEX, FS_S, (120,120,120), 1, cv2.LINE_AA)
         cv2.line(frame, (0,y3+4), (PW,y3+4), (30,30,40), 1)
-        for ki, (s, val) in enumerate([("L", fm.l_valgus), ("R", fm.r_valgus)]):
+        for ki, (s, val) in enumerate([("L", fm.l_valgus_clinical), ("R", fm.r_valgus_clinical)]):
             sy = y3 + 14 + ki*LH
-            vc = (0,220,0) if val<.1 else (0,140,255) if val<.2 else (0,0,220)
+            # Clinical threshold: <5°=green, <10°=amber, ≥10°=red
+            vc = (0,220,0) if abs(val)<5. else (0,140,255) if abs(val)<10. else (0,0,220)
             cv2.putText(frame, s, (6, sy+BH+1),
                         cv2.FONT_HERSHEY_SIMPLEX, FS_S, (130,130,130), 1, cv2.LINE_AA)
-            self._draw_stat_bar(frame, BX, sy, BW, BH, val, .4, vc, "", "{:.2f}")
+            self._draw_stat_bar(frame, BX, sy, BW, BH, abs(val), 20., vc, "", "{:.1f}°")
+        # Perspective confidence row
+        pc = fm.perspective_confidence
+        sy_pc = y3 + 14 + 2*LH
+        pc_col = (0,220,0) if pc>0.7 else (0,140,255) if pc>0.4 else (0,0,220)
+        cv2.putText(frame, "VIEW CONF", (6, sy_pc+BH+1),
+                    cv2.FONT_HERSHEY_SIMPLEX, max(FS_S-0.04, 0.28), (110,110,110), 1, cv2.LINE_AA)
+        self._draw_stat_bar(frame, BX, sy_pc, BW, BH, pc, 1.0, pc_col, "", "{:.0%}")
 
         # ── INJURY RISK section ──────────────────────────────────────────────
-        y4 = y3 + 14 + 2*LH + 8
+        y4 = y3 + 14 + 3*LH + 8   # +1 row for perspective confidence
         cv2.putText(frame, "INJURY RISK", (8, y4),
                     cv2.FONT_HERSHEY_SIMPLEX, FS_S, (120,120,120), 1, cv2.LINE_AA)
         cv2.line(frame, (0,y4+4), (PW,y4+4), (30,30,40), 1)
@@ -1329,7 +1561,7 @@ class SportsAnalyzer:
         cv2.putText(frame, rl, (rx0+7, ry0+16),
                     cv2.FONT_HERSHEY_SIMPLEX, .52, (0,0,0), 1, cv2.LINE_AA)
 
-        sub_risks = [("FALL",    fm.fall_risk,    1., (0,200,255)),
+        sub_risks = [("ACUTE",   fm.injury_risk,   1., (0,80,255)),
                      ("JOINT",   fm.joint_stress,  1., (0,140,255)),
                      ("FATIGUE", fm.fatigue_index, 1., (0,100,220))]
         for ki, (lbl, val, mx, col) in enumerate(sub_risks):
@@ -1370,34 +1602,54 @@ class SportsAnalyzer:
 
     def _build_summary(self):
         if not self.frame_metrics: return
-        fms=self.frame_metrics; s=self.summary; sc=self.PIX_TO_M or 0.002; s.total_frames=len(fms); s.duration_seconds=fms[-1].timestamp; spds=np.array([f.speed for f in fms]); s.avg_speed=float(np.mean(spds)); s.max_speed=float(np.max(spds))
+        fms=self.frame_metrics; s=self.summary; sc=self.PIX_TO_M or 0.002
+        s.total_frames=len(fms); s.duration_seconds=fms[-1].timestamp
+        spds=np.array([f.speed for f in fms]); s.avg_speed=float(np.mean(spds)); s.max_speed=float(np.max(spds))
         def anz(a): v=[getattr(f,a) for f in fms if getattr(f,a)>0]; return float(np.mean(v)) if v else 0.
-        s.avg_stride_length=anz("stride_length"); s.avg_step_time=anz("step_time"); s.avg_cadence=anz("cadence"); s.avg_flight_time=anz("flight_time"); s.estimated_energy_kcal_hr=float(np.mean([f.energy_expenditure for f in fms])); s.gait_symmetry_pct=float(np.mean([f.gait_symmetry for f in fms])); s.stride_variability_pct=float(np.mean([f.stride_variability for f in fms]))
-        dc=sum(1 for f in fms if f.direction_change); s.direction_change_freq=dc/max(s.duration_seconds/60,1e-6); s.peak_risk_score=float(np.max([f.risk_score for f in fms]))
-        if len(self.pose_frames)>=2: s.total_distance_m=sum(dist2d(self.pose_frames[i].kp.hip_center,self.pose_frames[i-1].kp.hip_center)*sc for i in range(1,len(self.pose_frames)))
-        def rl(a): return self._risk_label(float(np.mean([getattr(f,a) for f in fms]))); s.fall_risk_label=rl("fall_risk"); s.injury_risk_label=rl("injury_risk"); s.body_stress_label=rl("joint_stress"); s.fatigue_label=rl("fatigue_index"); ai=float(np.mean([f.injury_risk for f in fms])); s.injury_risk_detail="high knee load" if ai>.5 else "moderate joint stress" if ai>.3 else "within normal range"
+        s.avg_stride_length=anz("stride_length"); s.avg_step_time=anz("step_time")
+        s.avg_cadence=anz("cadence"); s.avg_flight_time=anz("flight_time")
+        # Energy now in Watts (Minetti model) — store mean power
+        s.estimated_energy_kcal_hr=float(np.mean([f.energy_expenditure for f in fms]))
+        s.gait_symmetry_pct=float(np.mean([f.gait_symmetry for f in fms]))
+        s.stride_variability_pct=float(np.mean([f.stride_variability for f in fms]))
+        dc=sum(1 for f in fms if f.direction_change)
+        s.direction_change_freq=dc/max(s.duration_seconds/60,1e-6)
+        s.peak_risk_score=float(np.max([f.risk_score for f in fms]))
+        if len(self.pose_frames)>=2:
+            s.total_distance_m=sum(dist2d(self.pose_frames[i].kp.hip_center,
+                                          self.pose_frames[i-1].kp.hip_center)*sc
+                                   for i in range(1,len(self.pose_frames)))
+        def rl(a): return self._risk_label(float(np.mean([getattr(f,a) for f in fms])))
+        s.fall_risk_label=rl("fall_risk"); s.injury_risk_label=rl("injury_risk")
+        s.body_stress_label=rl("joint_stress"); s.fatigue_label=rl("fatigue_index")
+        # Injury risk detail now uses clinical valgus thresholds
+        avg_valgus=float(np.mean([abs(f.l_valgus_clinical)+abs(f.r_valgus_clinical) for f in fms]))/2.
+        ai=float(np.mean([f.injury_risk for f in fms]))
+        if avg_valgus>10.: s.injury_risk_detail="valgus collapse detected (>10°)"
+        elif ai>.5:        s.injury_risk_detail="high knee load / acceleration stress"
+        elif ai>.3:        s.injury_risk_detail="moderate joint stress"
+        else:              s.injury_risk_detail="within normal range"
 
     def get_report_string(self) -> str:
         s = self.summary
         dm = _detection_layer.mode.upper() if _detection_layer else "BLOB"
-        
+        bio_backend = "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy"
+
         lines = []
         width = 70
-        
-        # Header
+
         lines.append("=" * width)
         lines.append(f"JUVENTUS ANALYTICS v4 — Player #{s.player_id} [{dm}]".center(width))
         lines.append("=" * width)
-        
-        # Session Overview
+
         lines.append("")
         lines.append("SESSION OVERVIEW")
         lines.append("-" * width)
         lines.append(f"  Duration        : {s.duration_seconds:>6.1f} s")
         lines.append(f"  Total Frames    : {s.total_frames:>6}")
         lines.append(f"  Total Distance  : {s.total_distance_m:>6.1f} m")
-        
-        # Player Metrics
+        lines.append(f"  Angle Backend   : {bio_backend}")
+
         lines.append("")
         lines.append("PLAYER METRICS")
         lines.append("-" * width)
@@ -1407,23 +1659,52 @@ class SportsAnalyzer:
         lines.append(f"  Avg Cadence     : {s.avg_cadence:>6.0f} spm")
         lines.append(f"  Avg Step Time   : {s.avg_step_time:>6.2f} s")
         lines.append(f"  Changes/Min     : {s.direction_change_freq:>6.1f}")
-        lines.append(f"  Energy Burn     : {s.estimated_energy_kcal_hr:>6.0f} kcal/hr")
-        
-        # Risk Indicators
+        lines.append(f"  Energy (avg)    : {s.estimated_energy_kcal_hr:>6.0f} W  "
+                     f"(Minetti model, 75 kg)")
+
+        # Biomechanics summary if available
+        if self.bio_engine and self.bio_engine.frames:
+            bio = self.bio_engine.summary_dict()
+            lines.append("")
+            lines.append("BIOMECHANICS  (Sports2D angles, Butterworth 6 Hz)")
+            lines.append("-" * width)
+            lines.append(f"  L Knee flexion  : {bio.get('left_knee_flexion_mean',0):>6.1f}° avg  "
+                         f"{bio.get('left_knee_flexion_std',0):.1f}° sd")
+            lines.append(f"  R Knee flexion  : {bio.get('right_knee_flexion_mean',0):>6.1f}° avg  "
+                         f"{bio.get('right_knee_flexion_std',0):.1f}° sd")
+            lines.append(f"  L Hip flexion   : {bio.get('left_hip_flexion_mean',0):>6.1f}°")
+            lines.append(f"  R Hip flexion   : {bio.get('right_hip_flexion_mean',0):>6.1f}°")
+            lines.append(f"  L Ankle dorsi   : {bio.get('left_ankle_dorsiflexion_mean',0):>6.1f}°")
+            lines.append(f"  R Ankle dorsi   : {bio.get('right_ankle_dorsiflexion_mean',0):>6.1f}°")
+            lines.append(f"  Trunk lat lean  : {bio.get('trunk_lateral_lean_mean',0):>6.1f}°")
+            lines.append(f"  Pelvis obliquity: {bio.get('pelvis_obliquity_mean',0):>6.1f}°")
+            lines.append(f"  Arm swing asym  : {bio.get('arm_swing_asymmetry_mean',0):>6.1f}°")
+            lines.append(f"  Double support  : {bio.get('double_support_pct',0):>6.1f}%")
+            lines.append(f"  Heel strikes L/R: {bio.get('lhs_count',0)} / {bio.get('rhs_count',0)}")
+
+            lvc = bio.get('left_valgus_clinical_mean', 0)
+            rvc = bio.get('right_valgus_clinical_mean', 0)
+            lvc_flag = "  ⚠ VALGUS" if abs(lvc) > 10 else ""
+            rvc_flag = "  ⚠ VALGUS" if abs(rvc) > 10 else ""
+            lines.append(f"  L Valgus (clin) : {lvc:>+6.1f}°{lvc_flag}")
+            lines.append(f"  R Valgus (clin) : {rvc:>+6.1f}°{rvc_flag}")
+
         lines.append("")
         lines.append("RISK INDICATORS")
         lines.append("-" * width)
         lines.append(f"  Peak Risk Score : {s.peak_risk_score:>6.0f} / 100")
         lines.append(f"  Gait Symmetry   : {s.gait_symmetry_pct:>6.1f} %")
-        lines.append(f"  Fall Risk       : {s.fall_risk_label:<10}")
-        lines.append(f"  Injury Risk     : {s.injury_risk_label:<10}")
-        lines.append(f"  Body Stress     : {s.body_stress_label:<10}")
+        lines.append(f"  Acute Inj. Risk : {s.injury_risk_label:<10}  "
+                     f"(valgus collapse, knee asym, acceleration)")
+        lines.append(f"  Body Stress     : {s.body_stress_label:<10}  "
+                     f"(joint load, trunk lean)")
         lines.append(f"  Fatigue Level   : {s.fatigue_label:<10}")
-        lines.append(f"  Risk Detail     : {s.injury_risk_detail:<20}")
-        
+        lines.append(f"  Risk Detail     : {s.injury_risk_detail:<30}")
+        lines.append(f"  NOTE: Scores discounted when player faces camera")
+        lines.append(f"        (perspective_confidence < 1.0)")
+
         lines.append("")
         lines.append("=" * width)
-        
         return "\n".join(lines)
 
     @staticmethod

@@ -102,27 +102,29 @@ def main():
         else:
             print("[WARN] BiomechanicsEngine has no frames — bio CSV skipped.")
 
-    # DataFrame preview
+    # DF/BIO preview
+    print("\n" + "="*70)
+    print("ANALYSIS SUMMARY PREVIEW".center(70))
+    print("="*70)
+    
     df = analyzer.get_dataframe()
-    print(f"\n[INFO] Core DataFrame: {df.shape[0]} frames x {df.shape[1]} columns")
     if not df.empty:
+        print(f"\n[CORE] Data: {df.shape[0]} frames x {df.shape[1]} columns")
         cols = ["frame_idx","timestamp","speed","cadence","stride_length",
-                "left_knee_angle","right_knee_angle","l_valgus","r_valgus",
-                "risk_score","gait_symmetry"]
-        print(df[cols].head(8).to_string(index=False))
+                "left_knee_angle","right_knee_angle","risk_score","gait_symmetry"]
+        # Print first few and last few rows to see progress
+        print(df[cols].head(3).to_string(index=False))
+        print("...")
+        print(df[cols].tail(3).to_string(index=False, header=False))
 
-    # BiomechanicsEngine summary
     if analyzer.bio_engine and analyzer.bio_engine.frames:
         bio = analyzer.bio_engine.summary_dict()
         bdf = analyzer.bio_engine.get_dataframe()
-        print(f"\n[BIO] DataFrame: {bdf.shape[0]} frames x {bdf.shape[1]} columns")
-        print(f"[BIO] L Knee avg : {bio.get('left_knee_flexion_mean',0):.1f} deg   "
-              f"R Knee avg : {bio.get('right_knee_flexion_mean',0):.1f} deg")
-        print(f"[BIO] L Valgus   : {bio.get('left_valgus_clinical_mean',0):.2f} deg  "
-              f"R Valgus   : {bio.get('right_valgus_clinical_mean',0):.2f} deg")
-        print(f"[BIO] Heel strikes L={bio.get('lhs_count',0)}  R={bio.get('rhs_count',0)}")
-        print(f"[BIO] Double support: {bio.get('double_support_pct',0):.1f}%")
-        print(f"[BIO] Arm swing asym: {bio.get('arm_swing_asymmetry_mean',0):.1f} deg")
+        print(f"\n[BIO] Biomechanics Data: {bdf.shape[0]} frames x {bdf.shape[1]} columns")
+        print(f"  Knee Flexion (avg) : L {bio.get('left_knee_flexion_mean',0):.1f}° | R {bio.get('right_knee_flexion_mean',0):.1f}°")
+        print(f"  Valgus Clinical    : L {bio.get('left_valgus_clinical_mean',0):.2f}° | R {bio.get('right_valgus_clinical_mean',0):.2f}°")
+        print(f"  Stride/Gait        : Sym {bio.get('gait_symmetry_pct',0):.1f}% | DS {bio.get('double_support_pct',0):.1f}%")
+        print(f"  Event Counts       : LHS={bio.get('lhs_count',0)} | RHS={bio.get('rhs_count',0)}")
 
     print(f"\n[DONE] Outputs saved to: {output_dir}/")
     print(f"  Annotated video -> {video_out}")
