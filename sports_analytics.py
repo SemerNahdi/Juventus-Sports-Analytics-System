@@ -1,18 +1,21 @@
 """
-Juventus Sports Analytics System  v4
+Juventus Sports Analytics System  v5
 ======================================
-Tracking architecture upgrade — see architecture diagram at bottom of imports.
+Refactored for data integrity, clean video output, and OpenSim compatibility.
 
-Install on your Windows machine:
-    pip install ultralytics          # YOLO11 pose model
-    pip install opencv-python numpy pandas scipy
+Install:
+    pip install ultralytics opencv-python numpy pandas scipy matplotlib
+    pip install sports2d pose2sim          # for Sports2D pipeline
+    # ffmpeg must be on PATH for H.264 re-encoding (https://ffmpeg.org)
+    # For OpenSim IK: conda install -c opensim-org opensim
 """
 
 import cv2
+import math
+import json
+import os
 import numpy as np
 import pandas as pd
-import json
-import math
 from collections import deque
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple
@@ -24,73 +27,65 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-# ── YOLO (Torch) Detection — must load before Pose2Sim on Windows to avoid DLL conflicts ──────
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive backend — safe for headless/server use
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
+# ── YOLO pose detection ────────────────────────────────────────────────────────
 try:
     from ultralytics import YOLO as _YOLO
     HAS_YOLO = True
 except (ImportError, Exception):
     HAS_YOLO = False
-    print("[WARNING] ultralytics/torch failed to load — falling back to MOG2.")
-    print("          (Common on Windows if DLLs conflict with open3d/opensim)")
 
-# ── Optional Sports2D / Pyomeca / SKDH — graceful fallback built-in ──────────
+# ── Optional Sports2D / Pose2Sim ───────────────────────────────────────────────
+HAS_SPORTS2D = False
+_s2d_angle   = None
+_s2d_seg     = None
+
 try:
-    # Modern Sports2D (v0.5.0+) uses Pose2Sim as its computation engine
+    from Sports2D import Sports2D as _Sports2DModule
+    HAS_SPORTS2D = True
     try:
         from Pose2Sim.common import points_to_angles as _pta
-        HAS_SPORTS2D = True
-        # Bridge to maintain legacy internal naming requested by analyzer
-        def _s2d_angle(p1, p2, p3): 
-            val = _pta([p1, p2, p3])
-            return [val] if isinstance(val, (float, int, np.number)) else val
-        def _s2d_seg(p1, p2):
-            val = _pta([p1, p2])
-            return [val] if isinstance(val, (float, int, np.number)) else val
-    except (ImportError, Exception):
-        # Legacy / local directory structures
-        from Sports2D.kinematics import angle_from_points as _s2d_angle, segment_angle as _s2d_seg
-        HAS_SPORTS2D = True
-except (ImportError, AttributeError, NameError, Exception):
-    try:
-        # Fallback for lowercase variants
-        from sports2d.kinematics import angle_from_points as _s2d_angle, segment_angle as _s2d_seg
-        HAS_SPORTS2D = True
-    except (ImportError, Exception):
-        HAS_SPORTS2D = False
+        def _s2d_angle(p1, p2, p3):
+            v = _pta([p1, p2, p3])
+            return [float(v)] if isinstance(v, (float, int, np.number)) else list(v)
+        def _s2d_seg(p_from, p_to):
+            v = _pta([p_from, p_to])
+            return [float(v)] if isinstance(v, (float, int, np.number)) else list(v)
+    except Exception:
+        pass
+except ImportError:
+    pass
+
 
 def _s2d_joint_angle(p_prox, p_vertex, p_dist) -> float:
-    """
-    Compute a joint angle using Sports2D's convention when available,
-    otherwise fall back to our own dot-product formula.
-    Sports2D uses the ISB-recommended 'angle at vertex' definition
-    and handles gimbal / wrap-around correctly.
-    """
-    if HAS_SPORTS2D:
+    if _s2d_angle is not None:
         try:
-            # sports2d expects numpy arrays [[x,y]] shaped (1,2)
-            pp = np.array(p_prox, dtype=float).reshape(1, 2)
-            pv = np.array(p_vertex, dtype=float).reshape(1, 2)
-            pd_ = np.array(p_dist, dtype=float).reshape(1, 2)
+            pp  = np.array(p_prox,   dtype=float).reshape(1, 2)
+            pv  = np.array(p_vertex, dtype=float).reshape(1, 2)
+            pd_ = np.array(p_dist,   dtype=float).reshape(1, 2)
             return float(_s2d_angle(pp, pv, pd_)[0])
         except Exception:
             pass
-    # fallback
     return angle_3pts(p_prox, p_vertex, p_dist)
 
+
 def _s2d_seg_angle(p_from, p_to) -> float:
-    """
-    Segment angle to the vertical (degrees). Sports2D convention:
-    0 = perfectly vertical, positive = rightward lean.
-    Works without Sports2D installed.
-    """
-    if HAS_SPORTS2D:
+    if _s2d_seg is not None:
         try:
             pf = np.array(p_from, dtype=float).reshape(1, 2)
             pt = np.array(p_to,   dtype=float).reshape(1, 2)
             return float(_s2d_seg(pf, pt)[0])
         except Exception:
             pass
-    dx = p_to[0] - p_from[0]; dy = p_to[1] - p_from[1]
+    dx = p_to[0] - p_from[0]
+    dy = p_to[1] - p_from[1]
     return float(math.degrees(math.atan2(dx, abs(dy) + 1e-9)))
 
 
@@ -99,118 +94,224 @@ def _s2d_seg_angle(p_from, p_to) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 JOINT_NAMES = [
-    "head","neck","left_shoulder","right_shoulder","left_elbow","right_elbow",
-    "left_wrist","right_wrist","left_hip","right_hip","left_knee","right_knee",
-    "left_ankle","right_ankle","left_foot","right_foot","hip_center","shoulder_center",
+    "head", "neck", "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow", "left_wrist", "right_wrist",
+    "left_hip", "right_hip", "left_knee", "right_knee",
+    "left_ankle", "right_ankle", "left_foot", "right_foot",
+    "hip_center", "shoulder_center",
 ]
+
+# COCO keypoint indices for YOLO pose model
+_COCO = {
+    "nose": 0, "left_shoulder": 5, "right_shoulder": 6,
+    "left_elbow": 7, "right_elbow": 8, "left_wrist": 9, "right_wrist": 10,
+    "left_hip": 11, "right_hip": 12, "left_knee": 13,
+    "right_knee": 14, "left_ankle": 15, "right_ankle": 16,
+}
 
 
 @dataclass
 class PoseKeypoints:
-    head:(float,float)=(0.,0.); neck:(float,float)=(0.,0.)
-    left_shoulder:(float,float)=(0.,0.); right_shoulder:(float,float)=(0.,0.)
-    left_elbow:(float,float)=(0.,0.);    right_elbow:(float,float)=(0.,0.)
-    left_wrist:(float,float)=(0.,0.);    right_wrist:(float,float)=(0.,0.)
-    left_hip:(float,float)=(0.,0.);      right_hip:(float,float)=(0.,0.)
-    left_knee:(float,float)=(0.,0.);     right_knee:(float,float)=(0.,0.)
-    left_ankle:(float,float)=(0.,0.);    right_ankle:(float,float)=(0.,0.)
-    left_foot:(float,float)=(0.,0.);     right_foot:(float,float)=(0.,0.)
-    hip_center:(float,float)=(0.,0.);    shoulder_center:(float,float)=(0.,0.)
+    head:            Tuple[float, float] = (0., 0.)
+    neck:            Tuple[float, float] = (0., 0.)
+    left_shoulder:   Tuple[float, float] = (0., 0.)
+    right_shoulder:  Tuple[float, float] = (0., 0.)
+    left_elbow:      Tuple[float, float] = (0., 0.)
+    right_elbow:     Tuple[float, float] = (0., 0.)
+    left_wrist:      Tuple[float, float] = (0., 0.)
+    right_wrist:     Tuple[float, float] = (0., 0.)
+    left_hip:        Tuple[float, float] = (0., 0.)
+    right_hip:       Tuple[float, float] = (0., 0.)
+    left_knee:       Tuple[float, float] = (0., 0.)
+    right_knee:      Tuple[float, float] = (0., 0.)
+    left_ankle:      Tuple[float, float] = (0., 0.)
+    right_ankle:     Tuple[float, float] = (0., 0.)
+    left_foot:       Tuple[float, float] = (0., 0.)
+    right_foot:      Tuple[float, float] = (0., 0.)
+    hip_center:      Tuple[float, float] = (0., 0.)
+    shoulder_center: Tuple[float, float] = (0., 0.)
+
 
 @dataclass
 class PoseFrame:
-    frame_idx:int; timestamp:float; bbox:Tuple[int,int,int,int]; kp:PoseKeypoints
+    frame_idx: int
+    timestamp: float
+    bbox: Tuple[int, int, int, int]
+    kp: PoseKeypoints
+
 
 @dataclass
 class FrameMetrics:
-    frame_idx:int=0; timestamp:float=0.; speed:float=0.; acceleration:float=0.
-    stride_length:float=0.; step_time:float=0.; cadence:float=0.; flight_time:float=0.
-    left_knee_angle:float=0.; right_knee_angle:float=0.
-    left_hip_angle:float=0.;  right_hip_angle:float=0.
-    trunk_lean:float=0.; direction_change:bool=False; energy_expenditure:float=0.
-    gait_symmetry:float=100.; stride_variability:float=0.
-    fall_risk:float=0.; injury_risk:float=0.; joint_stress:float=0.
-    fatigue_index:float=0.; body_center_disp:float=0.
-    l_valgus:float=0.; r_valgus:float=0.; risk_score:float=0.
-    # Clinical valgus (signed, degrees) — fed back from BiomechanicsEngine
-    l_valgus_clinical:float=0.; r_valgus_clinical:float=0.
-    # Perspective confidence: 1=side-on (reliable), 0=facing camera (unreliable)
-    perspective_confidence:float=1.0
+    frame_idx: int = 0
+    timestamp: float = 0.
+    speed: float = 0.
+    acceleration: float = 0.
+    stride_length: float = 0.
+    step_time: float = 0.
+    cadence: float = 0.
+    flight_time: float = 0.
+    left_knee_angle: float = 0.
+    right_knee_angle: float = 0.
+    left_hip_angle: float = 0.
+    right_hip_angle: float = 0.
+    trunk_lean: float = 0.
+    direction_change: bool = False
+    energy_expenditure: float = 0.
+    gait_symmetry: float = 100.
+    stride_variability: float = 0.
+    fall_risk: float = 0.
+    injury_risk: float = 0.
+    joint_stress: float = 0.
+    fatigue_index: float = 0.
+    body_center_disp: float = 0.
+    l_valgus: float = 0.
+    r_valgus: float = 0.
+    risk_score: float = 0.
+    l_valgus_clinical: float = 0.
+    r_valgus_clinical: float = 0.
+    perspective_confidence: float = 1.0
+
 
 @dataclass
 class PlayerSummary:
-    player_id:int=1; total_frames:int=0; duration_seconds:float=0.
-    avg_speed:float=0.; max_speed:float=0.; avg_stride_length:float=0.
-    avg_step_time:float=0.; avg_cadence:float=0.; avg_flight_time:float=0.
-    direction_change_freq:float=0.; estimated_energy_kcal_hr:float=0.
-    gait_symmetry_pct:float=0.; stride_variability_pct:float=0.
-    total_distance_m:float=0.; peak_risk_score:float=0.
-    fall_risk_label:str="Low"; injury_risk_label:str="Low"
-    injury_risk_detail:str=""; body_stress_label:str="Low"; fatigue_label:str="Low"
+    player_id: int = 1
+    total_frames: int = 0
+    duration_seconds: float = 0.
+    avg_speed: float = 0.
+    max_speed: float = 0.
+    avg_stride_length: float = 0.
+    avg_step_time: float = 0.
+    avg_cadence: float = 0.
+    avg_flight_time: float = 0.
+    direction_change_freq: float = 0.
+    estimated_energy_kcal_hr: float = 0.
+    gait_symmetry_pct: float = 0.
+    stride_variability_pct: float = 0.
+    total_distance_m: float = 0.
+    peak_risk_score: float = 0.
+    fall_risk_label: str = "Low"
+    injury_risk_label: str = "Low"
+    injury_risk_detail: str = ""
+    body_stress_label: str = "Low"
+    fatigue_label: str = "Low"
+
+
+@dataclass
+class BioFrame:
+    frame_idx: int = 0
+    timestamp: float = 0.
+    left_knee_flexion: float = 0.
+    right_knee_flexion: float = 0.
+    left_hip_flexion: float = 0.
+    right_hip_flexion: float = 0.
+    left_ankle_dorsiflexion: float = 0.
+    right_ankle_dorsiflexion: float = 0.
+    left_elbow_flexion: float = 0.
+    right_elbow_flexion: float = 0.
+    trunk_lateral_lean: float = 0.
+    trunk_sagittal_lean: float = 0.
+    pelvis_obliquity: float = 0.
+    pelvis_rotation: float = 0.
+    left_thigh_angle: float = 0.
+    right_thigh_angle: float = 0.
+    left_shank_angle: float = 0.
+    right_shank_angle: float = 0.
+    trunk_segment_angle: float = 0.
+    left_valgus_clinical: float = 0.
+    right_valgus_clinical: float = 0.
+    left_arm_swing: float = 0.
+    right_arm_swing: float = 0.
+    arm_swing_asymmetry: float = 0.
+    left_knee_ang_vel: float = 0.
+    right_knee_ang_vel: float = 0.
+    left_hip_ang_vel: float = 0.
+    right_hip_ang_vel: float = 0.
+    left_heel_strike: bool = False
+    right_heel_strike: bool = False
+    left_toe_off: bool = False
+    right_toe_off: bool = False
+    stance_left: bool = False
+    stance_right: bool = False
+    double_support: bool = False
+    step_width: float = 0.
+    foot_progression_angle: float = 0.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MATH HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def angle_3pts(a,b,c)->float:
-    ba=np.array(a)-np.array(b); bc=np.array(c)-np.array(b)
-    n=np.linalg.norm(ba)*np.linalg.norm(bc)+1e-9
-    return float(np.degrees(np.arccos(np.clip(np.dot(ba,bc)/n,-1,1))))
+def angle_3pts(a, b, c) -> float:
+    ba = np.array(a) - np.array(b)
+    bc = np.array(c) - np.array(b)
+    n = np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-9
+    return float(np.degrees(np.arccos(np.clip(np.dot(ba, bc) / n, -1, 1))))
 
-def dist2d(p1,p2)->float: return math.hypot(p1[0]-p2[0],p1[1]-p2[1])
 
-def smooth_arr(arr,w=5):
-    a=np.array(arr,dtype=float)
-    if HAS_SCIPY: return uniform_filter1d(a,size=w)
-    return np.convolve(a,np.ones(w)/w,mode='same')
+def dist2d(p1, p2) -> float:
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-def clamp01(x): return float(np.clip(x,0.,1.))
 
-def lerp_color(c1,c2,t):
-    t=clamp01(t); return tuple(int(c1[i]*(1-t)+c2[i]*t) for i in range(3))
+def smooth_arr(arr, w=5) -> np.ndarray:
+    a = np.array(arr, dtype=float)
+    if HAS_SCIPY:
+        return uniform_filter1d(a, size=w)
+    return np.convolve(a, np.ones(w) / w, mode='same')
+
+
+def clamp01(x) -> float:
+    return float(np.clip(x, 0., 1.))
+
+
+def lerp_color(c1, c2, t):
+    t = clamp01(t)
+    return tuple(int(c1[i] * (1 - t) + c2[i] * t) for i in range(3))
+
 
 def risk_color(s):
-    t=clamp01(s/100.)
-    return lerp_color((0,200,0),(0,200,255),t*2) if t<0.5 else lerp_color((0,200,255),(0,0,230),(t-.5)*2)
+    t = clamp01(s / 100.)
+    if t < 0.5:
+        return lerp_color((0, 200, 0), (0, 200, 255), t * 2)
+    return lerp_color((0, 200, 255), (0, 0, 230), (t - .5) * 2)
 
-def bbox_iou(a,b)->float:
-    ax,ay,aw,ah=a; bx,by,bw,bh=b
-    ix=max(0,min(ax+aw,bx+bw)-max(ax,bx)); iy=max(0,min(ay+ah,by+bh)-max(ay,by))
-    inter=ix*iy; return inter/(aw*ah+bw*bh-inter+1e-6)
 
-def bbox_centre(bbox): x,y,w,h=bbox; return (x+w/2.,y+h/2.)
+def bbox_iou(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    return inter / (aw * ah + bw * bh - inter + 1e-6)
 
-def crop_hist(frame,bbox):
-    bx,by,bw,bh=[int(v) for v in bbox]; H,W=frame.shape[:2]
-    bx,by=max(0,bx),max(0,by); bw,bh=min(bw,W-bx),min(bh,H-by)
-    if bw<5 or bh<5: return None
-    hsv=cv2.cvtColor(frame[by:by+bh,bx:bx+bw],cv2.COLOR_BGR2HSV)
-    hist=cv2.calcHist([hsv],[0,1],None,[18,16],[0,180,0,256])
-    cv2.normalize(hist,hist); return hist
 
-def hist_sim(h1,h2)->float:
-    if h1 is None or h2 is None: return 0.
-    return float(cv2.compareHist(h1,h2,cv2.HISTCMP_CORREL))
+def bbox_centre(bbox):
+    x, y, w, h = bbox
+    return (x + w / 2., y + h / 2.)
 
-def estimate_player_orientation(kp: "PoseKeypoints") -> float:
-    """
-    Estimate how much the player is facing toward/away from the camera
-    vs. running sideways, using shoulder and hip width ratios.
 
-    Returns a confidence weight in [0, 1]:
-      1.0 = player is fully side-on  → angles are reliable
-      0.0 = player facing camera straight-on / directly away → angles unreliable
+def crop_hist(frame, bbox):
+    bx, by, bw, bh = [int(v) for v in bbox]
+    H, W = frame.shape[:2]
+    bx, by = max(0, bx), max(0, by)
+    bw, bh = min(bw, W - bx), min(bh, H - by)
+    if bw < 5 or bh < 5:
+        return None
+    hsv = cv2.cvtColor(frame[by:by + bh, bx:bx + bw], cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [18, 16], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist
 
-    Method: if the player is side-on, their shoulder-to-shoulder and hip-to-hip
-    pixel widths are at their maximum. When facing the camera these widths
-    collapse toward zero. We use the ratio of observed width to expected
-    width (estimated from body height) as the confidence.
-    """
+
+def hist_sim(h1, h2) -> float:
+    if h1 is None or h2 is None:
+        return 0.
+    return float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
+
+
+def estimate_player_orientation(kp: PoseKeypoints) -> float:
     sh_w = abs(kp.left_shoulder[0] - kp.right_shoulder[0])
     hp_w = abs(kp.left_hip[0] - kp.right_hip[0])
     body_h = abs(kp.head[1] - kp.left_ankle[1]) + 1e-6
-    # Typical side-on ratios (empirical, normalised by body height)
     expected_sh = 0.22 * body_h
     expected_hp = 0.18 * body_h
     conf_sh = clamp01(sh_w / (expected_sh + 1e-6))
@@ -219,301 +320,387 @@ def estimate_player_orientation(kp: "PoseKeypoints") -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  KALMAN TRACK  — per-player state: [cx,cy,w,h, vx,vy,vw,vh]
+#  KALMAN TRACK
 # ══════════════════════════════════════════════════════════════════════════════
 
 class KalmanTrack:
-    _next_id=1
-    F=np.array([[1,0,0,0,1,0,0,0],[0,1,0,0,0,1,0,0],[0,0,1,0,0,0,1,0],[0,0,0,1,0,0,0,1],
-                [0,0,0,0,1,0,0,0],[0,0,0,0,0,1,0,0],[0,0,0,0,0,0,1,0],[0,0,0,0,0,0,0,1]],dtype=float)
-    H=np.eye(4,8)
+    _next_id = 1
+    F = np.array([
+        [1,0,0,0,1,0,0,0], [0,1,0,0,0,1,0,0], [0,0,1,0,0,0,1,0], [0,0,0,1,0,0,0,1],
+        [0,0,0,0,1,0,0,0], [0,0,0,0,0,1,0,0], [0,0,0,0,0,0,1,0], [0,0,0,0,0,0,0,1],
+    ], dtype=float)
+    H = np.eye(4, 8)
 
-    def __init__(self,bbox,frame,conf=1.0):
-        self.id=KalmanTrack._next_id; KalmanTrack._next_id+=1
-        cx,cy=bbox_centre(bbox); w,h=bbox[2],bbox[3]
-        self.x=np.array([cx,cy,w,h,0.,0.,0.,0.],dtype=float)
-        self.P=np.diag([10.,10.,10.,10.,100.,100.,10.,10.])
-        self.Q=np.diag([1.,1.,1.,1.,.5,.5,.2,.2])
-        self.R=np.diag([4.,4.,10.,10.])
-        self.conf=conf; self.hit_streak=1; self.missed=0; self.age=1
-        self.ref_hist=crop_hist(frame,bbox); self.last_bbox=bbox
-        self.trajectory=deque(maxlen=30); self.trajectory.append(bbox_centre(bbox))
-        self._yolo_kp=None
+    def __init__(self, bbox, frame, conf=1.0):
+        self.id = KalmanTrack._next_id
+        KalmanTrack._next_id += 1
+        cx, cy = bbox_centre(bbox)
+        w, h = bbox[2], bbox[3]
+        self.x = np.array([cx, cy, w, h, 0., 0., 0., 0.], dtype=float)
+        self.P = np.diag([10., 10., 10., 10., 100., 100., 10., 10.])
+        self.Q = np.diag([1., 1., 1., 1., .5, .5, .2, .2])
+        self.R = np.diag([4., 4., 10., 10.])
+        self.conf = conf
+        self.hit_streak = 1
+        self.missed = 0
+        self.age = 1
+        self.ref_hist = crop_hist(frame, bbox)
+        self.last_bbox = bbox
+        self.trajectory = deque(maxlen=30)
+        self.trajectory.append(bbox_centre(bbox))
+        self._yolo_kp = None
 
     def predict(self):
-        self.x=self.F@self.x; self.P=self.F@self.P@self.F.T+self.Q
-        self.x[2]=max(1.,self.x[2]); self.x[3]=max(1.,self.x[3])
-        self.age+=1; self.missed+=1; return self.get_bbox()
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        self.x[2] = max(1., self.x[2])
+        self.x[3] = max(1., self.x[3])
+        self.age += 1
+        self.missed += 1
+        return self.get_bbox()
 
-    def update(self,bbox,frame,conf=1.0):
-        cx,cy=bbox_centre(bbox); z=np.array([cx,cy,bbox[2],bbox[3]],dtype=float)
-        S=self.H@self.P@self.H.T+self.R; K=self.P@self.H.T@np.linalg.inv(S)
-        self.x=self.x+K@(z-self.H@self.x); self.P=(np.eye(8)-K@self.H)@self.P
-        self.conf=conf; self.hit_streak+=1; self.missed=0; self.last_bbox=bbox
+    def update(self, bbox, frame, conf=1.0):
+        cx, cy = bbox_centre(bbox)
+        z = np.array([cx, cy, bbox[2], bbox[3]], dtype=float)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ (z - self.H @ self.x)
+        self.P = (np.eye(8) - K @ self.H) @ self.P
+        self.conf = conf
+        self.hit_streak += 1
+        self.missed = 0
+        self.last_bbox = bbox
         self.trajectory.append(bbox_centre(bbox))
-        nh=crop_hist(frame,bbox)
+        nh = crop_hist(frame, bbox)
         if nh is not None and self.ref_hist is not None:
-            self.ref_hist=(0.92*self.ref_hist+0.08*nh).astype(np.float32)
-            cv2.normalize(self.ref_hist,self.ref_hist)
-        elif nh is not None: self.ref_hist=nh
+            self.ref_hist = (0.92 * self.ref_hist + 0.08 * nh).astype(np.float32)
+            cv2.normalize(self.ref_hist, self.ref_hist)
+        elif nh is not None:
+            self.ref_hist = nh
 
-    def get_bbox(self)->Tuple[int,int,int,int]:
-        cx,cy,w,h=self.x[:4]; return (int(cx-w/2),int(cy-h/2),int(w),int(h))
+    def get_bbox(self) -> Tuple[int, int, int, int]:
+        cx, cy, w, h = self.x[:4]
+        return (int(cx - w / 2), int(cy - h / 2), int(w), int(h))
 
-    def reactivate(self,bbox,frame):
-        cx,cy=bbox_centre(bbox); self.x[:4]=[cx,cy,bbox[2],bbox[3]]
-        self.missed=0; self.hit_streak=1; self.last_bbox=bbox
-        nh=crop_hist(frame,bbox)
-        if nh is not None: self.ref_hist=nh
+    def reactivate(self, bbox, frame):
+        cx, cy = bbox_centre(bbox)
+        self.x[:4] = [cx, cy, bbox[2], bbox[3]]
+        self.missed = 0
+        self.hit_streak = 1
+        self.last_bbox = bbox
+        nh = crop_hist(frame, bbox)
+        if nh is not None:
+            self.ref_hist = nh
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DETECTION LAYER  — YOLO first, MOG2 blob fallback
+#  DETECTION LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DetectionLayer:
-    def __init__(self,model_size="m"):
-        self._yolo=None
-        self._bg=cv2.createBackgroundSubtractorMOG2(history=400,varThreshold=40,detectShadows=False)
-        self._mode="blob"
+    def __init__(self, model_size="m"):
+        self._yolo = None
+        self._bg = cv2.createBackgroundSubtractorMOG2(
+            history=400, varThreshold=40, detectShadows=False
+        )
+        self._mode = "blob"
         if HAS_YOLO:
             try:
-                mn=f"yolo11{model_size}-pose.pt"
-                print(f"[DETECT] Loading {mn} …")
-                self._yolo=_YOLO(mn)
-                self._mode="yolo"
-                print("[DETECT] YOLO pose model loaded.")
-            except Exception as e:
-                print(f"[DETECT] YOLO failed ({e}) — blob fallback.")
+                mn = f"yolo11{model_size}-pose.pt"
+                self._yolo = _YOLO(mn)
+                self._mode = "yolo"
+            except Exception:
+                pass
 
     @property
-    def mode(self): return self._mode
+    def mode(self):
+        return self._mode
 
-    def detect(self,frame)->List[dict]:
-        return self._yolo_detect(frame) if self._mode=="yolo" else self._blob_detect(frame)
+    def detect(self, frame) -> List[dict]:
+        return self._yolo_detect(frame) if self._mode == "yolo" else self._blob_detect(frame)
 
-    def _yolo_detect(self,frame)->List[dict]:
-        res=self._yolo(frame,verbose=False,conf=0.25)[0]; dets=[]
-        if res.boxes is None or len(res.boxes)==0: return dets
-        for i,box in enumerate(res.boxes):
-            x1,y1,x2,y2=box.xyxy[0].cpu().numpy()
-            bw,bh=x2-x1,y2-y1
-            if bh<bw*0.8: continue
-            bbox=(int(x1),int(y1),int(bw),int(bh))
-            conf=float(box.conf[0].cpu()); kp=None
-            if res.keypoints is not None and i<len(res.keypoints.xy):
-                kpxy=res.keypoints.xy[i].cpu().numpy()
-                kpc=res.keypoints.conf[i].cpu().numpy()
-                kpxy[kpc<0.3]=0.; kp=kpxy
-            dets.append({'bbox':bbox,'conf':conf,'kp':kp})
+    def _yolo_detect(self, frame) -> List[dict]:
+        res = self._yolo(frame, verbose=False, conf=0.25)[0]
+        dets = []
+        if res.boxes is None or len(res.boxes) == 0:
+            return dets
+        for i, box in enumerate(res.boxes):
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            bw, bh = x2 - x1, y2 - y1
+            if bh < bw * 0.8:
+                continue
+            bbox = (int(x1), int(y1), int(bw), int(bh))
+            conf = float(box.conf[0].cpu())
+            kp = None
+            if res.keypoints is not None and i < len(res.keypoints.xy):
+                kpxy = res.keypoints.xy[i].cpu().numpy()
+                kpc = res.keypoints.conf[i].cpu().numpy()
+                kpxy[kpc < 0.3] = 0.
+                kp = kpxy
+            dets.append({'bbox': bbox, 'conf': conf, 'kp': kp})
         return dets
 
-    def _blob_detect(self,frame)->List[dict]:
-        mask=self._bg.apply(frame)
-        k7=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(7,7))
-        k3=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
-        mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,k7,iterations=2)
-        mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,k3,iterations=1)
-        cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-        cands=[]
+    def _blob_detect(self, frame) -> List[dict]:
+        mask = self._bg.apply(frame)
+        k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=1)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cands = []
         for cnt in cnts:
-            area=cv2.contourArea(cnt)
-            if not (2000<=area<=90000): continue
-            bx,by,bw,bh=cv2.boundingRect(cnt)
-            if not (1.3<=bh/(bw+1e-6)<=5.0): continue
-            fill=area/(bw*bh+1e-6)
-            if fill<0.25: continue
-            cands.append({'bbox':(bx,by,bw,bh),'conf':fill,'kp':None,'area':area})
-        cands.sort(key=lambda c:c['area'],reverse=True)
-        kept,sup=[], set()
-        for i,ci in enumerate(cands):
-            if i in sup: continue
+            area = cv2.contourArea(cnt)
+            if not (2000 <= area <= 90000):
+                continue
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            if not (1.3 <= bh / (bw + 1e-6) <= 5.0):
+                continue
+            fill = area / (bw * bh + 1e-6)
+            if fill < 0.25:
+                continue
+            cands.append({'bbox': (bx, by, bw, bh), 'conf': fill, 'kp': None, 'area': area})
+        cands.sort(key=lambda c: c['area'], reverse=True)
+        kept, sup = [], set()
+        for i, ci in enumerate(cands):
+            if i in sup:
+                continue
             kept.append(ci)
-            for j,cj in enumerate(cands):
-                if j<=i or j in sup: continue
-                if bbox_iou(ci['bbox'],cj['bbox'])>0.40: sup.add(j)
+            for j, cj in enumerate(cands):
+                if j <= i or j in sup:
+                    continue
+                if bbox_iou(ci['bbox'], cj['bbox']) > 0.40:
+                    sup.add(j)
         return kept
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCENE-CHANGE DETECTOR
+#  SCENE CHANGE DETECTOR
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SceneChangeDetector:
-    def __init__(self,threshold=0.45): self._prev=None; self._thr=threshold
-    def is_cut(self,frame)->bool:
-        gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-        hist=cv2.calcHist([gray],[0],None,[64],[0,256]); cv2.normalize(hist,hist)
-        if self._prev is None: self._prev=hist; return False
-        score=float(cv2.compareHist(self._prev,hist,cv2.HISTCMP_CORREL))
-        self._prev=hist; return score<self._thr
+    def __init__(self, threshold=0.45):
+        self._prev = None
+        self._thr = threshold
+
+    def is_cut(self, frame) -> bool:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
+        cv2.normalize(hist, hist)
+        if self._prev is None:
+            self._prev = hist
+            return False
+        score = float(cv2.compareHist(self._prev, hist, cv2.HISTCMP_CORREL))
+        self._prev = hist
+        return score < self._thr
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BYTETRACKER  — two-stage association, handles occlusion via Kalman + TTL
+#  BYTETRACKER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ByteTracker:
-    HIGH_THRESH=0.50; LOW_THRESH=0.20
-    IOU_HIGH=0.30;    IOU_LOW=0.15;   IOU_LOST=0.20
-    MIN_HITS=2;       LOST_TTL=60
+    HIGH_THRESH = 0.50
+    LOW_THRESH  = 0.20
+    IOU_HIGH    = 0.30
+    IOU_LOW     = 0.15
+    IOU_LOST    = 0.20
+    MIN_HITS    = 2
+    LOST_TTL    = 60
 
     def __init__(self):
-        self.active_tracks:List[KalmanTrack]=[]
-        self.lost_tracks:List[KalmanTrack]=[]
+        self.active_tracks: List[KalmanTrack] = []
+        self.lost_tracks:   List[KalmanTrack] = []
 
-    def update(self,detections:List[dict],frame)->List[KalmanTrack]:
-        for t in self.active_tracks+self.lost_tracks: t.predict()
-        high=[d for d in detections if d['conf']>=self.HIGH_THRESH]
-        low =[d for d in detections if self.LOW_THRESH<=d['conf']<self.HIGH_THRESH]
+    def update(self, detections: List[dict], frame) -> List[KalmanTrack]:
+        for t in self.active_tracks + self.lost_tracks:
+            t.predict()
+        high = [d for d in detections if d['conf'] >= self.HIGH_THRESH]
+        low  = [d for d in detections if self.LOW_THRESH <= d['conf'] < self.HIGH_THRESH]
 
         unm_t, unm_h = self._associate(self.active_tracks, high, frame, self.IOU_HIGH)
         still_unm, _ = self._associate(unm_t, low, frame, self.IOU_LOW)
         self._associate(self.lost_tracks, low, frame, self.IOU_LOST, reactivate=True)
 
         for t in still_unm:
-            t.hit_streak=0
-            if t not in self.lost_tracks: self.lost_tracks.append(t)
-            if t in self.active_tracks: self.active_tracks.remove(t)
+            t.hit_streak = 0
+            if t not in self.lost_tracks:
+                self.lost_tracks.append(t)
+            if t in self.active_tracks:
+                self.active_tracks.remove(t)
 
         for d in unm_h:
-            self.active_tracks.append(KalmanTrack(d['bbox'],frame,d['conf']))
+            self.active_tracks.append(KalmanTrack(d['bbox'], frame, d['conf']))
 
-        self.lost_tracks=[t for t in self.lost_tracks if t.missed<=self.LOST_TTL]
-        return [t for t in self.active_tracks if t.hit_streak>=self.MIN_HITS]
+        self.lost_tracks = [t for t in self.lost_tracks if t.missed <= self.LOST_TTL]
+        return [t for t in self.active_tracks if t.hit_streak >= self.MIN_HITS]
 
-    def _associate(self,tracks,dets,frame,iou_thr,reactivate=False):
-        if not tracks or not dets: return list(tracks),list(dets)
-        cost=np.zeros((len(tracks),len(dets)),dtype=float)
-        for ti,t in enumerate(tracks):
-            tb=t.get_bbox(); th=t.ref_hist
-            for di,d in enumerate(dets):
-                iou=bbox_iou(tb,d['bbox']); hs=hist_sim(th,crop_hist(frame,d['bbox']))
-                cost[ti,di]=1.0-(iou*0.60+hs*0.40)
-        mt,md=set(),set()
+    def _associate(self, tracks, dets, frame, iou_thr, reactivate=False):
+        if not tracks or not dets:
+            return list(tracks), list(dets)
+        cost = np.zeros((len(tracks), len(dets)), dtype=float)
+        for ti, t in enumerate(tracks):
+            tb = t.get_bbox()
+            th = t.ref_hist
+            for di, d in enumerate(dets):
+                iou = bbox_iou(tb, d['bbox'])
+                hs  = hist_sim(th, crop_hist(frame, d['bbox']))
+                cost[ti, di] = 1.0 - (iou * 0.60 + hs * 0.40)
+        mt, md = set(), set()
         while True:
-            avail=[(ti,di) for ti in range(len(tracks)) for di in range(len(dets))
-                   if ti not in mt and di not in md]
-            if not avail: break
-            ti,di=min(avail,key=lambda p:cost[p[0],p[1]])
-            if cost[ti,di]>=1.0-iou_thr: break
-            mt.add(ti); md.add(di)
-            t=tracks[ti]; d=dets[di]
-            t.update(d['bbox'],frame,d['conf'])
+            avail = [(ti, di) for ti in range(len(tracks)) for di in range(len(dets))
+                     if ti not in mt and di not in md]
+            if not avail:
+                break
+            ti, di = min(avail, key=lambda p: cost[p[0], p[1]])
+            if cost[ti, di] >= 1.0 - iou_thr:
+                break
+            mt.add(ti)
+            md.add(di)
+            t = tracks[ti]
+            d = dets[di]
+            t.update(d['bbox'], frame, d['conf'])
             if reactivate:
-                t.reactivate(d['bbox'],frame)
-                if t in self.lost_tracks: self.lost_tracks.remove(t)
-                if t not in self.active_tracks: self.active_tracks.append(t)
-            if d.get('kp') is not None: t._yolo_kp=d['kp']
-        return ([tracks[i] for i in range(len(tracks)) if i not in mt],
-                [dets[i]   for i in range(len(dets))   if i not in md])
+                t.reactivate(d['bbox'], frame)
+                if t in self.lost_tracks:
+                    self.lost_tracks.remove(t)
+                if t not in self.active_tracks:
+                    self.active_tracks.append(t)
+            if d.get('kp') is not None:
+                t._yolo_kp = d['kp']
+        return (
+            [tracks[i] for i in range(len(tracks)) if i not in mt],
+            [dets[i]   for i in range(len(dets))   if i not in md],
+        )
 
     def reset(self):
-        for t in self.active_tracks+self.lost_tracks: t.x[4:]=0.
-        print("[TRACKER] Scene cut — velocity reset.")
+        for t in self.active_tracks + self.lost_tracks:
+            t.x[4:] = 0.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TARGET LOCK  — single-player selector on top of ByteTracker
-#  Handles: occlusion, camera cuts, player overlap / identity swap
+#  TARGET LOCK
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TargetLock:
-    def __init__(self,seed_bbox,seed_hist,seed_frame_idx):
-        self._seed_bbox=seed_bbox; self._ref_hist=seed_hist
-        self._seed_fi=seed_frame_idx; self._target_id=None
-        self._last_bbox=None; self._smooth_box=None; self._alpha=0.35
-        self._state="searching"; self._lost_frames=0; self._fi=0
-        self.bt=ByteTracker(); self.scene=SceneChangeDetector()
+    def __init__(self, seed_bbox, seed_hist, seed_frame_idx):
+        self._seed_bbox    = seed_bbox
+        self._ref_hist     = seed_hist
+        self._seed_fi      = seed_frame_idx
+        self._target_id    = None
+        self._last_bbox    = None
+        self._smooth_box   = None
+        self._alpha        = 0.35
+        self._state        = "searching"
+        self._lost_frames  = 0
+        self._fi           = 0
+        self.bt    = ByteTracker()
+        self.scene = SceneChangeDetector()
 
     @property
-    def state(self): return self._state
+    def state(self):
+        return self._state
+
     @property
-    def lost_count(self): return self._lost_frames
+    def lost_count(self):
+        return self._lost_frames
 
-    def update(self,frame)->Optional[Tuple]:
-        # Scene cut
-        if self.scene.is_cut(frame) and self._fi>10:
-            print(f"[LOCK] Scene cut @ frame {self._fi}")
-            self.bt.reset(); self._target_id=None; self._state="searching"
+    def update(self, frame) -> Optional[Tuple]:
+        if self.scene.is_cut(frame) and self._fi > 10:
+            self.bt.reset()
+            self._target_id = None
+            self._state = "searching"
 
-        dets=_detection_layer.detect(frame)
-        tracks=self.bt.update(dets,frame)
-        self._fi+=1
+        dets   = _detection_layer.detect(frame)
+        tracks = self.bt.update(dets, frame)
+        self._fi += 1
 
-        # Initial lock
         if self._target_id is None:
-            if self._fi>=self._seed_fi:
-                self._target_id=self._choose(tracks,frame)
+            if self._fi >= self._seed_fi:
+                self._target_id = self._choose(tracks, frame)
                 if self._target_id is not None:
-                    print(f"[LOCK] Locked id={self._target_id} @ frame {self._fi}")
-                    self._state="tracking"
+                    self._state = "tracking"
             return None
 
-        target=next((t for t in tracks if t.id==self._target_id),None)
+        target = next((t for t in tracks if t.id == self._target_id), None)
         if target is not None:
-            target=self._resolve_overlap(target,tracks)
+            target = self._resolve_overlap(target, tracks)
 
         if target is None:
-            self._lost_frames+=1; self._state="lost"
-            target=self._reacquire(tracks,strict=self._lost_frames<=5)
+            self._lost_frames += 1
+            self._state = "lost"
+            target = self._reacquire(tracks, strict=self._lost_frames <= 5)
             if target is None:
-                target=self._reacquire(self.bt.lost_tracks,strict=False)
+                target = self._reacquire(self.bt.lost_tracks, strict=False)
         else:
-            self._lost_frames=0; self._state="tracking"
+            self._lost_frames = 0
+            self._state = "tracking"
 
-        if target is None: return None
-        self._target_id=target.id; self._last_bbox=target.get_bbox()
+        if target is None:
+            return None
+
+        self._target_id = target.id
+        self._last_bbox = target.get_bbox()
         return self._emit(self._last_bbox)
 
-    def _choose(self,tracks,frame)->Optional[int]:
-        if not tracks: return None
-        best,bid=-1.,None
+    def _choose(self, tracks, frame) -> Optional[int]:
+        if not tracks:
+            return None
+        best, bid = -1., None
         for t in tracks:
-            iou=bbox_iou(t.get_bbox(),self._seed_bbox)
-            hs=hist_sim(t.ref_hist,self._ref_hist)
-            sw,sh=self._seed_bbox[2],self._seed_bbox[3]
-            tw,th=t.get_bbox()[2],t.get_bbox()[3]
-            ss=min(sw*sh,tw*th)/(max(sw*sh,tw*th)+1e-6)
-            sc=iou*0.45+hs*0.40+ss*0.15
-            if sc>best: best,bid=sc,t.id
+            iou = bbox_iou(t.get_bbox(), self._seed_bbox)
+            hs  = hist_sim(t.ref_hist, self._ref_hist)
+            sw, sh = self._seed_bbox[2], self._seed_bbox[3]
+            tw, th = t.get_bbox()[2], t.get_bbox()[3]
+            ss = min(sw * sh, tw * th) / (max(sw * sh, tw * th) + 1e-6)
+            sc = iou * 0.45 + hs * 0.40 + ss * 0.15
+            if sc > best:
+                best, bid = sc, t.id
         return bid
 
-    def _reacquire(self,tracks,strict=True)->Optional[KalmanTrack]:
-        if not tracks: return None
-        thr=0.35 if strict else 0.18; best,bt=-1.,None
+    def _reacquire(self, tracks, strict=True) -> Optional[KalmanTrack]:
+        if not tracks:
+            return None
+        thr = 0.35 if strict else 0.18
+        best, bt = -1., None
         for t in tracks:
-            hs=hist_sim(t.ref_hist,self._ref_hist)
-            if hs<thr: continue
+            hs = hist_sim(t.ref_hist, self._ref_hist)
+            if hs < thr:
+                continue
             if self._last_bbox is not None:
-                lw,lh=self._last_bbox[2],self._last_bbox[3]
-                tw,th=t.get_bbox()[2],t.get_bbox()[3]
-                ss=min(lw*lh,tw*th)/(max(lw*lh,tw*th)+1e-6)
-                if ss<0.25: continue
-                sc=hs*0.65+ss*0.35
-            else: sc=hs
-            if sc>best: best,bt=sc,t
+                lw, lh = self._last_bbox[2], self._last_bbox[3]
+                tw, th = t.get_bbox()[2], t.get_bbox()[3]
+                ss = min(lw * lh, tw * th) / (max(lw * lh, tw * th) + 1e-6)
+                if ss < 0.25:
+                    continue
+                sc = hs * 0.65 + ss * 0.35
+            else:
+                sc = hs
+            if sc > best:
+                best, bt = sc, t
         if bt is not None:
-            print(f"[LOCK] Re-acquired id={bt.id} (score={best:.2f}) @ frame {self._fi}")
-            self._target_id=bt.id; self._state="tracking"
+            self._target_id = bt.id
+            self._state = "tracking"
         return bt
 
-    def _resolve_overlap(self,target,tracks)->KalmanTrack:
-        tb=target.get_bbox()
+    def _resolve_overlap(self, target, tracks) -> KalmanTrack:
+        tb = target.get_bbox()
         for other in tracks:
-            if other.id==target.id: continue
-            if bbox_iou(tb,other.get_bbox())>0.55:
-                ts=hist_sim(target.ref_hist,self._ref_hist)
-                os=hist_sim(other.ref_hist,self._ref_hist)
-                if os>ts+0.12:
-                    print(f"[LOCK] Overlap swap {target.id}->{other.id} @ frame {self._fi}")
-                    self._target_id=other.id; return other
+            if other.id == target.id:
+                continue
+            if bbox_iou(tb, other.get_bbox()) > 0.55:
+                ts = hist_sim(target.ref_hist, self._ref_hist)
+                os = hist_sim(other.ref_hist, self._ref_hist)
+                if os > ts + 0.12:
+                    self._target_id = other.id
+                    return other
         return target
 
-    def _emit(self,bbox)->Tuple:
-        arr=np.array(bbox,dtype=float)
-        if self._smooth_box is None: self._smooth_box=arr
-        else: self._smooth_box=self._alpha*arr+(1-self._alpha)*self._smooth_box
+    def _emit(self, bbox) -> Tuple:
+        arr = np.array(bbox, dtype=float)
+        if self._smooth_box is None:
+            self._smooth_box = arr
+        else:
+            self._smooth_box = self._alpha * arr + (1 - self._alpha) * self._smooth_box
         return tuple(int(v) for v in self._smooth_box)
 
 
@@ -521,11 +708,13 @@ class TargetLock:
 #  MODULE-LEVEL DETECTION SINGLETON
 # ══════════════════════════════════════════════════════════════════════════════
 
-_detection_layer:Optional[DetectionLayer]=None
+_detection_layer: Optional[DetectionLayer] = None
 
-def _get_detection_layer(model_size="m")->DetectionLayer:
+
+def _get_detection_layer(model_size="m") -> DetectionLayer:
     global _detection_layer
-    if _detection_layer is None: _detection_layer=DetectionLayer(model_size)
+    if _detection_layer is None:
+        _detection_layer = DetectionLayer(model_size)
     return _detection_layer
 
 
@@ -533,198 +722,271 @@ def _get_detection_layer(model_size="m")->DetectionLayer:
 #  INTERACTIVE PLAYER PICKER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def pick_player_interactive(video_path:str)->Optional[dict]:
-    det=_get_detection_layer()
-    cap=cv2.VideoCapture(video_path)
-    if not cap.isOpened(): raise FileNotFoundError(video_path)
-    total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    W=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    WARMUP=min(90,total//3); cands=[]
+def pick_player_interactive(video_path: str) -> Optional[dict]:
+    det = _get_detection_layer()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    WARMUP = min(90, total // 3)
+    cands = []
     for fi in range(WARMUP):
-        ret,frame=cap.read()
-        if not ret: break
-        dets=det.detect(frame)
-        if dets: cands.append((frame.copy(),dets,fi))
+        ret, frame = cap.read()
+        if not ret:
+            break
+        dets = det.detect(frame)
+        if dets:
+            cands.append((frame.copy(), dets, fi))
     cap.release()
     if not cands:
-        print("[PICKER] No detections — auto-select.")
         return select_primary_player(video_path)
-    best_frame,best_dets,best_fi=max(cands,key=lambda c:len(c[1]))
-    display=cv2.addWeighted(best_frame.copy(),0.65,np.zeros_like(best_frame),0.35,0)
-    COLORS=[(0,255,180),(0,140,255),(255,215,0),(0,200,255),(180,0,255),(0,255,80),(255,80,80),(80,255,255)]
-    blobs=[d['bbox'] for d in best_dets]
-    for i,(bx,by,bw,bh) in enumerate(blobs):
-        col=COLORS[i%len(COLORS)]
-        cv2.rectangle(display,(bx,by),(bx+bw,by+bh),col,3,cv2.LINE_AA)
-        lbl=str(i+1); lw,_=cv2.getTextSize(lbl,cv2.FONT_HERSHEY_SIMPLEX,0.8,2)[0]
-        bxb=bx+bw//2-lw//2-6; byb=max(0,by-34)
-        cv2.rectangle(display,(bxb,byb),(bxb+lw+12,byb+28),col,-1)
-        cv2.putText(display,lbl,(bxb+6,byb+22),cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,0),2,cv2.LINE_AA)
-    BH=52; banner=np.full((BH,W,3),15,np.uint8)
-    mode_str=det.mode.upper()
-    cv2.putText(banner,f"[{mode_str}] CLICK player to track  |  ESC=auto",(W//2-260,34),
-                cv2.FONT_HERSHEY_SIMPLEX,0.68,(255,215,0),1,cv2.LINE_AA)
-    display=np.vstack([banner,display])
-    chosen=[None]
-    def on_click(ev,cx,cy,fl,p):
-        if ev!=cv2.EVENT_LBUTTONDOWN: return
-        ay=cy-BH
-        if ay<0: return
+
+    best_frame, best_dets, best_fi = max(cands, key=lambda c: len(c[1]))
+    display = cv2.addWeighted(best_frame.copy(), 0.65, np.zeros_like(best_frame), 0.35, 0)
+    COLORS = [
+        (0,255,180),(0,140,255),(255,215,0),(0,200,255),
+        (180,0,255),(0,255,80),(255,80,80),(80,255,255),
+    ]
+    blobs = [d['bbox'] for d in best_dets]
+    for i, (bx, by, bw, bh) in enumerate(blobs):
+        col = COLORS[i % len(COLORS)]
+        cv2.rectangle(display, (bx, by), (bx + bw, by + bh), col, 3, cv2.LINE_AA)
+        lbl = str(i + 1)
+        lw, _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        bxb, byb = bx + bw // 2 - lw // 2 - 6, max(0, by - 34)
+        cv2.rectangle(display, (bxb, byb), (bxb + lw + 12, byb + 28), col, -1)
+        cv2.putText(display, lbl, (bxb + 6, byb + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+    BH = 52
+    banner = np.full((BH, W, 3), 15, np.uint8)
+    cv2.putText(banner, "CLICK player to track  |  ESC=auto", (W // 2 - 200, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 215, 0), 1, cv2.LINE_AA)
+    display = np.vstack([banner, display])
+    chosen = [None]
+
+    def on_click(ev, cx, cy, fl, p):
+        if ev != cv2.EVENT_LBUTTONDOWN:
+            return
+        ay = cy - BH
+        if ay < 0:
+            return
         for b in blobs:
-            bx,by,bw,bh=b
-            if bx<=cx<=bx+bw and by<=ay<=by+bh: chosen[0]=b; return
-        chosen[0]=min(blobs,key=lambda b:math.hypot(cx-(b[0]+b[2]/2),ay-(b[1]+b[3]/2)))
-    cv2.namedWindow("Select Player",cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Select Player",min(W,1280),min(H+BH,800))
-    cv2.setMouseCallback("Select Player",on_click)
-    print(f"\n[PICKER] {len(blobs)} player(s) [{mode_str}].  Click to select, ESC=auto.\n")
+            bx, by, bw, bh = b
+            if bx <= cx <= bx + bw and by <= ay <= by + bh:
+                chosen[0] = b
+                return
+        chosen[0] = min(blobs, key=lambda b: math.hypot(
+            cx - (b[0] + b[2] / 2), ay - (b[1] + b[3] / 2)))
+
+    cv2.namedWindow("Select Player", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Select Player", min(W, 1280), min(H + BH, 800))
+    cv2.setMouseCallback("Select Player", on_click)
     while True:
-        cv2.imshow("Select Player",display)
-        if chosen[0] is not None or (cv2.waitKey(20)&0xFF)==27: break
+        cv2.imshow("Select Player", display)
+        if chosen[0] is not None or (cv2.waitKey(20) & 0xFF) == 27:
+            break
     cv2.destroyAllWindows()
     if chosen[0] is None:
-        print("[PICKER] ESC — auto-select."); return select_primary_player(video_path)
-    blob=chosen[0]; bx,by,bw,bh=blob
-    print(f"[PICKER] Selected bbox={blob}")
-    return {'hist':crop_hist(best_frame,blob),'size':(float(bw),float(bh)),
-            'seed_bbox':blob,'seed_frame':best_fi}
+        return select_primary_player(video_path)
+    blob = chosen[0]
+    bx, by, bw, bh = blob
+    return {'hist': crop_hist(best_frame, blob), 'size': (float(bw), float(bh)),
+            'seed_bbox': blob, 'seed_frame': best_fi}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AUTO PRE-SCAN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def select_primary_player(video_path:str,sample_step:int=6)->Optional[dict]:
-    det=_get_detection_layer()
-    cap=cv2.VideoCapture(video_path)
-    if not cap.isOpened(): return None
-    total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    tracks:List[dict]=[]; MAX_GAP=max(sample_step*5,30); fi=0
-    print(f"[PRE-SCAN] {total} frames (step={sample_step}) …")
+def select_primary_player(video_path: str, sample_step: int = 6) -> Optional[dict]:
+    det = _get_detection_layer()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    tracks: List[dict] = []
+    MAX_GAP = max(sample_step * 5, 30)
+    fi = 0
     while True:
-        ret,frame=cap.read()
-        if not ret: break
-        if fi%sample_step==0:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if fi % sample_step == 0:
             for d in det.detect(frame):
-                blob=d['bbox']; bx,by,bw,bh=blob; matched=False
+                blob = d['bbox']
+                bx, by, bw, bh = blob
+                matched = False
                 for tr in tracks:
-                    if fi-tr["lf"]>MAX_GAP: continue
-                    iou=bbox_iou(blob,tr["lb"])
-                    rw,rh=tr["ms"]
-                    ss=min(bw*bh,rw*rh)/(max(bw*bh,rw*rh)+1e-6)
-                    if iou*0.7+ss*0.3>0.15 and (iou>0.10 or ss>0.55):
-                        h=crop_hist(frame,blob); tr["n"]+=1
-                        if h is not None: tr["hs"].append(h)
-                        n=tr["n"]; pw,ph=tr["ms"]
-                        tr["ms"]=((pw*(n-1)+bw)/n,(ph*(n-1)+bh)/n)
-                        tr["lb"]=blob; tr["lf"]=fi; matched=True; break
+                    if fi - tr["lf"] > MAX_GAP:
+                        continue
+                    iou = bbox_iou(blob, tr["lb"])
+                    rw, rh = tr["ms"]
+                    ss = min(bw * bh, rw * rh) / (max(bw * bh, rw * rh) + 1e-6)
+                    if iou * 0.7 + ss * 0.3 > 0.15 and (iou > 0.10 or ss > 0.55):
+                        h = crop_hist(frame, blob)
+                        tr["n"] += 1
+                        if h is not None:
+                            tr["hs"].append(h)
+                        n = tr["n"]
+                        pw, ph = tr["ms"]
+                        tr["ms"] = ((pw * (n - 1) + bw) / n, (ph * (n - 1) + bh) / n)
+                        tr["lb"] = blob
+                        tr["lf"] = fi
+                        matched = True
+                        break
                 if not matched:
-                    h=crop_hist(frame,blob)
-                    tracks.append({"n":1,"hs":[h] if h is not None else [],"ms":(float(bw),float(bh)),
-                                   "lb":blob,"lf":fi,"sb":blob,"sf":fi})
-        fi+=1
+                    h = crop_hist(frame, blob)
+                    tracks.append({
+                        "n": 1,
+                        "hs": [h] if h is not None else [],
+                        "ms": (float(bw), float(bh)),
+                        "lb": blob, "lf": fi, "sb": blob, "sf": fi,
+                    })
+        fi += 1
     cap.release()
-    if not tracks: return None
-    best=max(tracks,key=lambda t:t["n"])
-    print(f"[PRE-SCAN] Best: {best['n']} hits, seed={best['sb']}")
-    mh=None
+    if not tracks:
+        return None
+    best = max(tracks, key=lambda t: t["n"])
+    mh = None
     if best["hs"]:
-        stacked=np.mean(best["hs"],axis=0).astype(np.float32); cv2.normalize(stacked,stacked); mh=stacked
-    return {'hist':mh,'size':best["ms"],'seed_bbox':best["sb"],'seed_frame':best["sf"]}
+        stacked = np.mean(best["hs"], axis=0).astype(np.float32)
+        cv2.normalize(stacked, stacked)
+        mh = stacked
+    return {'hist': mh, 'size': best["ms"], 'seed_bbox': best["sb"], 'seed_frame': best["sf"]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HYBRID POSE ESTIMATOR  — YOLO keypoints + geometric fallback
+#  HYBRID POSE ESTIMATOR
 # ══════════════════════════════════════════════════════════════════════════════
-
-_COCO={"nose":0,"left_shoulder":5,"right_shoulder":6,"left_elbow":7,"right_elbow":8,
-       "left_wrist":9,"right_wrist":10,"left_hip":11,"right_hip":12,
-       "left_knee":13,"right_knee":14,"left_ankle":15,"right_ankle":16}
 
 class HybridPoseEstimator:
-    _VP=dict(head=0.04,neck=0.11,shoulder=0.20,elbow=0.34,wrist=0.46,
-             hip=0.54,knee=0.73,ankle=0.91,foot=0.99)
+    _VP = dict(head=0.04, neck=0.11, shoulder=0.20, elbow=0.34, wrist=0.46,
+               hip=0.54, knee=0.73, ankle=0.91, foot=0.99)
 
-    def __init__(self): self._prev_cx=None; self._dh=deque(maxlen=8)
+    def __init__(self):
+        self._prev_cx = None
+        self._dh = deque(maxlen=8)
 
-    def estimate(self,frame,bbox,ts,spd=0.,yolo_kp=None)->PoseKeypoints:
-        x,y,w,h=bbox; cx=x+w/2.
-        disp=abs(cx-self._prev_cx) if self._prev_cx is not None else 0.
-        self._prev_cx=cx; self._dh.append(disp)
-        ds=sum(self._dh); phase=(ds/max(w*0.18,4.))*math.pi
-        swing=clamp01(spd/9.); arm_sw=swing*0.10*w; leg_sw=swing*0.08*w; k_lift=swing*0.08*h
-        cw=self._cwidths(frame,bbox); sh,hh=self._bwidths(cw,w,h)
-        def vy(f): return y+f*h
-        kp=PoseKeypoints()
-        kp.head=(cx,vy(self._VP["head"])); kp.neck=(cx,vy(self._VP["neck"]))
-        ls=(cx-sh,vy(self._VP["shoulder"])); rs=(cx+sh,vy(self._VP["shoulder"]))
-        kp.left_shoulder=ls; kp.right_shoulder=rs
-        kp.shoulder_center=((ls[0]+rs[0])/2.,(ls[1]+rs[1])/2.)
-        aoff=arm_sw*math.sin(phase)
-        le=(ls[0]-aoff,vy(self._VP["elbow"])); re=(rs[0]+aoff,vy(self._VP["elbow"]))
-        kp.left_elbow=le; kp.right_elbow=re
-        kp.left_wrist=(le[0]-aoff*.55,vy(self._VP["wrist"]))
-        kp.right_wrist=(re[0]+aoff*.55,vy(self._VP["wrist"]))
-        lh=(cx-hh,vy(self._VP["hip"])); rh=(cx+hh,vy(self._VP["hip"]))
-        kp.left_hip=lh; kp.right_hip=rh
-        kp.hip_center=((lh[0]+rh[0])/2.,(lh[1]+rh[1])/2.)
-        loff=leg_sw*math.sin(phase); roff=-loff
-        ll=k_lift*max(0.,math.sin(phase)); rl=k_lift*max(0.,-math.sin(phase))
-        kp.left_knee=(lh[0]+loff,vy(self._VP["knee"])-ll)
-        kp.right_knee=(rh[0]+roff,vy(self._VP["knee"])-rl)
-        kp.left_ankle=(lh[0]+loff*.45,vy(self._VP["ankle"])-ll*.5)
-        kp.right_ankle=(rh[0]+roff*.45,vy(self._VP["ankle"])-rl*.5)
-        kp.left_foot=(kp.left_ankle[0]+w*.07,vy(self._VP["foot"]))
-        kp.right_foot=(kp.right_ankle[0]+w*.07,vy(self._VP["foot"]))
-        # Overlay YOLO where available
-        if yolo_kp is not None and len(yolo_kp)==17:
+    def estimate(self, frame, bbox, ts, spd=0., yolo_kp=None) -> PoseKeypoints:
+        x, y, w, h = bbox
+        cx = x + w / 2.
+        disp = abs(cx - self._prev_cx) if self._prev_cx is not None else 0.
+        self._prev_cx = cx
+        self._dh.append(disp)
+        ds = sum(self._dh)
+        phase = (ds / max(w * 0.18, 4.)) * math.pi
+        swing = clamp01(spd / 9.)
+        arm_sw = swing * 0.10 * w
+        leg_sw = swing * 0.08 * w
+        k_lift = swing * 0.08 * h
+        cw = self._cwidths(frame, bbox)
+        sh, hh = self._bwidths(cw, w, h)
+
+        def vy(f): return y + f * h
+
+        kp = PoseKeypoints()
+        kp.head = (cx, vy(self._VP["head"]))
+        kp.neck = (cx, vy(self._VP["neck"]))
+        ls = (cx - sh, vy(self._VP["shoulder"]))
+        rs = (cx + sh, vy(self._VP["shoulder"]))
+        kp.left_shoulder  = ls
+        kp.right_shoulder = rs
+        kp.shoulder_center = ((ls[0] + rs[0]) / 2., (ls[1] + rs[1]) / 2.)
+        aoff = arm_sw * math.sin(phase)
+        le = (ls[0] - aoff, vy(self._VP["elbow"]))
+        re = (rs[0] + aoff, vy(self._VP["elbow"]))
+        kp.left_elbow  = le
+        kp.right_elbow = re
+        kp.left_wrist  = (le[0] - aoff * .55, vy(self._VP["wrist"]))
+        kp.right_wrist = (re[0] + aoff * .55, vy(self._VP["wrist"]))
+        lh = (cx - hh, vy(self._VP["hip"]))
+        rh = (cx + hh, vy(self._VP["hip"]))
+        kp.left_hip   = lh
+        kp.right_hip  = rh
+        kp.hip_center = ((lh[0] + rh[0]) / 2., (lh[1] + rh[1]) / 2.)
+        loff = leg_sw * math.sin(phase)
+        roff = -loff
+        ll = k_lift * max(0., math.sin(phase))
+        rl = k_lift * max(0., -math.sin(phase))
+        kp.left_knee   = (lh[0] + loff, vy(self._VP["knee"]) - ll)
+        kp.right_knee  = (rh[0] + roff, vy(self._VP["knee"]) - rl)
+        kp.left_ankle  = (lh[0] + loff * .45, vy(self._VP["ankle"]) - ll * .5)
+        kp.right_ankle = (rh[0] + roff * .45, vy(self._VP["ankle"]) - rl * .5)
+        kp.left_foot   = (kp.left_ankle[0] + w * .07,  vy(self._VP["foot"]))
+        kp.right_foot  = (kp.right_ankle[0] + w * .07, vy(self._VP["foot"]))
+
+        if yolo_kp is not None and len(yolo_kp) == 17:
             def g(nm):
-                i=_COCO.get(nm)
-                if i is None: return None
-                pt=yolo_kp[i]
-                return (float(pt[0]),float(pt[1])) if (pt[0]>1 or pt[1]>1) else None
-            def gxy(nm,df): p=g(nm); return p if p is not None else df
-            kp.left_shoulder=gxy("left_shoulder",kp.left_shoulder)
-            kp.right_shoulder=gxy("right_shoulder",kp.right_shoulder)
-            kp.left_elbow=gxy("left_elbow",kp.left_elbow)
-            kp.right_elbow=gxy("right_elbow",kp.right_elbow)
-            kp.left_wrist=gxy("left_wrist",kp.left_wrist)
-            kp.right_wrist=gxy("right_wrist",kp.right_wrist)
-            kp.left_hip=gxy("left_hip",kp.left_hip)
-            kp.right_hip=gxy("right_hip",kp.right_hip)
-            kp.left_knee=gxy("left_knee",kp.left_knee)
-            kp.right_knee=gxy("right_knee",kp.right_knee)
-            kp.left_ankle=gxy("left_ankle",kp.left_ankle)
-            kp.right_ankle=gxy("right_ankle",kp.right_ankle)
-            nose=g("nose")
-            if nose: kp.head=nose
-            kp.shoulder_center=((kp.left_shoulder[0]+kp.right_shoulder[0])/2.,
-                                  (kp.left_shoulder[1]+kp.right_shoulder[1])/2.)
-            kp.hip_center=((kp.left_hip[0]+kp.right_hip[0])/2.,
-                            (kp.left_hip[1]+kp.right_hip[1])/2.)
-            kp.neck=((kp.shoulder_center[0]+kp.head[0])/2.,
-                      (kp.shoulder_center[1]+kp.head[1])/2.)
-            for side in ("left","right"):
-                ank=getattr(kp,f"{side}_ankle")
-                object.__setattr__(kp,f"{side}_foot",(ank[0]+w*.04,ank[1]+h*.03))
+                i = _COCO.get(nm)
+                if i is None:
+                    return None
+                pt = yolo_kp[i]
+                return (float(pt[0]), float(pt[1])) if (pt[0] > 1 or pt[1] > 1) else None
+
+            def gxy(nm, df):
+                p = g(nm)
+                return p if p is not None else df
+
+            kp.left_shoulder  = gxy("left_shoulder",  kp.left_shoulder)
+            kp.right_shoulder = gxy("right_shoulder", kp.right_shoulder)
+            kp.left_elbow     = gxy("left_elbow",     kp.left_elbow)
+            kp.right_elbow    = gxy("right_elbow",    kp.right_elbow)
+            kp.left_wrist     = gxy("left_wrist",     kp.left_wrist)
+            kp.right_wrist    = gxy("right_wrist",    kp.right_wrist)
+            kp.left_hip       = gxy("left_hip",       kp.left_hip)
+            kp.right_hip      = gxy("right_hip",      kp.right_hip)
+            kp.left_knee      = gxy("left_knee",      kp.left_knee)
+            kp.right_knee     = gxy("right_knee",     kp.right_knee)
+            kp.left_ankle     = gxy("left_ankle",     kp.left_ankle)
+            kp.right_ankle    = gxy("right_ankle",    kp.right_ankle)
+            nose = g("nose")
+            if nose:
+                kp.head = nose
+            kp.shoulder_center = (
+                (kp.left_shoulder[0] + kp.right_shoulder[0]) / 2.,
+                (kp.left_shoulder[1] + kp.right_shoulder[1]) / 2.,
+            )
+            kp.hip_center = (
+                (kp.left_hip[0] + kp.right_hip[0]) / 2.,
+                (kp.left_hip[1] + kp.right_hip[1]) / 2.,
+            )
+            kp.neck = (
+                (kp.shoulder_center[0] + kp.head[0]) / 2.,
+                (kp.shoulder_center[1] + kp.head[1]) / 2.,
+            )
+            for side in ("left", "right"):
+                ank = getattr(kp, f"{side}_ankle")
+                object.__setattr__(kp, f"{side}_foot", (ank[0] + w * .04, ank[1] + h * .03))
         return kp
 
-    def _cwidths(self,frame,bbox):
-        bx,by,bw,bh=bbox; H,W=frame.shape[:2]
-        bx2=min(bx+bw,W); by2=min(by+bh,H); bx=max(0,bx); by=max(0,by)
-        if bx2-bx<5 or by2-by<5: return None
-        crop=frame[by:by2,bx:bx2]
-        _,mask=cv2.threshold(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        ws=np.array([np.sum(mask[r]>0) for r in range(mask.shape[0])],dtype=float)
-        return smooth_arr(ws,w=max(3,bh//20)) if len(ws)>5 else None
+    def _cwidths(self, frame, bbox):
+        bx, by, bw, bh = bbox
+        H, W = frame.shape[:2]
+        bx2, by2 = min(bx + bw, W), min(by + bh, H)
+        bx, by = max(0, bx), max(0, by)
+        if bx2 - bx < 5 or by2 - by < 5:
+            return None
+        crop = frame[by:by2, bx:bx2]
+        _, mask = cv2.threshold(
+            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        ws = np.array([np.sum(mask[r] > 0) for r in range(mask.shape[0])], dtype=float)
+        return smooth_arr(ws, w=max(3, bh // 20)) if len(ws) > 5 else None
 
-    def _bwidths(self,cw,bw,bh):
-        dsh=bw*.29; dh=bw*.17
-        if cw is None or len(cw)<10: return dsh,dh
-        n=len(cw); u=cw[int(n*.15):int(n*.40)]; l=cw[int(n*.48):int(n*.68)]
-        sh=float(np.max(u))/2. if len(u) else dsh
-        hh=float(np.max(l))/2. if len(l) else dh
-        return float(np.clip(sh,bw*.18,bw*.42)),float(np.clip(hh,bw*.10,bw*.32))
+    def _bwidths(self, cw, bw, bh):
+        dsh = bw * .29
+        dh  = bw * .17
+        if cw is None or len(cw) < 10:
+            return dsh, dh
+        n = len(cw)
+        u = cw[int(n * .15):int(n * .40)]
+        l = cw[int(n * .48):int(n * .68)]
+        sh = float(np.max(u)) / 2. if len(u) else dsh
+        hh = float(np.max(l)) / 2. if len(l) else dh
+        return float(np.clip(sh, bw * .18, bw * .42)), float(np.clip(hh, bw * .10, bw * .32))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -732,26 +994,44 @@ class HybridPoseEstimator:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class JointKalman:
-    def __init__(self,pn=1.5,on=8.0):
-        self.x=None; self.v=0.; self.P=np.array([[100.,0.],[0.,100.]])
-        self.Q=np.diag([pn,pn*2]); self.R=on
-        self.F=np.array([[1.,1.],[0.,1.]]); self.H=np.array([[1.,0.]])
-    def update(self,z):
-        if self.x is None: self.x=z; return z
-        st=self.F@np.array([self.x,self.v]); Pp=self.F@self.P@self.F.T+self.Q
-        y=z-(self.H@st)[0]; S=(self.H@Pp@self.H.T)[0,0]+self.R
-        K=Pp@self.H.T/S; st=st+(K*y).flatten()
-        self.P=(np.eye(2)-np.outer(K.flatten(),self.H))@Pp
-        self.x,self.v=float(st[0]),float(st[1]); return self.x
+    def __init__(self, pn=1.5, on=8.0):
+        self.x = None
+        self.v = 0.
+        self.P = np.array([[100., 0.], [0., 100.]])
+        self.Q = np.diag([pn, pn * 2])
+        self.R = on
+        self.F = np.array([[1., 1.], [0., 1.]])
+        self.H = np.array([[1., 0.]])
+
+    def update(self, z):
+        if self.x is None:
+            self.x = z
+            return z
+        st = self.F @ np.array([self.x, self.v])
+        Pp = self.F @ self.P @ self.F.T + self.Q
+        y  = z - (self.H @ st)[0]
+        S  = (self.H @ Pp @ self.H.T)[0, 0] + self.R
+        K  = Pp @ self.H.T / S
+        st = st + (K * y).flatten()
+        self.P = (np.eye(2) - np.outer(K.flatten(), self.H)) @ Pp
+        self.x, self.v = float(st[0]), float(st[1])
+        return self.x
+
 
 class PoseKalmanSmoother:
-    def __init__(self): self._kx={}; self._ky={}
-    def smooth(self,kp):
-        out=PoseKeypoints()
+    def __init__(self):
+        self._kx = {}
+        self._ky = {}
+
+    def smooth(self, kp) -> PoseKeypoints:
+        out = PoseKeypoints()
         for nm in JOINT_NAMES:
-            raw=getattr(kp,nm)
-            if nm not in self._kx: self._kx[nm]=JointKalman(); self._ky[nm]=JointKalman()
-            object.__setattr__(out,nm,(self._kx[nm].update(raw[0]),self._ky[nm].update(raw[1])))
+            raw = getattr(kp, nm)
+            if nm not in self._kx:
+                self._kx[nm] = JointKalman()
+                self._ky[nm] = JointKalman()
+            object.__setattr__(out, nm,
+                               (self._kx[nm].update(raw[0]), self._ky[nm].update(raw[1])))
         return out
 
 
@@ -759,978 +1039,1595 @@ class PoseKalmanSmoother:
 #  SKELETON RENDERER
 # ══════════════════════════════════════════════════════════════════════════════
 
-_W=(240,240,240); _L=(255,200,0); _R=(0,140,255); _S=(180,240,180)
-BONE_DEFS=[
-    ("head","neck",_W,_W,4),("neck","shoulder_center",_W,_S,4),
-    ("shoulder_center","hip_center",_S,_S,5),
-    ("left_shoulder","left_elbow",_L,_L,5),("left_elbow","left_wrist",_L,_L,4),
-    ("right_shoulder","right_elbow",_R,_R,5),("right_elbow","right_wrist",_R,_R,4),
-    ("left_shoulder","right_shoulder",_L,_R,4),("left_hip","right_hip",_L,_R,5),
-    ("left_hip","left_knee",_L,_L,7),("left_knee","left_ankle",_L,_L,6),("left_ankle","left_foot",_L,_L,4),
-    ("right_hip","right_knee",_R,_R,7),("right_knee","right_ankle",_R,_R,6),("right_ankle","right_foot",_R,_R,4),
+_W  = (240, 240, 240)
+_L  = (255, 200, 0)
+_R  = (0, 140, 255)
+_S  = (180, 240, 180)
+
+BONE_DEFS = [
+    ("head",            "neck",            _W, _W, 4),
+    ("neck",            "shoulder_center", _W, _S, 4),
+    ("shoulder_center", "hip_center",      _S, _S, 5),
+    ("left_shoulder",   "left_elbow",      _L, _L, 5),
+    ("left_elbow",      "left_wrist",      _L, _L, 4),
+    ("right_shoulder",  "right_elbow",     _R, _R, 5),
+    ("right_elbow",     "right_wrist",     _R, _R, 4),
+    ("left_shoulder",   "right_shoulder",  _L, _R, 4),
+    ("left_hip",        "right_hip",       _L, _R, 5),
+    ("left_hip",        "left_knee",       _L, _L, 7),
+    ("left_knee",       "left_ankle",      _L, _L, 6),
+    ("left_ankle",      "left_foot",       _L, _L, 4),
+    ("right_hip",       "right_knee",      _R, _R, 7),
+    ("right_knee",      "right_ankle",     _R, _R, 6),
+    ("right_ankle",     "right_foot",      _R, _R, 4),
 ]
 
-def draw_gradient_bone(img,p1,p2,c1,c2,th,rt=0.):
-    s=max(8,int(dist2d(p1,p2)/4))
+
+def draw_gradient_bone(img, p1, p2, c1, c2, th, rt=0.):
+    s = max(8, int(dist2d(p1, p2) / 4))
     for i in range(s):
-        t=i/max(s-1,1); t2=(i+1)/max(s-1,1)
-        col=lerp_color(lerp_color(c1,c2,t),(0,0,220),rt*.6)
-        cv2.line(img,(int(p1[0]+t*(p2[0]-p1[0])),int(p1[1]+t*(p2[1]-p1[1]))),
-                 (int(p1[0]+t2*(p2[0]-p1[0])),int(p1[1]+t2*(p2[1]-p1[1]))),col,th,cv2.LINE_AA)
+        t  = i / max(s - 1, 1)
+        t2 = (i + 1) / max(s - 1, 1)
+        col = lerp_color(lerp_color(c1, c2, t), (0, 0, 220), rt * .6)
+        cv2.line(img,
+                 (int(p1[0] + t  * (p2[0] - p1[0])), int(p1[1] + t  * (p2[1] - p1[1]))),
+                 (int(p1[0] + t2 * (p2[0] - p1[0])), int(p1[1] + t2 * (p2[1] - p1[1]))),
+                 col, th, cv2.LINE_AA)
 
-def draw_glow_joint(img,pt,r,col,ga=0.45):
-    px,py=int(pt[0]),int(pt[1])
-    for rr in range(r+6,r,-2):
-        ov=img.copy(); cv2.circle(ov,(px,py),rr,col,-1,cv2.LINE_AA)
-        cv2.addWeighted(ov,ga*(1-(rr-r)/6.),img,1-ga*(1-(rr-r)/6.),0,img)
-    cv2.circle(img,(px,py),r,(255,255,255),-1,cv2.LINE_AA)
-    cv2.circle(img,(px,py),max(1,r-2),col,-1,cv2.LINE_AA)
 
-def render_skeleton(frame,kp,risk_tint=0.):
-    kpd={n:getattr(kp,n) for n in JOINT_NAMES}
-    for a,b,c1,c2,th in BONE_DEFS:
-        if a in kpd and b in kpd: draw_gradient_bone(frame,kpd[a],kpd[b],c1,c2,th,risk_tint)
-    sz={"head":4,"neck":3,"left_shoulder":4,"right_shoulder":4,"left_elbow":3,"right_elbow":3,
-        "left_wrist":3,"right_wrist":3,"left_hip":5,"right_hip":5,"left_knee":6,"right_knee":6,
-        "left_ankle":5,"right_ankle":5,"left_foot":3,"right_foot":3}
-    for nm,r in sz.items():
+def draw_glow_joint(img, pt, r, col, ga=0.45):
+    px, py = int(pt[0]), int(pt[1])
+    for rr in range(r + 6, r, -2):
+        ov = img.copy()
+        cv2.circle(ov, (px, py), rr, col, -1, cv2.LINE_AA)
+        cv2.addWeighted(ov, ga * (1 - (rr - r) / 6.), img, 1 - ga * (1 - (rr - r) / 6.), 0, img)
+    cv2.circle(img, (px, py), r,          (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(img, (px, py), max(1, r-2), col,            -1, cv2.LINE_AA)
+
+
+def render_skeleton(frame, kp, risk_tint=0.):
+    kpd = {n: getattr(kp, n) for n in JOINT_NAMES}
+    for a, b, c1, c2, th in BONE_DEFS:
+        if a in kpd and b in kpd:
+            draw_gradient_bone(frame, kpd[a], kpd[b], c1, c2, th, risk_tint)
+    sz = {
+        "head": 4, "neck": 3,
+        "left_shoulder": 4, "right_shoulder": 4,
+        "left_elbow": 3,    "right_elbow": 3,
+        "left_wrist": 3,    "right_wrist": 3,
+        "left_hip": 5,      "right_hip": 5,
+        "left_knee": 6,     "right_knee": 6,
+        "left_ankle": 5,    "right_ankle": 5,
+        "left_foot": 3,     "right_foot": 3,
+    }
+    for nm, r in sz.items():
         if nm in kpd:
-            col=lerp_color(_L if "left" in nm else _R if "right" in nm else _W,(0,0,220),risk_tint*.5)
-            draw_glow_joint(frame,kpd[nm],r,col)
-
-def draw_risk_gauge(frame,cx,cy,radius,s,label="RISK"):
-    cv2.ellipse(frame,(cx,cy),(radius,radius),225,0,270,(30,30,30),6,cv2.LINE_AA)
-    sw=int(270*clamp01(s/100.))
-    if sw>0: cv2.ellipse(frame,(cx,cy),(radius,radius),225,0,sw,risk_color(s),6,cv2.LINE_AA)
-    col=risk_color(s)
-    cv2.putText(frame,f"{s:.0f}",(cx-18,cy+7),cv2.FONT_HERSHEY_SIMPLEX,.75,col,2,cv2.LINE_AA)
-    cv2.putText(frame,label,(cx-20,cy+radius-2),cv2.FONT_HERSHEY_SIMPLEX,.38,(180,180,180),1,cv2.LINE_AA)
+            col = lerp_color(
+                _L if "left" in nm else _R if "right" in nm else _W,
+                (0, 0, 220), risk_tint * .5,
+            )
+            draw_glow_joint(frame, kpd[nm], r, col)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BIOMECHANICS ENGINE  (Sports2D-style joint angles + Butterworth smoothing)
+#  BIOMECHANICS ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class BioFrame:
-    """Extended per-frame biomechanics from Sports2D-style analysis."""
-    frame_idx: int = 0; timestamp: float = 0.
-    left_knee_flexion: float = 0.;   right_knee_flexion: float = 0.
-    left_hip_flexion: float = 0.;    right_hip_flexion: float = 0.
-    left_ankle_dorsiflexion: float = 0.; right_ankle_dorsiflexion: float = 0.
-    left_elbow_flexion: float = 0.;  right_elbow_flexion: float = 0.
-    trunk_lateral_lean: float = 0.;  trunk_sagittal_lean: float = 0.
-    pelvis_obliquity: float = 0.;    pelvis_rotation: float = 0.
-    left_thigh_angle: float = 0.;    right_thigh_angle: float = 0.
-    left_shank_angle: float = 0.;    right_shank_angle: float = 0.
-    trunk_segment_angle: float = 0.
-    left_valgus_clinical: float = 0.; right_valgus_clinical: float = 0.
-    left_arm_swing: float = 0.;      right_arm_swing: float = 0.
-    arm_swing_asymmetry: float = 0.
-    left_knee_ang_vel: float = 0.;   right_knee_ang_vel: float = 0.
-    left_hip_ang_vel: float = 0.;    right_hip_ang_vel: float = 0.
-    left_heel_strike: bool = False;  right_heel_strike: bool = False
-    left_toe_off: bool = False;      right_toe_off: bool = False
-    stance_left: bool = False;       stance_right: bool = False
-    double_support: bool = False
-    step_width: float = 0.;          foot_progression_angle: float = 0.
-
 
 class BiomechanicsEngine:
-    """
-    Sports2D-convention joint angles, Butterworth LP smoothing,
-    SKDH-style heel-strike / toe-off detection.
-    Works in pure numpy; upgrades automatically when scipy / sports2d available.
-    """
-    FILTER_HZ = 6.0   # Sports2D default low-pass cutoff
+    FILTER_HZ = 6.0
 
     def __init__(self, fps: float = 25.0, pix_to_m: float = 0.002):
-        self.fps = fps; self.pix_to_m = pix_to_m
-        self.frames: List[BioFrame] = []
-        self._ah: dict = {}          # angle history for angular velocity
-        self._la_y: List[float] = []; self._ra_y: List[float] = []
-        self._lf_x: List[float] = []; self._rf_x: List[float] = []
-        self.lhs: List[int] = []; self.rhs: List[int] = []
-        self.lto: List[int] = []; self.rto: List[int] = []
-        backend = "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy"
-        # Status already summarized in SportsAnalyzer initialization report
+        self.fps       = fps
+        self.pix_to_m  = pix_to_m
+        self.frames:   List[BioFrame] = []
+        self._ah:      dict = {}
+        self._la_y:    List[float] = []
+        self._ra_y:    List[float] = []
+        self._lf_x:    List[float] = []
+        self._rf_x:    List[float] = []
+        self.lhs:      List[int] = []
+        self.rhs:      List[int] = []
+        self.lto:      List[int] = []
+        self.rto:      List[int] = []
 
-    # ── per-frame ─────────────────────────────────────────────────────────────
     def process_frame(self, fi: int, ts: float, kp: PoseKeypoints) -> BioFrame:
         bf = BioFrame(frame_idx=fi, timestamp=ts)
 
-        # ── Joint angles via Sports2D adapter (ISB convention) ────────────
-        bf.left_knee_flexion   = _s2d_joint_angle(kp.left_hip,  kp.left_knee,  kp.left_ankle)
-        bf.right_knee_flexion  = _s2d_joint_angle(kp.right_hip, kp.right_knee, kp.right_ankle)
-        bf.left_hip_flexion    = _s2d_joint_angle(kp.shoulder_center, kp.left_hip,  kp.left_knee)
-        bf.right_hip_flexion   = _s2d_joint_angle(kp.shoulder_center, kp.right_hip, kp.right_knee)
-        bf.left_ankle_dorsiflexion  = _s2d_joint_angle(kp.left_knee,  kp.left_ankle,  kp.left_foot)
-        bf.right_ankle_dorsiflexion = _s2d_joint_angle(kp.right_knee, kp.right_ankle, kp.right_foot)
-        bf.left_elbow_flexion  = _s2d_joint_angle(kp.left_shoulder,  kp.left_elbow,  kp.left_wrist)
-        bf.right_elbow_flexion = _s2d_joint_angle(kp.right_shoulder, kp.right_elbow, kp.right_wrist)
+        bf.left_knee_flexion         = _s2d_joint_angle(kp.left_hip,  kp.left_knee,  kp.left_ankle)
+        bf.right_knee_flexion        = _s2d_joint_angle(kp.right_hip, kp.right_knee, kp.right_ankle)
+        bf.left_hip_flexion          = _s2d_joint_angle(kp.shoulder_center, kp.left_hip,  kp.left_knee)
+        bf.right_hip_flexion         = _s2d_joint_angle(kp.shoulder_center, kp.right_hip, kp.right_knee)
+        bf.left_ankle_dorsiflexion   = _s2d_joint_angle(kp.left_knee,  kp.left_ankle,  kp.left_foot)
+        bf.right_ankle_dorsiflexion  = _s2d_joint_angle(kp.right_knee, kp.right_ankle, kp.right_foot)
+        bf.left_elbow_flexion        = _s2d_joint_angle(kp.left_shoulder,  kp.left_elbow,  kp.left_wrist)
+        bf.right_elbow_flexion       = _s2d_joint_angle(kp.right_shoulder, kp.right_elbow, kp.right_wrist)
 
-        # ── Segment angles to vertical via Sports2D adapter ───────────────
         bf.left_thigh_angle    = _s2d_seg_angle(kp.left_hip,   kp.left_knee)
         bf.right_thigh_angle   = _s2d_seg_angle(kp.right_hip,  kp.right_knee)
         bf.left_shank_angle    = _s2d_seg_angle(kp.left_knee,  kp.left_ankle)
         bf.right_shank_angle   = _s2d_seg_angle(kp.right_knee, kp.right_ankle)
         bf.trunk_segment_angle = _s2d_seg_angle(kp.hip_center, kp.shoulder_center)
 
-        # Trunk lean
-        dx = kp.shoulder_center[0]-kp.hip_center[0]; dy = kp.shoulder_center[1]-kp.hip_center[1]
-        bf.trunk_lateral_lean  = math.degrees(math.atan2(dx,  abs(dy)+1e-9))
-        bf.trunk_sagittal_lean = math.degrees(math.atan2(abs(dx), abs(dy)+1e-9))
+        dx = kp.shoulder_center[0] - kp.hip_center[0]
+        dy = kp.shoulder_center[1] - kp.hip_center[1]
+        bf.trunk_lateral_lean  = math.degrees(math.atan2(dx,       abs(dy) + 1e-9))
+        bf.trunk_sagittal_lean = math.degrees(math.atan2(abs(dx),  abs(dy) + 1e-9))
 
-        # Pelvis
-        hd = kp.left_hip[1]-kp.right_hip[1]; hw = dist2d(kp.left_hip,kp.right_hip)+1e-9
+        hd = kp.left_hip[1] - kp.right_hip[1]
+        hw = dist2d(kp.left_hip, kp.right_hip) + 1e-9
         bf.pelvis_obliquity = math.degrees(math.atan2(abs(hd), hw))
-        bf.pelvis_rotation  = abs(hd)/hw*100.
+        bf.pelvis_rotation  = abs(hd) / hw * 100.
 
-        # Clinical valgus (signed: +ve=valgus, -ve=varus)
         bf.left_valgus_clinical  = self._clinical_valgus(kp.left_hip,  kp.left_knee,  kp.left_ankle)
         bf.right_valgus_clinical = self._clinical_valgus(kp.right_hip, kp.right_knee, kp.right_ankle)
 
-        # Arm swing excursion
-        bf.left_arm_swing  = abs(self._seg_to_vert(kp.left_shoulder,  kp.left_elbow))
-        bf.right_arm_swing = abs(self._seg_to_vert(kp.right_shoulder, kp.right_elbow))
+        bf.left_arm_swing      = abs(self._seg_to_vert(kp.left_shoulder,  kp.left_elbow))
+        bf.right_arm_swing     = abs(self._seg_to_vert(kp.right_shoulder, kp.right_elbow))
         bf.arm_swing_asymmetry = abs(bf.left_arm_swing - bf.right_arm_swing)
 
-        # Angular velocities (deg/s)
-        bf.left_knee_ang_vel  = self._angvel("lk", bf.left_knee_flexion)
-        bf.right_knee_ang_vel = self._angvel("rk", bf.right_knee_flexion)
-        bf.left_hip_ang_vel   = self._angvel("lh", bf.left_hip_flexion)
-        bf.right_hip_ang_vel  = self._angvel("rh", bf.right_hip_flexion)
+        bf.left_knee_ang_vel   = self._angvel("lk", bf.left_knee_flexion)
+        bf.right_knee_ang_vel  = self._angvel("rk", bf.right_knee_flexion)
+        bf.left_hip_ang_vel    = self._angvel("lh", bf.left_hip_flexion)
+        bf.right_hip_ang_vel   = self._angvel("rh", bf.right_hip_flexion)
 
-        # Step width
-        bf.step_width = abs(kp.left_foot[0]-kp.right_foot[0]) * self.pix_to_m
+        bf.step_width = abs(kp.left_foot[0] - kp.right_foot[0]) * self.pix_to_m
 
-        # Foot progression
-        la = math.degrees(math.atan2(kp.left_foot[0]-kp.left_ankle[0],  abs(kp.left_foot[1]-kp.left_ankle[1])+1e-9))
-        ra = math.degrees(math.atan2(kp.right_foot[0]-kp.right_ankle[0], abs(kp.right_foot[1]-kp.right_ankle[1])+1e-9))
-        bf.foot_progression_angle = (abs(la)+abs(ra))/2.
+        la = math.degrees(math.atan2(kp.left_foot[0]  - kp.left_ankle[0],
+                                     abs(kp.left_foot[1]  - kp.left_ankle[1])  + 1e-9))
+        ra = math.degrees(math.atan2(kp.right_foot[0] - kp.right_ankle[0],
+                                     abs(kp.right_foot[1] - kp.right_ankle[1]) + 1e-9))
+        bf.foot_progression_angle = (abs(la) + abs(ra)) / 2.
 
-        self._la_y.append(kp.left_ankle[1]); self._ra_y.append(kp.right_ankle[1])
-        self._lf_x.append(kp.left_foot[0]);  self._rf_x.append(kp.right_foot[0])
+        self._la_y.append(kp.left_ankle[1])
+        self._ra_y.append(kp.right_ankle[1])
+        self._lf_x.append(kp.left_foot[0])
+        self._rf_x.append(kp.right_foot[0])
         self.frames.append(bf)
         return bf
 
-    # ── post-processing ───────────────────────────────────────────────────────
     def post_process(self):
-        if len(self.frames) < 8: return
-        # Smooth all continuous angle fields
-        for field in ["left_knee_flexion","right_knee_flexion","left_hip_flexion",
-                      "right_hip_flexion","left_ankle_dorsiflexion","right_ankle_dorsiflexion",
-                      "trunk_lateral_lean","trunk_sagittal_lean",
-                      "left_valgus_clinical","right_valgus_clinical"]:
+        if len(self.frames) < 8:
+            return
+        for field in [
+            "left_knee_flexion", "right_knee_flexion",
+            "left_hip_flexion", "right_hip_flexion",
+            "left_ankle_dorsiflexion", "right_ankle_dorsiflexion",
+            "trunk_lateral_lean", "trunk_sagittal_lean",
+            "left_valgus_clinical", "right_valgus_clinical",
+        ]:
             raw = np.array([getattr(f, field) for f in self.frames], dtype=float)
             sm  = self._smooth(raw)
             for i, bf in enumerate(self.frames):
                 object.__setattr__(bf, field, float(sm[i]))
 
-        # ── Gait event detection ──────────────────────────────────────────────
-        # In image coordinates Y increases downward.
-        # Heel-strike = ankle at its LOWEST point in the image = MAXIMUM Y value = peak of signal.
-        # Toe-off     = ankle leaving the ground = minimum Y = TROUGH = peak of -signal.
-        # Previous code had these swapped — fixed here.
         md = max(4, int(self.fps * 0.18))
-        la = np.array(self._la_y); ra = np.array(self._ra_y)
-        self.lhs = self._peaks( la, md)   # heel-strike left  = peak of Y (foot at ground)
-        self.rhs = self._peaks( ra, md)   # heel-strike right
-        self.lto = self._peaks(-la, md)   # toe-off left      = trough of Y (foot leaving ground)
-        self.rto = self._peaks(-ra, md)   # toe-off right
+        la = np.array(self._la_y)
+        ra = np.array(self._ra_y)
+        self.lhs = self._peaks( la, md)
+        self.rhs = self._peaks( ra, md)
+        self.lto = self._peaks(-la, md)
+        self.rto = self._peaks(-ra, md)
 
-        lhs_s=set(self.lhs); rhs_s=set(self.rhs)
-        lto_s=set(self.lto); rto_s=set(self.rto)
+        lhs_s = set(self.lhs)
+        rhs_s = set(self.rhs)
+        lto_s = set(self.lto)
+        rto_s = set(self.rto)
         sl = self._stance_mask(self.lhs, self.lto, len(self.frames))
         sr = self._stance_mask(self.rhs, self.rto, len(self.frames))
 
-        lf_x=np.array(self._lf_x); rf_x=np.array(self._rf_x)
+        lf_x = np.array(self._lf_x)
+        rf_x = np.array(self._rf_x)
         for i, bf in enumerate(self.frames):
-            bf.left_heel_strike  = i in lhs_s; bf.right_heel_strike = i in rhs_s
-            bf.left_toe_off  = i in lto_s;     bf.right_toe_off = i in rto_s
-            bf.stance_left = sl[i]; bf.stance_right = sr[i]
+            bf.left_heel_strike  = i in lhs_s
+            bf.right_heel_strike = i in rhs_s
+            bf.left_toe_off      = i in lto_s
+            bf.right_toe_off     = i in rto_s
+            bf.stance_left   = sl[i]
+            bf.stance_right  = sr[i]
             bf.double_support = sl[i] and sr[i]
             if bf.left_heel_strike or bf.right_heel_strike:
-                bf.step_width = abs(lf_x[i]-rf_x[i])*self.pix_to_m
-        print(f"[BIO] Post-process: LHS={len(self.lhs)} RHS={len(self.rhs)}")
+                bf.step_width = abs(lf_x[i] - rf_x[i]) * self.pix_to_m
 
     def summary_dict(self) -> dict:
-        if not self.frames: return {}
-        skip = {"frame_idx","timestamp","left_heel_strike","right_heel_strike",
-                "left_toe_off","right_toe_off","stance_left","stance_right","double_support"}
+        if not self.frames:
+            return {}
+        skip = {
+            "frame_idx", "timestamp",
+            "left_heel_strike", "right_heel_strike",
+            "left_toe_off", "right_toe_off",
+            "stance_left", "stance_right", "double_support",
+        }
         out = {}
         for f in BioFrame.__dataclass_fields__:
-            if f in skip: continue
+            if f in skip:
+                continue
             v = np.array([getattr(x, f) for x in self.frames], dtype=float)
-            out[f"{f}_mean"]=float(np.mean(v)); out[f"{f}_max"]=float(np.max(v)); out[f"{f}_std"]=float(np.std(v))
-        out["lhs_count"]=len(self.lhs); out["rhs_count"]=len(self.rhs)
-        out["double_support_pct"]=100.*sum(1 for x in self.frames if x.double_support)/max(len(self.frames),1)
-        out["valgus_asymmetry"]=abs(out.get("left_valgus_clinical_mean",0)-out.get("right_valgus_clinical_mean",0))
+            out[f"{f}_mean"] = float(np.mean(v))
+            out[f"{f}_max"]  = float(np.max(v))
+            out[f"{f}_std"]  = float(np.std(v))
+        out["lhs_count"]          = len(self.lhs)
+        out["rhs_count"]          = len(self.rhs)
+        out["double_support_pct"] = 100. * sum(
+            1 for x in self.frames if x.double_support
+        ) / max(len(self.frames), 1)
+        out["valgus_asymmetry"]   = abs(
+            out.get("left_valgus_clinical_mean", 0) - out.get("right_valgus_clinical_mean", 0)
+        )
         return out
 
-    def get_dataframe(self):
-        from dataclasses import asdict as _ad
-        return pd.DataFrame([_ad(f) for f in self.frames])
+    def get_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame([asdict(f) for f in self.frames])
 
-    # ── helpers ───────────────────────────────────────────────────────────────
     @staticmethod
     def _seg_to_vert(p, d) -> float:
-        dx=d[0]-p[0]; dy=d[1]-p[1]
-        return float(math.degrees(math.atan2(dx, abs(dy)+1e-9)))
+        dx = d[0] - p[0]
+        dy = d[1] - p[1]
+        return float(math.degrees(math.atan2(dx, abs(dy) + 1e-9)))
 
     @staticmethod
     def _clinical_valgus(hip, knee, ankle) -> float:
-        ha=np.array([ankle[0]-hip[0], ankle[1]-hip[1]], dtype=float)
-        hk=np.array([knee[0]-hip[0],  knee[1]-hip[1]],  dtype=float)
-        dev=float(np.cross(ha, hk))/(np.linalg.norm(ha)+1e-9)
-        return float(math.degrees(math.atan2(dev, np.linalg.norm(hk)+1e-9)))
+        ha  = np.array([ankle[0] - hip[0], ankle[1] - hip[1]], dtype=float)
+        hk  = np.array([knee[0]  - hip[0], knee[1]  - hip[1]], dtype=float)
+        dev = float(np.cross(ha, hk)) / (np.linalg.norm(ha) + 1e-9)
+        return float(math.degrees(math.atan2(dev, np.linalg.norm(hk) + 1e-9)))
 
     def _angvel(self, key: str, ang: float) -> float:
-        prev=self._ah.get(key, ang); self._ah[key]=ang
-        return (ang-prev)*self.fps
+        prev = self._ah.get(key, ang)
+        self._ah[key] = ang
+        return (ang - prev) * self.fps
 
     def _smooth(self, arr: np.ndarray) -> np.ndarray:
         if HAS_SCIPY:
             try:
-                nyq=self.fps/2.; b,a=butter(4, min(self.FILTER_HZ,nyq*.9)/nyq, btype="low")
+                nyq = self.fps / 2.
+                b, a = butter(4, min(self.FILTER_HZ, nyq * .9) / nyq, btype="low")
                 return filtfilt(b, a, arr)
-            except Exception: pass
-        w=max(3, int(self.fps*0.12))
+            except Exception:
+                pass
+        w = max(3, int(self.fps * 0.12))
         return smooth_arr(arr, w=w)
 
     def _peaks(self, sig: np.ndarray, md: int) -> List[int]:
         if HAS_SCIPY:
-            try: pk,_=find_peaks(sig, distance=md, prominence=2.); return [int(p) for p in pk]
-            except Exception: pass
-        pks=[]
-        for i in range(1, len(sig)-1):
-            if sig[i]>=sig[i-1] and sig[i]>=sig[i+1]:
-                if not pks or i-pks[-1]>=md: pks.append(i)
+            try:
+                pk, _ = find_peaks(sig, distance=md, prominence=2.)
+                return [int(p) for p in pk]
+            except Exception:
+                pass
+        pks = []
+        for i in range(1, len(sig) - 1):
+            if sig[i] >= sig[i - 1] and sig[i] >= sig[i + 1]:
+                if not pks or i - pks[-1] >= md:
+                    pks.append(i)
         return pks
 
     @staticmethod
     def _stance_mask(hs: List[int], to: List[int], n: int) -> List[bool]:
-        m=[False]*n
+        m = [False] * n
         for h in hs:
-            nxt=[t for t in to if t>h]
-            end=min(nxt) if nxt else min(h+20, n-1)
-            for i in range(h, min(end+1, n)): m[i]=True
+            nxt = [t for t in to if t > h]
+            end = min(nxt) if nxt else min(h + 20, n - 1)
+            for i in range(h, min(end + 1, n)):
+                m[i] = True
         return m
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SKELETON-ONLY CANVAS RENDERER  (for separate skeleton video)
+#  SPORTS2D RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_skeleton_canvas(W: int, H: int, kp: PoseKeypoints,
-                           fm: "FrameMetrics", player_id: int,
-                           ts: float) -> np.ndarray:
+class Sports2DRunner:
+    JOINT_ANGLES = [
+        "Right ankle", "Left ankle",
+        "Right knee",  "Left knee",
+        "Right hip",   "Left hip",
+        "Right shoulder", "Left shoulder",
+        "Right elbow", "Left elbow",
+    ]
+    SEGMENT_ANGLES = [
+        "Right foot",    "Left foot",
+        "Right shank",   "Left shank",
+        "Right thigh",   "Left thigh",
+        "Pelvis", "Trunk", "Shoulders",
+        "Right arm",     "Left arm",
+        "Right forearm", "Left forearm",
+    ]
+
+    def __init__(self, video_path: str, result_dir: str,
+                 player_height_m: float = 1.75,
+                 participant_mass_kg: float = 75.0,
+                 mode: str = "balanced",
+                 show_realtime: bool = False,
+                 person_ordering: str = "greatest_displacement",
+                 do_ik: bool = False,
+                 use_augmentation: bool = False,
+                 visible_side: str = "auto front"):
+        self.video_path          = video_path
+        self.result_dir          = result_dir
+        self.player_height_m     = player_height_m
+        self.participant_mass_kg = participant_mass_kg
+        self.mode                = mode
+        self.show_realtime       = show_realtime
+        self.person_ordering     = person_ordering
+        self.do_ik               = do_ik
+        self.use_augmentation    = use_augmentation
+        self.visible_side        = visible_side
+        self.outputs: dict       = {}
+
+    def run(self) -> dict:
+        if not HAS_SPORTS2D:
+            print("[S2D] Sports2D not installed — skipping.\n"
+                  "      Run: pip install sports2d pose2sim")
+            return {}
+
+        os.makedirs(self.result_dir, exist_ok=True)
+
+        config = {
+            "base": {
+                "video_input":            self.video_path,
+                "result_dir":             self.result_dir,
+                "nb_persons_to_detect":   1,
+                "person_ordering_method": self.person_ordering,
+                "first_person_height":    self.player_height_m,
+                "floor_angle":            "auto",
+                "xy_origin":              "auto",
+                "to_meters":              True,
+                "participant_mass":       self.participant_mass_kg,
+                "save_vid":    True,
+                "save_img":    False,
+                "save_pose":   True,
+                "save_angles": True,
+                "save_graphs": True,
+                "save_calib":  True,
+                "make_c3d":    True,
+                "show_realtime_results": self.show_realtime,
+                "show_graphs":           False,
+                "do_ik":             self.do_ik,
+                "use_augmentation":  self.use_augmentation,
+                "visible_side":      self.visible_side,
+            },
+            "pose": {
+                "mode":          self.mode,
+                "det_frequency": 4,
+                "input_size":    [1280, 720],
+                "keypoint_likelihood_threshold": 0.3,
+                "average_likelihood_threshold":  0.5,
+            },
+            "angles": {
+                "joint_angles":   self.JOINT_ANGLES,
+                "segment_angles": self.SEGMENT_ANGLES,
+                "flip_left_right":                          True,
+                "correct_segment_angles_with_floor_angle":  True,
+                "display_angle_values_on":                  "body",
+                "fontSize":                                 0.4,
+                "calculate_angles":                         True,
+            },
+            "filtering": {
+                "interpolate":             True,
+                "interp_gap_smaller_than": 10,
+                "fill_large_gaps_with":    "last_value",
+                "reject_outliers":         True,
+                "filter":                  True,
+                "filter_type":             "butterworth",
+                "cut_off_frequency":       6,
+                "order":                   4,
+                "sections_to_keep":        "largest",
+                "min_chunk_size":          10,
+            },
+        }
+
+        try:
+            _Sports2DModule.process(config)
+        except Exception as e:
+            import traceback
+            print(f"[S2D] Sports2D.process() failed: {e}")
+            traceback.print_exc()
+            return {}
+
+        self.outputs = self._collect_outputs()
+        self._reencode_videos()
+        return self.outputs
+
+    def _collect_outputs(self) -> dict:
+        import glob
+        rd = self.result_dir
+        out = {
+            "annotated_video": [],
+            "angle_plots_png": [],
+            "trc_pose_px":     [],
+            "trc_pose_m":      [],
+            "mot_angles":      [],
+            "calib_toml":      [],
+            "c3d":             [],
+            "osim_model":      [],
+            "osim_mot":        [],
+            "osim_setup":      [],
+            "all":             [],
+        }
+        for f in glob.glob(os.path.join(rd, "**", "*"), recursive=True):
+            if not os.path.isfile(f):
+                continue
+            out["all"].append(f)
+            fl   = f.lower()
+            name = os.path.basename(fl)
+            if fl.endswith(".mp4") or fl.endswith(".avi"):
+                if "_h264" not in name:
+                    out["annotated_video"].append(f)
+            elif fl.endswith(".png"):
+                out["angle_plots_png"].append(f)
+            elif fl.endswith(".trc"):
+                if "_px" in name or "pixel" in name:
+                    out["trc_pose_px"].append(f)
+                else:
+                    out["trc_pose_m"].append(f)
+            elif fl.endswith(".mot") and "ik" not in name:
+                out["mot_angles"].append(f)
+            elif fl.endswith(".toml"):
+                out["calib_toml"].append(f)
+            elif fl.endswith(".c3d"):
+                out["c3d"].append(f)
+            elif fl.endswith(".osim"):
+                out["osim_model"].append(f)
+            elif fl.endswith(".mot") and "ik" in name:
+                out["osim_mot"].append(f)
+            elif fl.endswith(".xml"):
+                out["osim_setup"].append(f)
+        return out
+
+    def _reencode_videos(self):
+        import subprocess
+        import shutil
+        if not shutil.which("ffmpeg"):
+            return
+        reencoded = []
+        for raw in self.outputs.get("annotated_video", []):
+            base, _ = os.path.splitext(raw)
+            out_path = base + "_h264.mp4"
+            cmd = [
+                "ffmpeg", "-y", "-i", raw,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-c:a", "aac",
+                out_path,
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if result.returncode == 0:
+                    reencoded.append(out_path)
+                    self.outputs["annotated_video_h264"] = reencoded
+            except Exception:
+                pass
+
+    def load_mot_angles(self) -> Optional[pd.DataFrame]:
+        mots = self.outputs.get("mot_angles", [])
+        if not mots:
+            return None
+        path = mots[0]
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            header_idx = next(
+                (i for i, l in enumerate(lines) if l.strip().lower().startswith("time")),
+                None,
+            )
+            if header_idx is None:
+                return None
+            df = pd.read_csv(path, sep="\t", skiprows=header_idx,
+                             encoding="utf-8", on_bad_lines="skip")
+            df.columns = [c.strip() for c in df.columns]
+            return df.dropna(axis=1, how="all")
+        except Exception as e:
+            print(f"[S2D] Failed to load MOT file {path}: {e}")
+            return None
+
+    def load_trc_pose(self, metres: bool = True) -> Optional[pd.DataFrame]:
+        key  = "trc_pose_m" if metres else "trc_pose_px"
+        trcs = self.outputs.get(key, [])
+        if not trcs:
+            return None
+        path = trcs[0]
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            data_start = None
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if i >= 3 and stripped and (stripped[0].isdigit() or
+                        stripped.lower().startswith("frame")):
+                    data_start = i
+                    break
+            if data_start is None:
+                data_start = 5
+            header_line = data_start - 2
+            df = pd.read_csv(path, sep="\t", skiprows=header_line,
+                             encoding="utf-8", on_bad_lines="skip")
+            df.columns = [c.strip() for c in df.columns]
+            return df.dropna(axis=1, how="all")
+        except Exception as e:
+            print(f"[S2D] Failed to load TRC file {path}: {e}")
+            return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TRC / MOT WRITER  — native OpenSim-compatible file generation
+# ══════════════════════════════════════════════════════════════════════════════
+
+class OpenSimFileWriter:
     """
-    Draw the skeleton on a pure black canvas — no video background.
-    Used for the separate skeleton-only output video.
+    Generates valid OpenSim input files from tracked pose data.
+
+    TRC format:
+        Standard OpenSim Marker Trajectory (marker positions in metres, 3-D).
+        We set Z=0 for all markers (monocular video → 2-D plane).
+        Coordinate system: X = horizontal (right), Y = vertical (up, image Y inverted),
+        Z = depth (out of plane, zero). This matches the standard OpenSim convention
+        used by Sports2D / Pose2Sim.
+
+    MOT format:
+        OpenSim Motion file (tab-separated, header block).
+        Stores joint angles in degrees, same convention as Sports2D.
     """
-    canvas = np.zeros((H, W, 3), dtype=np.uint8)
 
-    rt = clamp01(fm.risk_score / 100.)
-    render_skeleton(canvas, kp, risk_tint=rt)
+    # Subset of our joint names that map to standard OpenSim marker labels
+    OPENSIM_MARKERS = [
+        "head", "neck",
+        "left_shoulder", "right_shoulder",
+        "left_elbow",    "right_elbow",
+        "left_wrist",    "right_wrist",
+        "left_hip",      "right_hip",
+        "left_knee",     "right_knee",
+        "left_ankle",    "right_ankle",
+        "left_foot",     "right_foot",
+        "hip_center",    "shoulder_center",
+    ]
 
-    # Knee angle labels
-    for kpt, ang in [(kp.left_knee, fm.left_knee_angle),
-                     (kp.right_knee, fm.right_knee_angle)]:
-        kx, ky = int(kpt[0]), int(kpt[1])
-        ac = (0,220,0) if ang>145 else (0,140,255) if ang>120 else (0,0,220)
-        cv2.putText(canvas, f"{ang:.0f}°", (kx+8,ky-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, .55, ac, 1, cv2.LINE_AA)
+    # Canonical OpenSim marker label mapping
+    _LABEL_MAP = {
+        "head":             "Head",
+        "neck":             "Neck",
+        "left_shoulder":    "L_Shoulder",
+        "right_shoulder":   "R_Shoulder",
+        "left_elbow":       "L_Elbow",
+        "right_elbow":      "R_Elbow",
+        "left_wrist":       "L_Wrist",
+        "right_wrist":      "R_Wrist",
+        "left_hip":         "L_Hip",
+        "right_hip":        "R_Hip",
+        "left_knee":        "L_Knee",
+        "right_knee":       "R_Knee",
+        "left_ankle":       "L_Ankle",
+        "right_ankle":      "R_Ankle",
+        "left_foot":        "L_Foot",
+        "right_foot":       "R_Foot",
+        "hip_center":       "Hip_Center",
+        "shoulder_center":  "Shoulder_Center",
+    }
 
-    # Player badge
-    hx, hy = int(kp.hip_center[0]), int(kp.hip_center[1])
-    head_y = int(kp.head[1]) - 32
-    badge = f"  #{player_id}  "
-    (tw,_),_ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, .70, 2)
-    bx0 = hx - tw//2 - 4
-    cv2.rectangle(canvas, (bx0, head_y-24), (bx0+tw+8, head_y+6), (255,220,0), -1)
-    cv2.putText(canvas, badge, (bx0+4, head_y+2),
-                cv2.FONT_HERSHEY_SIMPLEX, .70, (0,0,0), 2, cv2.LINE_AA)
+    def write_trc(self, pose_frames: List[PoseFrame], path: str,
+                  fps: float, pix_to_m: float, frame_height_px: int) -> bool:
+        """
+        Write a .trc file with 3-D marker trajectories.
 
-    # Timecode bottom-right
-    tc = f"{int(ts//60):02d}:{ts%60:05.2f}"
-    (tcw,_),_ = cv2.getTextSize(tc, cv2.FONT_HERSHEY_SIMPLEX, .5, 1)
-    cv2.putText(canvas, tc, (W-tcw-10, H-10),
-                cv2.FONT_HERSHEY_SIMPLEX, .5, (120,120,120), 1, cv2.LINE_AA)
+        Coordinate conversion from image (px) to OpenSim (m):
+            X_osim =  x_px * pix_to_m          (right is positive)
+            Y_osim =  (H - y_px) * pix_to_m    (Y flipped: up is positive)
+            Z_osim =  0.0                       (monocular — no depth)
+        """
+        n_frames  = len(pose_frames)
+        n_markers = len(self.OPENSIM_MARKERS)
+        H         = frame_height_px
 
-    # Risk gauge bottom-left
-    draw_risk_gauge(canvas, 50, H-60, 38, fm.risk_score)
+        if n_frames == 0:
+            print("[TRC] No pose frames — skipping TRC export.")
+            return False
 
-    return canvas
+        try:
+            with open(path, "w", newline="\r\n") as f:
+                # ── Header ────────────────────────────────────────────────────
+                # Line 0: file-type header
+                f.write(f"PathFileType\t4\t(X/Y/Z)\t{os.path.basename(path)}\n")
+                # Line 1: field names
+                f.write("DataRate\tCameraRate\tNumFrames\tNumMarkers\t"
+                        "Units\tOrigDataRate\tOrigDataStartFrame\tOrigNumFrames\n")
+                # Line 2: values
+                f.write(f"{fps:.6f}\t{fps:.6f}\t{n_frames}\t{n_markers}\t"
+                        f"m\t{fps:.6f}\t1\t{n_frames}\n")
+                # Line 3: marker labels — Frame# Time M1 '' '' M2 '' '' ...
+                labels_row = "Frame#\tTime"
+                for nm in self.OPENSIM_MARKERS:
+                    lbl = self._LABEL_MAP[nm]
+                    labels_row += f"\t{lbl}\t\t"  # label + 2 empty for Y Z
+                f.write(labels_row + "\n")
+                # Line 4: X/Y/Z sub-headers
+                xyz_row = "\t"
+                for _ in self.OPENSIM_MARKERS:
+                    xyz_row += "\tX\tY\tZ"
+                f.write(xyz_row + "\n")
+                # Line 5: blank separator (OpenSim expects this)
+                f.write("\n")
+
+                # ── Data rows ─────────────────────────────────────────────────
+                for pf in pose_frames:
+                    row = f"{pf.frame_idx + 1}\t{pf.timestamp:.6f}"
+                    for nm in self.OPENSIM_MARKERS:
+                        px, py = getattr(pf.kp, nm)
+                        x =  px * pix_to_m
+                        y = (H - py) * pix_to_m  # flip Y: image Y↓ → OpenSim Y↑
+                        z = 0.0
+                        row += f"\t{x:.6f}\t{y:.6f}\t{z:.6f}"
+                    f.write(row + "\n")
+            print(f"[TRC] Written: {path}  ({n_frames} frames, {n_markers} markers)")
+            return True
+        except Exception as e:
+            print(f"[TRC] Failed to write {path}: {e}")
+            return False
+
+    def write_mot(self, bio_frames: List[BioFrame], path: str, fps: float) -> bool:
+        """
+        Write a .mot (OpenSim Motion) file containing joint angles (degrees).
+
+        The column ordering matches the standard Sports2D MOT output so the
+        file can be loaded directly in OpenSim's Motion Visualizer or used
+        as input to Inverse Kinematics.
+        """
+        if not bio_frames:
+            print("[MOT] No biomechanics frames — skipping MOT export.")
+            return False
+
+        # Columns to export (all continuous angle fields from BioFrame)
+        angle_fields = [
+            "left_knee_flexion",    "right_knee_flexion",
+            "left_hip_flexion",     "right_hip_flexion",
+            "left_ankle_dorsiflexion", "right_ankle_dorsiflexion",
+            "left_elbow_flexion",   "right_elbow_flexion",
+            "trunk_lateral_lean",   "trunk_sagittal_lean",
+            "pelvis_obliquity",     "pelvis_rotation",
+            "left_thigh_angle",     "right_thigh_angle",
+            "left_shank_angle",     "right_shank_angle",
+            "trunk_segment_angle",
+            "left_valgus_clinical", "right_valgus_clinical",
+            "left_arm_swing",       "right_arm_swing",
+        ]
+
+        n_rows = len(bio_frames)
+        n_cols = 1 + len(angle_fields)  # time + angles
+
+        try:
+            with open(path, "w", newline="\r\n") as f:
+                # ── OpenSim MOT header ────────────────────────────────────────
+                f.write(f"{os.path.basename(path)}\n")
+                f.write("version=1\n")
+                f.write(f"nRows={n_rows}\n")
+                f.write(f"nColumns={n_cols}\n")
+                f.write("inDegrees=yes\n")
+                f.write("endheader\n")
+
+                # ── Column header row ─────────────────────────────────────────
+                header = "time\t" + "\t".join(angle_fields)
+                f.write(header + "\n")
+
+                # ── Data rows ─────────────────────────────────────────────────
+                for bf in bio_frames:
+                    row = f"{bf.timestamp:.6f}"
+                    for field in angle_fields:
+                        row += f"\t{getattr(bf, field):.6f}"
+                    f.write(row + "\n")
+            print(f"[MOT] Written: {path}  ({n_rows} rows, {len(angle_fields)} angles)")
+            return True
+        except Exception as e:
+            print(f"[MOT] Failed to write {path}: {e}")
+            return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ANALYTICS PLOTTER  — saves all plots to /results
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AnalyticsPlotter:
+    """
+    Generates and saves high-resolution analytical plots to a /results directory.
+    All plots are saved as 300 DPI PNG and SVG for publication / external use.
+    """
+
+    def __init__(self, results_dir: str, player_id: int = 1):
+        self.results_dir = results_dir
+        self.player_id   = player_id
+        os.makedirs(results_dir, exist_ok=True)
+
+    def _save(self, fig, name: str):
+        """Save figure as both PNG (300 DPI) and SVG."""
+        base = os.path.join(self.results_dir, name)
+        fig.savefig(base + ".png", dpi=300, bbox_inches="tight")
+        fig.savefig(base + ".svg", bbox_inches="tight")
+        plt.close(fig)
+        print(f"[PLOT] Saved → {base}.png / .svg")
+
+    def plot_speed_profile(self, frame_metrics: List[FrameMetrics]):
+        if not frame_metrics or not HAS_MPL:
+            return
+        ts    = [f.timestamp for f in frame_metrics]
+        speed = [f.speed     for f in frame_metrics]
+        accel = [f.acceleration for f in frame_metrics]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+        fig.suptitle(f"Player #{self.player_id} — Speed & Acceleration Profile", fontsize=13)
+
+        ax1.plot(ts, speed, color="#00C8A0", linewidth=1.5, label="Speed (m/s)")
+        ax1.fill_between(ts, speed, alpha=0.15, color="#00C8A0")
+        ax1.set_ylabel("Speed (m/s)")
+        ax1.legend(loc="upper right")
+        ax1.grid(True, alpha=0.3)
+
+        ax2.plot(ts, accel, color="#FF6B35", linewidth=1.2, label="Acceleration (m/s²)")
+        ax2.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+        ax2.set_ylabel("Acceleration (m/s²)")
+        ax2.set_xlabel("Time (s)")
+        ax2.legend(loc="upper right")
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        self._save(fig, "speed_acceleration_profile")
+
+    def plot_joint_angles(self, frame_metrics: List[FrameMetrics]):
+        if not frame_metrics or not HAS_MPL:
+            return
+        ts  = [f.timestamp        for f in frame_metrics]
+        lk  = [f.left_knee_angle  for f in frame_metrics]
+        rk  = [f.right_knee_angle for f in frame_metrics]
+        lh  = [f.left_hip_angle   for f in frame_metrics]
+        rh  = [f.right_hip_angle  for f in frame_metrics]
+        trl = [f.trunk_lean       for f in frame_metrics]
+
+        fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+        fig.suptitle(f"Player #{self.player_id} — Joint Angle Timeseries", fontsize=13)
+
+        axes[0].plot(ts, lk, label="Left Knee",  color="#FFB300", linewidth=1.4)
+        axes[0].plot(ts, rk, label="Right Knee", color="#0088FF", linewidth=1.4)
+        axes[0].set_ylabel("Knee Flexion (°)")
+        axes[0].axhline(120, color="red", linewidth=0.7, linestyle="--", label="Risk threshold 120°")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(ts, lh, label="Left Hip",  color="#FFB300", linewidth=1.4)
+        axes[1].plot(ts, rh, label="Right Hip", color="#0088FF", linewidth=1.4)
+        axes[1].set_ylabel("Hip Flexion (°)")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(ts, trl, label="Trunk Lean", color="#AA44FF", linewidth=1.4)
+        axes[2].set_ylabel("Trunk Lean (°)")
+        axes[2].set_xlabel("Time (s)")
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        self._save(fig, "joint_angles_timeseries")
+
+    def plot_biomechanics(self, bio_engine: "BiomechanicsEngine"):
+        if not bio_engine or not bio_engine.frames or not HAS_MPL:
+            return
+        frames = bio_engine.frames
+        ts     = [f.timestamp for f in frames]
+
+        # ── Knee flexion ──────────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.plot(ts, [f.left_knee_flexion  for f in frames], label="L Knee Flexion",
+                color="#FFB300", linewidth=1.4)
+        ax.plot(ts, [f.right_knee_flexion for f in frames], label="R Knee Flexion",
+                color="#0088FF", linewidth=1.4)
+        ax.set_title(f"Player #{self.player_id} — Knee Flexion (BiomechanicsEngine)")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Angle (°)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save(fig, "knee_flexion")
+
+        # ── Valgus (clinical) ────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.plot(ts, [f.left_valgus_clinical  for f in frames], label="L Valgus",
+                color="#FF6B35", linewidth=1.4)
+        ax.plot(ts, [f.right_valgus_clinical for f in frames], label="R Valgus",
+                color="#35C2FF", linewidth=1.4)
+        ax.axhline( 10, color="red",    linewidth=0.8, linestyle="--", label="±10° risk")
+        ax.axhline(-10, color="red",    linewidth=0.8, linestyle="--")
+        ax.axhline( 0,  color="gray",   linewidth=0.6, linestyle="-")
+        ax.set_title(f"Player #{self.player_id} — Clinical Knee Valgus/Varus")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Angle (°)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save(fig, "clinical_valgus")
+
+        # ── Hip & ankle ───────────────────────────────────────────────────────
+        fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+        axes[0].plot(ts, [f.left_hip_flexion  for f in frames], label="L Hip", color="#FFB300", linewidth=1.4)
+        axes[0].plot(ts, [f.right_hip_flexion for f in frames], label="R Hip", color="#0088FF", linewidth=1.4)
+        axes[0].set_ylabel("Hip Flexion (°)")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(ts, [f.left_ankle_dorsiflexion  for f in frames], label="L Ankle", color="#FFB300", linewidth=1.4)
+        axes[1].plot(ts, [f.right_ankle_dorsiflexion for f in frames], label="R Ankle", color="#0088FF", linewidth=1.4)
+        axes[1].set_ylabel("Ankle Dorsiflexion (°)")
+        axes[1].set_xlabel("Time (s)")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        fig.suptitle(f"Player #{self.player_id} — Hip & Ankle Kinematics")
+        plt.tight_layout()
+        self._save(fig, "hip_ankle_kinematics")
+
+        # ── Angular velocities ────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.plot(ts, [f.left_knee_ang_vel  for f in frames], label="L Knee ω",  color="#FFB300", linewidth=1.2)
+        ax.plot(ts, [f.right_knee_ang_vel for f in frames], label="R Knee ω",  color="#0088FF", linewidth=1.2)
+        ax.plot(ts, [f.left_hip_ang_vel   for f in frames], label="L Hip ω",   color="#FF8800", linewidth=1.0, linestyle="--")
+        ax.plot(ts, [f.right_hip_ang_vel  for f in frames], label="R Hip ω",   color="#0055CC", linewidth=1.0, linestyle="--")
+        ax.axhline(0, color="gray", linewidth=0.6)
+        ax.set_title(f"Player #{self.player_id} — Joint Angular Velocities")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Angular Velocity (°/s)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save(fig, "angular_velocities")
+
+        # ── Gait events ───────────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(14, 3))
+        ax.set_title(f"Player #{self.player_id} — Gait Events (Heel Strikes & Toe Offs)")
+        lhs_ts = [frames[i].timestamp for i in bio_engine.lhs if i < len(frames)]
+        rhs_ts = [frames[i].timestamp for i in bio_engine.rhs if i < len(frames)]
+        lto_ts = [frames[i].timestamp for i in bio_engine.lto if i < len(frames)]
+        rto_ts = [frames[i].timestamp for i in bio_engine.rto if i < len(frames)]
+        for t in lhs_ts:
+            ax.axvline(t, color="#FFB300", linewidth=1.2, alpha=0.8, label="L Heel Strike" if t == lhs_ts[0] else "")
+        for t in rhs_ts:
+            ax.axvline(t, color="#0088FF", linewidth=1.2, alpha=0.8, label="R Heel Strike" if t == rhs_ts[0] else "")
+        for t in lto_ts:
+            ax.axvline(t, color="#FFB300", linewidth=0.8, linestyle="--", alpha=0.6, label="L Toe Off" if t == lto_ts[0] else "")
+        for t in rto_ts:
+            ax.axvline(t, color="#0088FF", linewidth=0.8, linestyle="--", alpha=0.6, label="R Toe Off" if t == rto_ts[0] else "")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylim(0, 1)
+        ax.set_yticks([])
+        handles, labels = ax.get_legend_handles_labels()
+        seen = {}
+        unique_handles, unique_labels = [], []
+        for h, l in zip(handles, labels):
+            if l and l not in seen:
+                seen[l] = True
+                unique_handles.append(h)
+                unique_labels.append(l)
+        ax.legend(unique_handles, unique_labels, loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        self._save(fig, "gait_events")
+
+        # ── Arm swing ─────────────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.plot(ts, [f.left_arm_swing  for f in frames], label="L Arm Swing",  color="#FFB300", linewidth=1.4)
+        ax.plot(ts, [f.right_arm_swing for f in frames], label="R Arm Swing",  color="#0088FF", linewidth=1.4)
+        ax.plot(ts, [f.arm_swing_asymmetry for f in frames], label="Asymmetry", color="red",    linewidth=1.0, linestyle="--")
+        ax.set_title(f"Player #{self.player_id} — Arm Swing Excursion")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Angle (°)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save(fig, "arm_swing")
+
+    def plot_risk_scores(self, frame_metrics: List[FrameMetrics]):
+        if not frame_metrics or not HAS_MPL:
+            return
+        ts       = [f.timestamp    for f in frame_metrics]
+        risk     = [f.risk_score   for f in frame_metrics]
+        inj      = [f.injury_risk  for f in frame_metrics]
+        joint_s  = [f.joint_stress for f in frame_metrics]
+        fatigue  = [f.fatigue_index for f in frame_metrics]
+
+        fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+        fig.suptitle(f"Player #{self.player_id} — Risk Indicators", fontsize=13)
+
+        axes[0].plot(ts, risk, color="#FF3333", linewidth=1.5, label="Composite Risk Score")
+        axes[0].fill_between(ts, risk, alpha=0.12, color="#FF3333")
+        axes[0].axhline(50, color="orange", linewidth=0.8, linestyle="--", label="Moderate threshold (50)")
+        axes[0].axhline(75, color="red",    linewidth=0.8, linestyle="--", label="High threshold (75)")
+        axes[0].set_ylabel("Risk Score (0–100)")
+        axes[0].set_ylim(0, 105)
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(ts, [v * 100 for v in inj],     label="Acute Injury Risk", color="#FF6B35", linewidth=1.3)
+        axes[1].plot(ts, [v * 100 for v in joint_s], label="Joint Stress",      color="#9B59B6", linewidth=1.3)
+        axes[1].plot(ts, [v * 100 for v in fatigue], label="Fatigue Index",     color="#2ECC71", linewidth=1.3)
+        axes[1].set_ylabel("Sub-scores (%)")
+        axes[1].set_xlabel("Time (s)")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        self._save(fig, "risk_scores")
+
+    def plot_energy(self, frame_metrics: List[FrameMetrics]):
+        if not frame_metrics or not HAS_MPL:
+            return
+        ts     = [f.timestamp          for f in frame_metrics]
+        energy = [f.energy_expenditure for f in frame_metrics]
+
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.plot(ts, energy, color="#F39C12", linewidth=1.5, label="Metabolic Power (W)")
+        ax.fill_between(ts, energy, alpha=0.12, color="#F39C12")
+        ax.set_title(f"Player #{self.player_id} — Estimated Metabolic Power (Minetti Model)")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Power (W)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save(fig, "metabolic_power")
+
+    def generate_all(self, frame_metrics: List[FrameMetrics],
+                     bio_engine: Optional["BiomechanicsEngine"]):
+        """Generate and save all standard plots."""
+        if not HAS_MPL:
+            print("[PLOT] matplotlib not installed — skipping plot generation.")
+            print("       Run: pip install matplotlib")
+            return
+        self.plot_speed_profile(frame_metrics)
+        self.plot_joint_angles(frame_metrics)
+        self.plot_risk_scores(frame_metrics)
+        self.plot_energy(frame_metrics)
+        if bio_engine and bio_engine.frames:
+            self.plot_biomechanics(bio_engine)
+        print(f"[PLOT] All plots saved to: {self.results_dir}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN ANALYZER
+# ══════════════════════════════════════════════════════════════════════════════
 
 class SportsAnalyzer:
-    PIX_TO_M=None
+    PIX_TO_M = None
 
-    def __init__(self,video_path,output_video_path="output_annotated.mp4",
-                 player_id=1,fps_override=None,pick=False,yolo_size="m",
-                 skeleton_video_path=None):
-        self.video_path=video_path; self.output_video_path=output_video_path
-        self.skeleton_video_path=skeleton_video_path
-        self.player_id=player_id; self.fps_override=fps_override
-        self.pose_est=HybridPoseEstimator(); self.smoother=PoseKalmanSmoother()
-        self.pose_frames:List[PoseFrame]=[]; self.frame_metrics:List[FrameMetrics]=[]
-        self.summary=PlayerSummary(player_id=player_id)
-        self._spd_win=deque(maxlen=30); self._risk_win=deque(maxlen=15)
-        self._speed_history=deque(maxlen=90)
-        self._pix_to_m_samples=deque(maxlen=60)   # rolling calibration buffer
-        self._accel_burst=0; self._fps_cache=30.
-        self.bio_engine:Optional[BiomechanicsEngine]=None
+    def __init__(self, video_path: str,
+                 output_video_path: str = "output_annotated.mp4",
+                 player_id: int = 1,
+                 fps_override: Optional[float] = None,
+                 pick: bool = False,
+                 yolo_size: str = "m",
+                 player_height_m: float = 1.75):
+        self.video_path         = video_path
+        self.output_video_path  = output_video_path
+        self.player_id          = player_id
+        self.fps_override       = fps_override
+        self.player_height_m    = player_height_m
+
+        self.pose_est   = HybridPoseEstimator()
+        self.smoother   = PoseKalmanSmoother()
+        self.pose_frames:    List[PoseFrame]    = []
+        self.frame_metrics:  List[FrameMetrics] = []
+        self.summary = PlayerSummary(player_id=player_id)
+
+        self._spd_win         = deque(maxlen=30)
+        self._risk_win        = deque(maxlen=15)
+        self._speed_history   = deque(maxlen=90)
+        self._pix_to_m_samples = deque(maxlen=60)
+        self._accel_burst     = 0
+        self._fps_cache       = 30.
+
+        self.bio_engine:         Optional[BiomechanicsEngine] = None
+        self.sports2d_runner:    Optional[Sports2DRunner]     = None
+        self._frame_height_px:   int = 0
+
         det_layer = _get_detection_layer(yolo_size)
 
-        # ─── ENGINE STATUS SUMMARY (Terminal Display) ─────────────────────
-        print("\n" + "="*50)
+        print("\n" + "=" * 50)
         print(" JUVENTUS SPORTS ANALYTICS: ENGINE READY")
         print("-" * 50)
         print(f" * POSE DETECTION:    {det_layer.mode.upper()}")
         print(f" * BIOMECHANICS:      {'SPORTS2D (Clinical-Grade)' if HAS_SPORTS2D else 'NUMPY (Math Fallback)'}")
         print(f" * SIGNAL FILTERING:  {'SCIPY (Advanced Signal)' if HAS_SCIPY else 'NUMPY (Basic Mean)'}")
-        print("="*50 + "\n")
+        print(f" * PLOTTING:          {'MATPLOTLIB' if HAS_MPL else 'NOT AVAILABLE'}")
+        print("=" * 50 + "\n")
+
         if pick:
-            print("[INFO] Interactive selection …"); primary=pick_player_interactive(video_path)
+            primary = pick_player_interactive(video_path)
         else:
-            print("[INFO] Pre-scan …"); primary=select_primary_player(video_path)
-        if primary is None: raise RuntimeError("No player candidates found.")
-        self.lock=TargetLock(primary["seed_bbox"],primary["hist"],primary["seed_frame"])
+            primary = select_primary_player(video_path)
+        if primary is None:
+            raise RuntimeError("No player candidates found in video.")
+        self.lock = TargetLock(primary["seed_bbox"], primary["hist"], primary["seed_frame"])
 
-    def process_video(self):
-        cap=cv2.VideoCapture(self.video_path)
-        if not cap.isOpened(): raise FileNotFoundError(self.video_path)
-        fps=self.fps_override or cap.get(cv2.CAP_PROP_FPS) or 30.
-        self._fps_cache=fps
-        W=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # ── Video Writer(s) with Fallback Logic ──────────────────────────────
-        def create_writer(path, fps, width, height):
-            codecs = ["mp4v", "avc1", "XVID", "MJPG"]
-            for c in codecs:
-                try:
-                    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*c), fps, (width, height))
-                    if writer.isOpened():
-                        # Test write dummy frame to ensure codec is actually working
-                        dummy = np.zeros((height, width, 3), np.uint8)
-                        writer.write(dummy)
-                        return writer
-                except Exception:
-                    continue
-            return None
+    # ── Video processing ──────────────────────────────────────────────────────
 
-        out = create_writer(self.output_video_path, fps, W, H)
-        if out is None:
-            print(f"[ERROR] Could not initialize VideoWriter for {self.output_video_path}")
-            # Create a null-writer or dummy to avoid crashes later
-            class DummyWriter:
-                def write(self, f): pass
-                def release(self): pass
-            out = DummyWriter()
-        else:
-            print(f"[INFO] VideoWriter initialized for {self.output_video_path}")
+    def process_video(self) -> PlayerSummary:
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            raise FileNotFoundError(self.video_path)
 
-        # Skeleton-only video writer
-        skel_out = None
-        if self.skeleton_video_path:
-            skel_out = create_writer(self.skeleton_video_path, fps, W, H)
-            if skel_out:
-                print(f"[INFO] Skeleton video → {self.skeleton_video_path}")
-            else:
-                print(f"[WARN] Failed to initialize skeleton VideoWriter.")
+        fps   = self.fps_override or cap.get(cv2.CAP_PROP_FPS) or 30.
+        self._fps_cache = fps
+        W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._frame_height_px = H
 
-        # BiomechanicsEngine — init after fps is known
-        self.bio_engine=BiomechanicsEngine(fps=fps, pix_to_m=self.PIX_TO_M or 0.002)
+        out = self._create_writer(self.output_video_path, fps, W, H)
+        self.bio_engine = BiomechanicsEngine(fps=fps, pix_to_m=self.PIX_TO_M or 0.002)
 
-        print(f"[INFO] {total} frames @ {fps:.1f} fps  ({W}×{H})")
-        idx=0
+        idx = 0
         while True:
-            ret,frame=cap.read()
-            if not ret: break
-            ts=idx/fps; bbox=self.lock.update(frame)
-            visible=False
-            if bbox and bbox[2]>20 and bbox[3]>40:
-                visible=True
-                target=next((t for t in self.lock.bt.active_tracks if t.id==self.lock._target_id),None)
-                yolo_kp=getattr(target,'_yolo_kp',None) if target else None
-                spd=self.frame_metrics[-1].speed if self.frame_metrics else 0.
-                raw_kp=self.pose_est.estimate(frame,bbox,ts,spd,yolo_kp=yolo_kp)
-                kp=self.smoother.smooth(raw_kp); pf=PoseFrame(idx,ts,bbox,kp)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            ts   = idx / fps
+            bbox = self.lock.update(frame)
+
+            if bbox and bbox[2] > 20 and bbox[3] > 40:
+                target  = next((t for t in self.lock.bt.active_tracks
+                                if t.id == self.lock._target_id), None)
+                yolo_kp = getattr(target, '_yolo_kp', None) if target else None
+                spd     = self.frame_metrics[-1].speed if self.frame_metrics else 0.
+
+                raw_kp = self.pose_est.estimate(frame, bbox, ts, spd, yolo_kp=yolo_kp)
+                kp     = self.smoother.smooth(raw_kp)
+                pf     = PoseFrame(idx, ts, bbox, kp)
                 self.pose_frames.append(pf)
-                # Recalibrate every frame — rolling median handles noise
+
                 self._calibrate(kp)
-                fm=self._metrics(pf,idx,ts,fps); self.frame_metrics.append(fm)
+                fm = self._metrics(pf, idx, ts, fps)
+                self.frame_metrics.append(fm)
                 self._speed_history.append(fm.speed)
-                # BiomechanicsEngine per-frame
                 self.bio_engine.process_frame(idx, ts, kp)
-                if abs(fm.acceleration)>4.0: self._accel_burst=8
-                elif self._accel_burst>0: self._accel_burst-=1
-                # Annotated video (no trail)
-                frame=self._annotate(frame,pf,fm,W,H)
-                frame=self._draw_player_aura(frame,kp,fm)
-                # Skeleton-only frame
-                if skel_out is not None:
-                    skel_frame=render_skeleton_canvas(W,H,kp,fm,self.player_id,ts)
-                    skel_out.write(skel_frame)
-            else:
-                if skel_out is not None:
-                    skel_out.write(np.zeros((H,W,3),dtype=np.uint8))
-            frame=self._hud(frame,idx,ts,total,visible); out.write(frame); idx+=1
 
-        cap.release(); out.release()
-        if skel_out is not None: skel_out.release()
-        tr=len(self.pose_frames); print(f"[INFO] Tracked {tr}/{idx} frames ({100*tr/max(idx,1):.1f}%)")
-        if self.bio_engine: self.bio_engine.post_process()
-        self._post_gait(fps); self._build_summary(); print("[INFO] Done."); return self.summary
+                if abs(fm.acceleration) > 4.0:
+                    self._accel_burst = 8
+                elif self._accel_burst > 0:
+                    self._accel_burst -= 1
 
-    def _annotate(self, frame, pf, fm, W, H):
-        """Draw player-specific skeleton and labels on the main frame."""
+                # Annotate frame: skeleton + labels only (no side panel)
+                frame = self._annotate(frame, pf, fm)
+                frame = self._draw_player_aura(frame, kp, fm)
+
+            out.write(frame)
+            idx += 1
+
+        cap.release()
+        out.release()
+
+        if self.bio_engine:
+            self.bio_engine.post_process()
+        self._post_gait(fps)
+        self._build_summary()
+        return self.summary
+
+    def _create_writer(self, path: str, fps: float, W: int, H: int):
+        for codec in ["mp4v", "avc1", "XVID", "MJPG"]:
+            try:
+                writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*codec), fps, (W, H))
+                if writer.isOpened():
+                    dummy = np.zeros((H, W, 3), np.uint8)
+                    writer.write(dummy)
+                    return writer
+            except Exception:
+                continue
+
+        class _NullWriter:
+            def write(self, _): pass
+            def release(self): pass
+        return _NullWriter()
+
+    # ── Annotation (skeleton + labels on video frame, NO side panel) ──────────
+
+    def _annotate(self, frame, pf: PoseFrame, fm: FrameMetrics) -> np.ndarray:
         kp = pf.kp
         rt = clamp01(fm.risk_score / 100.)
-        
-        # 1. Render Skeleton
         render_skeleton(frame, kp, risk_tint=rt)
-        
-        # 2. Knee Angle Labels
+
+        # Knee angle labels
         for kpt, ang in [(kp.left_knee, fm.left_knee_angle),
                          (kp.right_knee, fm.right_knee_angle)]:
             kx, ky = int(kpt[0]), int(kpt[1])
-            # Color based on angle (Green > 145, Orange > 120, Red < 120)
             ac = (0, 220, 0) if ang > 145 else (0, 140, 255) if ang > 120 else (0, 0, 220)
             cv2.putText(frame, f"{ang:.0f}°", (kx + 12, ky - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, ac, 1, cv2.LINE_AA)
-        
-        # 3. Player Badge (Jersey # indicators)
-        hx = int(kp.hip_center[0])
-        head_y = int(kp.head[1]) - 35
-        badge = f"  #{self.player_id}  "
-        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-        bx0 = hx - tw // 2
-        
-        # Semi-transparent backing for badge
-        overlay = frame.copy()
+
+        # Player badge above head
+        hx       = int(kp.hip_center[0])
+        head_y   = int(kp.head[1]) - 35
+        badge    = f"  #{self.player_id}  "
+        (tw, _), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        bx0      = hx - tw // 2
+        overlay  = frame.copy()
         cv2.rectangle(overlay, (bx0, head_y - 22), (bx0 + tw, head_y + 6), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-        
-        # Gold border and white text
         cv2.rectangle(frame, (bx0, head_y - 22), (bx0 + tw, head_y + 6), (255, 215, 0), 1)
         cv2.putText(frame, badge, (bx0 + 2, head_y + 1),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
-        
+
+        # Speed & risk overlay near player bbox
+        bx, by, bw, bh = pf.bbox
+        spd_txt = f"{fm.speed:.1f} m/s"
+        cv2.putText(frame, spd_txt, (bx, by - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 200), 1, cv2.LINE_AA)
+
         return frame
 
-    def _calibrate(self, kp):
-        """
-        Rolling-median pixel-to-metre calibration.
-        Assumes average male leg length (hip→ankle) ≈ 0.90 m.
-        Recalibrates every frame using a 60-sample median — robust to
-        partial occlusion, geometric-fallback frames, and camera zoom.
-        """
+    def _draw_player_aura(self, frame, kp: PoseKeypoints, fm: FrameMetrics) -> np.ndarray:
+        if fm.speed < .5:
+            return frame
+        hx, hy = int(kp.hip_center[0]), int(kp.hip_center[1])
+        bx, by, bw, bh = self.pose_frames[-1].bbox
+        rx  = max(12, bw // 2 + 6)
+        ry  = max(20, bh // 2 + 10)
+        col = lerp_color((0, 180, 60), (0, 60, 255), clamp01(fm.speed / 8.))
+        if self._accel_burst > 0:
+            br = int(rx * 1.6 + self._accel_burst * 3)
+            ba = self._accel_burst / 8. * .4
+            ov = frame.copy()
+            cv2.ellipse(ov, (hx, hy), (br, int(br * 1.4)), 0, 0, 360,
+                        (0, 200, 255), 3, cv2.LINE_AA)
+            frame[:] = cv2.addWeighted(ov, ba, frame, 1 - ba, 0)
+        for exp, a in [(14, .12), (6, .20)]:
+            ov = frame.copy()
+            cv2.ellipse(ov, (hx, hy), (rx + exp, ry + exp), 0, 0, 360, col, -1, cv2.LINE_AA)
+            frame[:] = cv2.addWeighted(ov, a, frame, 1 - a, 0)
+        return frame
+
+    # ── Calibration ───────────────────────────────────────────────────────────
+
+    def _calibrate(self, kp: PoseKeypoints):
         left_leg  = dist2d(kp.left_hip,  kp.left_ankle)
         right_leg = dist2d(kp.right_hip, kp.right_ankle)
-        # Only use the longer leg estimate (less likely to be occluded)
         leg = max(left_leg, right_leg)
         if leg < 10:
-            return   # keypoints collapsed — skip this frame
+            return
         estimate = 0.90 / leg
         self._pix_to_m_samples.append(estimate)
-        # Update using rolling median — much more stable than a single frame
         self.PIX_TO_M = float(np.median(self._pix_to_m_samples))
         if self.bio_engine is not None:
             self.bio_engine.pix_to_m = self.PIX_TO_M
 
-    def _metrics(self,pf,idx,ts,fps)->FrameMetrics:
-        fm=FrameMetrics(frame_idx=idx,timestamp=ts)
-        kp=pf.kp; sc=self.PIX_TO_M or 0.002
+    # ── Per-frame metrics ─────────────────────────────────────────────────────
 
-        # ── Joint angles (now using Sports2D adapter) ──────────────────────
+    def _metrics(self, pf: PoseFrame, idx: int, ts: float, fps: float) -> FrameMetrics:
+        fm  = FrameMetrics(frame_idx=idx, timestamp=ts)
+        kp  = pf.kp
+        sc  = self.PIX_TO_M or 0.002
+
         fm.left_knee_angle  = _s2d_joint_angle(kp.left_hip,  kp.left_knee,  kp.left_ankle)
         fm.right_knee_angle = _s2d_joint_angle(kp.right_hip, kp.right_knee, kp.right_ankle)
         fm.left_hip_angle   = _s2d_joint_angle(kp.left_shoulder,  kp.left_hip,  kp.left_knee)
         fm.right_hip_angle  = _s2d_joint_angle(kp.right_shoulder, kp.right_hip, kp.right_knee)
-        dx=kp.shoulder_center[0]-kp.hip_center[0]; dy=kp.shoulder_center[1]-kp.hip_center[1]
-        fm.trunk_lean=math.degrees(math.atan2(abs(dx),abs(dy)+1e-9))
 
-        # ── Perspective confidence (how side-on the player is) ─────────────
+        dx = kp.shoulder_center[0] - kp.hip_center[0]
+        dy = kp.shoulder_center[1] - kp.hip_center[1]
+        fm.trunk_lean = math.degrees(math.atan2(abs(dx), abs(dy) + 1e-9))
+
         fm.perspective_confidence = estimate_player_orientation(kp)
 
-        # ── Clinical valgus from BiomechanicsEngine (cross-product method) ──
-        # Uses the proper hip→knee→ankle signed angle — replaces the simple
-        # horizontal offset metric. Weighted by perspective confidence.
         lvc = BiomechanicsEngine._clinical_valgus(kp.left_hip,  kp.left_knee,  kp.left_ankle)
         rvc = BiomechanicsEngine._clinical_valgus(kp.right_hip, kp.right_knee, kp.right_ankle)
         fm.l_valgus_clinical = lvc * fm.perspective_confidence
         fm.r_valgus_clinical = rvc * fm.perspective_confidence
-        # Keep the simple normalised metric for backward compatibility
-        hw=dist2d(kp.left_hip,kp.right_hip)+1e-6
-        fm.l_valgus=abs(kp.left_knee[0]-kp.left_hip[0])/hw
-        fm.r_valgus=abs(kp.right_knee[0]-kp.right_hip[0])/hw
 
-        # ── Speed & acceleration ───────────────────────────────────────────
-        if len(self.pose_frames)>=2:
-            prev=self.pose_frames[-2]; dt=ts-prev.timestamp+1e-9
-            dp=dist2d(kp.hip_center,prev.kp.hip_center)*sc; raw=dp/dt
-            self._spd_win.append(raw); fm.speed=float(np.mean(self._spd_win))
-            fm.body_center_disp=dp
-            if len(self.pose_frames)>=3:
-                p2=self.pose_frames[-3]
-                dp2=dist2d(prev.kp.hip_center,p2.kp.hip_center)*sc
-                dt2=prev.timestamp-p2.timestamp+1e-9
-                fm.acceleration=(raw-dp2/dt2)/dt
+        hw = dist2d(kp.left_hip, kp.right_hip) + 1e-6
+        fm.l_valgus = abs(kp.left_knee[0]  - kp.left_hip[0])  / hw
+        fm.r_valgus = abs(kp.right_knee[0] - kp.right_hip[0]) / hw
 
-        # ── Direction change ───────────────────────────────────────────────
-        if len(self.pose_frames)>=5:
-            pos=[p.kp.hip_center for p in list(self.pose_frames)[-5:]]
-            vecs=[(pos[i+1][0]-pos[i][0],pos[i+1][1]-pos[i][1]) for i in range(4)]
-            for i in range(len(vecs)-1):
-                v1,v2=np.array(vecs[i]),np.array(vecs[i+1])
-                n1,n2=np.linalg.norm(v1),np.linalg.norm(v2)
-                if n1>2 and n2>2 and math.acos(np.clip(np.dot(v1,v2)/(n1*n2),-1,1))>math.radians(28):
-                    fm.direction_change=True
+        if len(self.pose_frames) >= 2:
+            prev = self.pose_frames[-2]
+            dt   = ts - prev.timestamp + 1e-9
+            dp   = dist2d(kp.hip_center, prev.kp.hip_center) * sc
+            raw  = dp / dt
+            self._spd_win.append(raw)
+            fm.speed            = float(np.mean(self._spd_win))
+            fm.body_center_disp = dp
+            if len(self.pose_frames) >= 3:
+                p2  = self.pose_frames[-3]
+                dp2 = dist2d(prev.kp.hip_center, p2.kp.hip_center) * sc
+                dt2 = prev.timestamp - p2.timestamp + 1e-9
+                fm.acceleration = (raw - dp2 / dt2) / dt
 
-        # ── Energy expenditure — Minetti/di Prampero metabolic model ───────
-        # Metabolic cost of running: Cr ≈ 4.0 J/(kg·m) (Minetti 2002, measured)
-        # Steady-state power: P = Cr * v * mass
-        # Acceleration surcharge (di Prampero 2005): equivalent slope = a/g,
-        #   adds Cr * (a/g) * v * mass of extra metabolic cost
-        # +80 W resting metabolic rate baseline
-        MASS_KG = 75.0; G = 9.81; Cr = 4.0
+        if len(self.pose_frames) >= 5:
+            pos  = [p.kp.hip_center for p in list(self.pose_frames)[-5:]]
+            vecs = [(pos[i+1][0]-pos[i][0], pos[i+1][1]-pos[i][1]) for i in range(4)]
+            for i in range(len(vecs) - 1):
+                v1, v2 = np.array(vecs[i]), np.array(vecs[i+1])
+                n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                if n1 > 2 and n2 > 2 and math.acos(
+                        np.clip(np.dot(v1, v2) / (n1 * n2), -1, 1)) > math.radians(28):
+                    fm.direction_change = True
+
+        MASS_KG = 75.0
+        G = 9.81
+        Cr = 4.0
         v = max(fm.speed, 0.1)
         a = fm.acceleration
-        P_loco  = Cr * v * MASS_KG                           # W steady-state
-        g_eq    = max(0., a) / G                             # equivalent slope
-        P_accel = Cr * g_eq * v * MASS_KG                   # W acceleration surcharge
-        fm.energy_expenditure = P_loco + P_accel + 80.0     # W total
+        P_loco  = Cr * v * MASS_KG
+        g_eq    = max(0., a) / G
+        P_accel = Cr * g_eq * v * MASS_KG
+        fm.energy_expenditure = P_loco + P_accel + 80.0
 
-        # ── Joint stress ───────────────────────────────────────────────────
-        ks=sum((155-ang)/155 for ang in [fm.left_knee_angle,fm.right_knee_angle] if ang<155)
-        fm.joint_stress=min(1.,ks/2)
-        ls=clamp01(fm.trunk_lean/25.)*(max(0,fm.speed-1.0)/5.0)
-        asym=clamp01(abs(fm.left_knee_angle-fm.right_knee_angle)/40.)
-        fm.joint_stress=clamp01(fm.joint_stress*0.5+ls*0.3+asym*0.2)
+        ks = sum((155 - ang) / 155 for ang in
+                 [fm.left_knee_angle, fm.right_knee_angle] if ang < 155)
+        fm.joint_stress = min(1., ks / 2)
+        ls  = clamp01(fm.trunk_lean / 25.) * (max(0, fm.speed - 1.0) / 5.0)
+        asym = clamp01(abs(fm.left_knee_angle - fm.right_knee_angle) / 40.)
+        fm.joint_stress = clamp01(fm.joint_stress * 0.5 + ls * 0.3 + asym * 0.2)
 
-        # ── Fatigue ────────────────────────────────────────────────────────
-        if len(self._spd_win)>=10:
-            s=list(self._spd_win)
-            fm.fatigue_index=max(0.,min(1.,(np.mean(s[:5])-np.mean(s[-5:]))/(np.mean(s[:5])+1e-6)))
+        if len(self._spd_win) >= 10:
+            s = list(self._spd_win)
+            fm.fatigue_index = max(0., min(1., (np.mean(s[:5]) - np.mean(s[-5:])) /
+                                           (np.mean(s[:5]) + 1e-6)))
 
-        # ── SPLIT RISK SCORE ───────────────────────────────────────────────
-        # Acute injury risk — things that cause damage RIGHT NOW
-        #   Based on: valgus collapse, knee asymmetry, high acceleration
-        #   Clinical valgus > 10° is the ACL risk threshold (literature)
         valgus_deg = (abs(fm.l_valgus_clinical) + abs(fm.r_valgus_clinical)) / 2.0
-        p_valgus  = clamp01(valgus_deg / 15.0)           # 15° = high risk threshold
-        p_knee_asym = clamp01(abs(fm.left_knee_angle-fm.right_knee_angle)/30.)
-        p_accel   = clamp01(abs(fm.acceleration)/12.)
-        fm.injury_risk = 0.45*p_valgus + 0.30*p_knee_asym + 0.25*p_accel
+        p_valgus    = clamp01(valgus_deg / 15.0)
+        p_knee_asym = clamp01(abs(fm.left_knee_angle - fm.right_knee_angle) / 30.)
+        p_accel     = clamp01(abs(fm.acceleration) / 12.)
+        fm.injury_risk = 0.45 * p_valgus + 0.30 * p_knee_asym + 0.25 * p_accel
 
-        # Cumulative / overuse risk — builds up over time
-        #   Based on: joint stress, trunk lean, fatigue
-        p_trunk   = clamp01(fm.trunk_lean/30.)
-        p_joint   = fm.joint_stress
-        p_fatigue = fm.fatigue_index
-        cumulative_risk = 0.40*p_joint + 0.35*p_trunk + 0.25*p_fatigue
+        p_trunk    = clamp01(fm.trunk_lean / 30.)
+        cumulative = 0.40 * fm.joint_stress + 0.35 * p_trunk + 0.25 * fm.fatigue_index
 
-        # Combined weighted score — discount by perspective confidence
-        raw_risk = (0.60*fm.injury_risk + 0.40*cumulative_risk) * fm.perspective_confidence
+        raw_risk = (0.60 * fm.injury_risk + 0.40 * cumulative) * fm.perspective_confidence
         self._risk_win.append(raw_risk)
         fm.risk_score = float(np.mean(self._risk_win)) * 100.
-        fm.fall_risk = 0.
+        fm.fall_risk  = 0.
         return fm
 
+    # ── Post-processing ───────────────────────────────────────────────────────
 
-    def _post_gait(self,fps):
-        if len(self.pose_frames)<15: return
-        sc=self.PIX_TO_M or 0.002
-        la=smooth_arr([p.kp.left_ankle[1]  for p in self.pose_frames])
-        ra=smooth_arr([p.kp.right_ankle[1] for p in self.pose_frames])
-        md=max(5,int(fps*.18))
-        # Heel-strike = ankle at maximum Y (lowest in frame = ground contact) = peak
-        # Toe-off     = ankle at minimum Y (highest in frame = foot in air)   = trough = peak of -signal
+    def _post_gait(self, fps: float):
+        if len(self.pose_frames) < 15:
+            return
+        sc = self.PIX_TO_M or 0.002
+        la = smooth_arr([p.kp.left_ankle[1]  for p in self.pose_frames])
+        ra = smooth_arr([p.kp.right_ankle[1] for p in self.pose_frames])
+        md = max(5, int(fps * .18))
+
         if HAS_SCIPY:
-            lp,_=find_peaks( la, distance=md, prominence=2)   # heel-strike left
-            rp,_=find_peaks( ra, distance=md, prominence=2)   # heel-strike right
+            lp, _ = find_peaks( la, distance=md, prominence=2)
+            rp, _ = find_peaks( ra, distance=md, prominence=2)
         else:
-            def pk(arr,d):
-                pks=[]
-                for i in range(1,len(arr)-1):
-                    if arr[i]>arr[i-1] and arr[i]>arr[i+1]:
-                        if not pks or i-pks[-1]>=d: pks.append(i)
+            def pk(arr, d):
+                pks = []
+                for i in range(1, len(arr) - 1):
+                    if arr[i] > arr[i-1] and arr[i] > arr[i+1]:
+                        if not pks or i - pks[-1] >= d:
+                            pks.append(i)
                 return np.array(pks)
-            lp=pk(la,md); rp=pk(ra,md)
-        pos=[p.kp.hip_center for p in self.pose_frames]; strl,stt,flt=[],[],[]
-        for peaks in [lp,rp]:
-            for i in range(1,len(peaks)):
-                i0,i1=peaks[i-1],peaks[i]
-                if i1>=len(pos): continue
-                sl=dist2d(pos[i0],pos[i1])*sc
-                if .15<sl<3.5: strl.append(sl)
-                st=(i1-i0)/fps
-                if .08<st<2.0: stt.append(st); flt.append(max(0.,st*.35))
-        n=min(len(lp),len(rp))-1
-        if n>0:
-            li=[(lp[i+1]-lp[i])/fps for i in range(n)]; ri=[(rp[i+1]-rp[i])/fps for i in range(n)]; m=min(len(li),len(ri))
-            sym=float(np.mean([1-abs(l-r)/(l+r+1e-9) for l,r in zip(li[:m],ri[:m])]))*100
-        else: sym=94.
-        sv=float(np.std(strl)/(np.mean(strl)+1e-9)*100) if len(strl)>2 else 3.5; asl=float(np.mean(strl)) if strl else 1.35; ast=float(np.mean(stt)) if stt else .38; aft=float(np.mean(flt)) if flt else .13; acad=60./ast if ast>0 else 158.
-        for fm in self.frame_metrics: fm.stride_length=asl; fm.step_time=ast; fm.flight_time=aft; fm.cadence=acad; fm.gait_symmetry=sym; fm.stride_variability=sv
-        hip_x = [p.kp.hip_center[0] for p in self.pose_frames]; lat_bal = clamp01(np.std(hip_x) / (max(1, np.mean([p.bbox[2] for p in self.pose_frames]))*0.1) if hip_x else 0.)
+            lp = pk(la, md)
+            rp = pk(ra, md)
+
+        pos  = [p.kp.hip_center for p in self.pose_frames]
+        strl, stt, flt = [], [], []
+        for peaks in [lp, rp]:
+            for i in range(1, len(peaks)):
+                i0, i1 = peaks[i-1], peaks[i]
+                if i1 >= len(pos):
+                    continue
+                sl = dist2d(pos[i0], pos[i1]) * sc
+                if .15 < sl < 3.5:
+                    strl.append(sl)
+                st = (i1 - i0) / fps
+                if .08 < st < 2.0:
+                    stt.append(st)
+                    flt.append(max(0., st * .35))
+
+        n = min(len(lp), len(rp)) - 1
+        if n > 0:
+            li = [(lp[i+1] - lp[i]) / fps for i in range(n)]
+            ri = [(rp[i+1] - rp[i]) / fps for i in range(n)]
+            m  = min(len(li), len(ri))
+            sym = float(np.mean(
+                [1 - abs(l - r) / (l + r + 1e-9) for l, r in zip(li[:m], ri[:m])]
+            )) * 100
+        else:
+            sym = 94.
+
+        sv   = float(np.std(strl) / (np.mean(strl) + 1e-9) * 100) if len(strl) > 2 else 3.5
+        asl  = float(np.mean(strl)) if strl else 1.35
+        ast  = float(np.mean(stt))  if stt  else .38
+        aft  = float(np.mean(flt))  if flt  else .13
+        acad = 60. / ast if ast > 0 else 158.
+
         for fm in self.frame_metrics:
-            sr=max(0.,(100-fm.gait_symmetry)/100); vr=min(1.,fm.stride_variability/25); lr=min(1.,fm.trunk_lean/40); fm.fall_risk = clamp01(sr*.3 + vr*.2 + lr*.2 + lat_bal*.3); ar=min(1.,abs(fm.acceleration)/12); fm.injury_risk=fm.joint_stress*.5+ar*.3+fm.fatigue_index*.2
+            fm.stride_length   = asl
+            fm.step_time       = ast
+            fm.flight_time     = aft
+            fm.cadence         = acad
+            fm.gait_symmetry   = sym
+            fm.stride_variability = sv
 
-    def _draw_trail(self, frame):
-        # Trail removed — no longer rendered
-        return frame
-
-    def _draw_player_aura(self,frame,kp,fm):
-        if fm.speed<.5: return frame
-        hx,hy=int(kp.hip_center[0]),int(kp.hip_center[1]); bx,by,bw,bh=self.pose_frames[-1].bbox; rx=max(12,bw//2+6); ry=max(20,bh//2+10); col=lerp_color((0,180,60),(0,60,255),clamp01(fm.speed/8.))
-        if self._accel_burst>0:
-            br=int(rx*1.6+self._accel_burst*3); ba=self._accel_burst/8.*.4; ov=frame.copy(); cv2.ellipse(ov,(hx,hy),(br,int(br*1.4)),0,0,360,(0,200,255),3,cv2.LINE_AA); frame[:]=cv2.addWeighted(ov,ba,frame,1-ba,0)
-        for exp,a in [(14,.12),(6,.20)]:
-            ov=frame.copy(); cv2.ellipse(ov,(hx,hy),(rx+exp,ry+exp),0,0,360,col,-1,cv2.LINE_AA); frame[:]=cv2.addWeighted(ov,a,frame,1-a,0)
-        return frame
-
-    def _draw_stat_bar(self, frame, x, y, w, h, val, mx, col, lbl, fmt):
-        """Gradient-filled stat bar with label and value text."""
-        filled = int(w * clamp01(val / max(mx, 1e-6)))
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (28, 28, 32), -1)
-        for px in range(filled):
-            t = px / max(w-1, 1)
-            cv2.line(frame, (x+px, y+1), (x+px, y+h-1),
-                     lerp_color(col, lerp_color(col, (255,255,255), .35), t), 1)
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (55, 55, 60), 1)
-        if lbl:
-            cv2.putText(frame, lbl, (x-2, y+h-1), cv2.FONT_HERSHEY_SIMPLEX,
-                        .34, (160,160,160), 1, cv2.LINE_AA)
-        vt = fmt.format(val)
-        cv2.putText(frame, vt, (x+w+5, y+h-1), cv2.FONT_HERSHEY_SIMPLEX,
-                    .42, col, 1, cv2.LINE_AA)
-
-    def _draw_sparkline(self, frame, x, y, w, h, vals, col=(0,255,200)):
-        v = list(vals)
-        if len(v) < 2: return
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (18, 18, 20), -1)
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (45, 45, 50), 1)
-        mx = max(max(v), .1)
-        pts = [(x + int(i/(len(v)-1)*w),
-                y+h - int(clamp01(vi/mx)*(h-2)) - 1) for i,vi in enumerate(v)]
-        for i in range(1, len(pts)):
-            cv2.line(frame, pts[i-1], pts[i],
-                     lerp_color((0,120,100), col, i/len(pts)), 2, cv2.LINE_AA)
-        cv2.circle(frame, pts[-1], 3, (255,255,255), -1, cv2.LINE_AA)
-
-    # ── NEW ENLARGED HUD — PW=310, bigger fonts, more readable ───────────────
-    def _hud(self, frame, idx, ts, total, visible=True):
-        H, W = frame.shape[:2]
-        fps  = self._fps_cache
-        PW   = 310          # ← was 230, now wider
-        FS   = 0.48         # base font scale (was ~0.33)
-        FS_S = 0.38         # small label scale
-        FS_V = 0.44         # value scale
-        LH   = 26           # line height for stat rows (was 22)
-        BH   = 10           # bar height (was 7)
-        BW   = 108          # bar width  (was 80)
-        BX   = 96           # bar x offset (was 68)
-
-        # ── Background panel ─────────────────────────────────────────────────
-        ov = frame.copy()
-        cv2.rectangle(ov, (0,0), (PW,H), (8,8,12), -1)
-        frame[:] = cv2.addWeighted(ov, .75, frame, .25, 0)
-        cv2.line(frame, (PW-1,0), (PW-1,H), (255,215,0), 2)
-
-        # ── Header bar ───────────────────────────────────────────────────────
-        cv2.rectangle(frame, (0,0), (PW,48), (20,20,28), -1)
-        cv2.line(frame, (0,48), (PW,48), (255,215,0), 1)
-        # Mini logo block
-        cv2.rectangle(frame, (6,6), (38,42), (255,255,255), -1)
-        cv2.rectangle(frame, (22,6), (38,42), (0,0,0), -1)
-        cv2.putText(frame, "JUV",  (7,36), cv2.FONT_HERSHEY_SIMPLEX, .50, (0,0,0), 1)
-        cv2.putText(frame, "ANALYTICS", (42,22),
-                    cv2.FONT_HERSHEY_SIMPLEX, .50, (255,215,0), 1, cv2.LINE_AA)
-        dm = _detection_layer.mode.upper() if _detection_layer else "BLOB"
-        bio_stat = "S2D" if HAS_SPORTS2D else "NP"
-        sig_stat = "SCIPY" if HAS_SCIPY else "NP"
-        cv2.putText(frame, f"POSE:{dm} | BIO:{bio_stat} | SIG:{sig_stat}", (42,38),
-                    cv2.FONT_HERSHEY_SIMPLEX, .30, (120,120,120), 1, cv2.LINE_AA)
-
-        # ── Tracker state + timecode ─────────────────────────────────────────
-        ts_ = self.lock.state
-        dc  = {"searching":(0,200,255),"tracking":(0,220,0),"lost":(0,80,255)}.get(ts_,(150,150,150))
-        st  = {"searching":"ACQUIRING","tracking":"LIVE","lost":"SEARCHING"}.get(ts_,"")
-        cv2.circle(frame, (12,62), 6, dc, -1, cv2.LINE_AA)
-        cv2.putText(frame, st, (24,67), cv2.FONT_HERSHEY_SIMPLEX, .44, dc, 1, cv2.LINE_AA)
-        tc = f"{int(ts//60):02d}:{ts%60:05.2f}"
-        (tcw,_),_ = cv2.getTextSize(tc, cv2.FONT_HERSHEY_SIMPLEX, .44, 1)
-        cv2.putText(frame, tc, (PW-tcw-8, 67),
-                    cv2.FONT_HERSHEY_SIMPLEX, .44, (160,160,160), 1, cv2.LINE_AA)
-
-        # ── Player label bar ─────────────────────────────────────────────────
-        cv2.rectangle(frame, (0,72), (PW,100), (18,18,26), -1)
-        cv2.putText(frame, f"PLAYER  #{self.player_id}", (8,92),
-                    cv2.FONT_HERSHEY_DUPLEX, .62, (255,215,0), 1, cv2.LINE_AA)
-
-        if not self.frame_metrics:
-            return frame
-
-        fm = self.frame_metrics[-1]
-        rc = risk_color(fm.risk_score)
-
-        # ── VELOCITY section ─────────────────────────────────────────────────
-        y0 = 106
-        cv2.putText(frame, "VELOCITY", (8,y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, FS_S, (120,120,120), 1, cv2.LINE_AA)
-        cv2.line(frame, (0,y0+4), (PW,y0+4), (30,30,40), 1)
-        spdt = f"{fm.speed:.1f}"
-        cv2.putText(frame, spdt, (8, y0+46),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.7, (0,255,200), 2, cv2.LINE_AA)
-        cv2.putText(frame, "m/s", (8+int(len(spdt)*26), y0+46),
-                    cv2.FONT_HERSHEY_SIMPLEX, .50, (80,200,160), 1, cv2.LINE_AA)
-        # Sparkline
-        self._draw_sparkline(frame, 8, y0+52, PW-20, 32, self._speed_history)
-        cv2.putText(frame, "3s SPEED HISTORY", (8, y0+96),
-                    cv2.FONT_HERSHEY_SIMPLEX, .30, (80,80,80), 1, cv2.LINE_AA)
-
-        # ── STATS section ────────────────────────────────────────────────────
-        y1 = y0 + 108
-        cv2.putText(frame, "PERFORMANCE", (8, y1),
-                    cv2.FONT_HERSHEY_SIMPLEX, FS_S, (120,120,120), 1, cv2.LINE_AA)
-        cv2.line(frame, (0,y1+4), (PW,y1+4), (30,30,40), 1)
-
-        stats = [
-            ("CADENCE",  fm.cadence,          220.,  (0,200,255),  "{:.0f} spm"),
-            ("STRIDE",   fm.stride_length,    2.5,   (0,255,180),  "{:.2f} m"),
-            ("ENERGY",   fm.energy_expenditure,900., (0,180,255),  "{:.0f} kc"),
-            ("GAIT SYM", fm.gait_symmetry,    100.,  (0,255,150),  "{:.0f}%"),
-            ("TRUNK",    fm.trunk_lean,        30.,  (0,200,220),  "{:.1f}°"),
-        ]
-        for i, (lbl, val, mx, col, fmt) in enumerate(stats):
-            sy = y1 + 14 + i*LH
-            cv2.putText(frame, lbl, (6, sy+BH+1),
-                        cv2.FONT_HERSHEY_SIMPLEX, FS_S, (130,130,130), 1, cv2.LINE_AA)
-            self._draw_stat_bar(frame, BX, sy, BW, BH, val, mx, col, "", fmt)
-
-        # ── JOINT ANGLES section ─────────────────────────────────────────────
-        y2 = y1 + 14 + len(stats)*LH + 8
-        cv2.putText(frame, "JOINT ANGLES", (8, y2),
-                    cv2.FONT_HERSHEY_SIMPLEX, FS_S, (120,120,120), 1, cv2.LINE_AA)
-        cv2.line(frame, (0,y2+4), (PW,y2+4), (30,30,40), 1)
-        for ki, (s, ang) in enumerate([("L KNEE", fm.left_knee_angle),
-                                        ("R KNEE", fm.right_knee_angle)]):
-            sy = y2 + 14 + ki*LH
-            ac = (0,220,0) if ang>145 else (0,140,255) if ang>120 else (0,0,220)
-            cv2.putText(frame, s, (6, sy+BH+1),
-                        cv2.FONT_HERSHEY_SIMPLEX, FS_S, (130,130,130), 1, cv2.LINE_AA)
-            self._draw_stat_bar(frame, BX, sy, BW, BH, ang, 180., ac, "", "{:.0f}°")
-
-        # ── VALGUS section ───────────────────────────────────────────────────
-        y3 = y2 + 14 + 2*LH + 6
-        cv2.putText(frame, "VALGUS (clinical°)", (8, y3),
-                    cv2.FONT_HERSHEY_SIMPLEX, FS_S, (120,120,120), 1, cv2.LINE_AA)
-        cv2.line(frame, (0,y3+4), (PW,y3+4), (30,30,40), 1)
-        for ki, (s, val) in enumerate([("L", fm.l_valgus_clinical), ("R", fm.r_valgus_clinical)]):
-            sy = y3 + 14 + ki*LH
-            # Clinical threshold: <5°=green, <10°=amber, ≥10°=red
-            vc = (0,220,0) if abs(val)<5. else (0,140,255) if abs(val)<10. else (0,0,220)
-            cv2.putText(frame, s, (6, sy+BH+1),
-                        cv2.FONT_HERSHEY_SIMPLEX, FS_S, (130,130,130), 1, cv2.LINE_AA)
-            self._draw_stat_bar(frame, BX, sy, BW, BH, abs(val), 20., vc, "", "{:.1f}°")
-        # Perspective confidence row
-        pc = fm.perspective_confidence
-        sy_pc = y3 + 14 + 2*LH
-        pc_col = (0,220,0) if pc>0.7 else (0,140,255) if pc>0.4 else (0,0,220)
-        cv2.putText(frame, "VIEW CONF", (6, sy_pc+BH+1),
-                    cv2.FONT_HERSHEY_SIMPLEX, max(FS_S-0.04, 0.28), (110,110,110), 1, cv2.LINE_AA)
-        self._draw_stat_bar(frame, BX, sy_pc, BW, BH, pc, 1.0, pc_col, "", "{:.0%}")
-
-        # ── INJURY RISK section ──────────────────────────────────────────────
-        y4 = y3 + 14 + 3*LH + 8   # +1 row for perspective confidence
-        cv2.putText(frame, "INJURY RISK", (8, y4),
-                    cv2.FONT_HERSHEY_SIMPLEX, FS_S, (120,120,120), 1, cv2.LINE_AA)
-        cv2.line(frame, (0,y4+4), (PW,y4+4), (30,30,40), 1)
-        rt = f"{fm.risk_score:.0f}"
-        cv2.putText(frame, rt, (8, y4+44),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.7, rc, 2, cv2.LINE_AA)
-        cv2.putText(frame, "/ 100", (8+int(len(rt)*26), y4+44),
-                    cv2.FONT_HERSHEY_SIMPLEX, .46, (80,80,80), 1, cv2.LINE_AA)
-        rl  = self._risk_label(fm.injury_risk)
-        lc  = (0,200,0) if rl=="Low" else (0,140,255) if rl=="Moderate" else (0,0,220)
-        (rlw,_),_ = cv2.getTextSize(rl, cv2.FONT_HERSHEY_SIMPLEX, .52, 1)
-        rx0, ry0 = 8, y4+50
-        cv2.rectangle(frame, (rx0,ry0), (rx0+rlw+14, ry0+22), lc, -1)
-        cv2.putText(frame, rl, (rx0+7, ry0+16),
-                    cv2.FONT_HERSHEY_SIMPLEX, .52, (0,0,0), 1, cv2.LINE_AA)
-
-        sub_risks = [("ACUTE",   fm.injury_risk,   1., (0,80,255)),
-                     ("JOINT",   fm.joint_stress,  1., (0,140,255)),
-                     ("FATIGUE", fm.fatigue_index, 1., (0,100,220))]
-        for ki, (lbl, val, mx, col) in enumerate(sub_risks):
-            sy = y4 + 76 + ki*LH
-            cv2.putText(frame, lbl, (6, sy+9),
-                        cv2.FONT_HERSHEY_SIMPLEX, FS_S, (110,110,110), 1, cv2.LINE_AA)
-            self._draw_stat_bar(frame, BX, sy, BW, 8, val, mx,
-                                risk_color(val*100), "", "{:.2f}")
-
-        # ── Progress bar ─────────────────────────────────────────────────────
-        prog = clamp01(ts / max(total/fps, 1e-6))
-        pby  = H - 20
-        cv2.rectangle(frame, (0,pby), (PW,H), (14,14,18), -1)
-        if prog > 0:
-            cv2.rectangle(frame, (0,pby+2), (int(PW*prog), H-2), (255,215,0), -1)
-            cv2.putText(frame, f"{prog*100:.0f}%", (PW//2-12, H-4),
-                        cv2.FONT_HERSHEY_SIMPLEX, .36,
-                        (0,0,0) if prog>.3 else (130,130,130), 1, cv2.LINE_AA)
-
-        # Risk bar along bottom of video area
-        if self.frame_metrics:
-            rc2 = risk_color(self.frame_metrics[-1].risk_score)
-            bw2 = int((W-PW)*clamp01(self.frame_metrics[-1].risk_score/100.))
-            cv2.rectangle(frame, (PW, H-9), (W, H), (20,20,20), -1)
-            if bw2 > 0:
-                cv2.rectangle(frame, (PW, H-9), (PW+bw2, H), rc2, -1)
-
-        # Out-of-frame banner
-        if not visible and ts_ == "lost":
-            bov = frame.copy()
-            cv2.rectangle(bov, (PW, H//2-38), (W, H//2+38), (0,0,0), -1)
-            frame[:] = cv2.addWeighted(bov, .70, frame, .30, 0)
-            cv2.putText(frame, f"PLAYER #{self.player_id} — OUT OF FRAME",
-                        (PW+20, H//2+10), cv2.FONT_HERSHEY_DUPLEX,
-                        .80, (0,140,255), 2, cv2.LINE_AA)
-
-        return frame
+        hip_x   = [p.kp.hip_center[0] for p in self.pose_frames]
+        lat_bal = clamp01(
+            np.std(hip_x) / (max(1, np.mean([p.bbox[2] for p in self.pose_frames])) * 0.1)
+            if hip_x else 0.
+        )
+        for fm in self.frame_metrics:
+            sr = max(0., (100 - fm.gait_symmetry) / 100)
+            vr = min(1., fm.stride_variability / 25)
+            lr = min(1., fm.trunk_lean / 40)
+            fm.fall_risk    = clamp01(sr * .3 + vr * .2 + lr * .2 + lat_bal * .3)
+            ar              = min(1., abs(fm.acceleration) / 12)
+            fm.injury_risk  = fm.joint_stress * .5 + ar * .3 + fm.fatigue_index * .2
 
     def _build_summary(self):
-        if not self.frame_metrics: return
-        fms=self.frame_metrics; s=self.summary; sc=self.PIX_TO_M or 0.002
-        s.total_frames=len(fms); s.duration_seconds=fms[-1].timestamp
-        spds=np.array([f.speed for f in fms]); s.avg_speed=float(np.mean(spds)); s.max_speed=float(np.max(spds))
-        def anz(a): v=[getattr(f,a) for f in fms if getattr(f,a)>0]; return float(np.mean(v)) if v else 0.
-        s.avg_stride_length=anz("stride_length"); s.avg_step_time=anz("step_time")
-        s.avg_cadence=anz("cadence"); s.avg_flight_time=anz("flight_time")
-        # Energy now in Watts (Minetti model) — store mean power
-        s.estimated_energy_kcal_hr=float(np.mean([f.energy_expenditure for f in fms]))
-        s.gait_symmetry_pct=float(np.mean([f.gait_symmetry for f in fms]))
-        s.stride_variability_pct=float(np.mean([f.stride_variability for f in fms]))
-        dc=sum(1 for f in fms if f.direction_change)
-        s.direction_change_freq=dc/max(s.duration_seconds/60,1e-6)
-        s.peak_risk_score=float(np.max([f.risk_score for f in fms]))
-        if len(self.pose_frames)>=2:
-            s.total_distance_m=sum(dist2d(self.pose_frames[i].kp.hip_center,
-                                          self.pose_frames[i-1].kp.hip_center)*sc
-                                   for i in range(1,len(self.pose_frames)))
-        def rl(a): return self._risk_label(float(np.mean([getattr(f,a) for f in fms])))
-        s.fall_risk_label=rl("fall_risk"); s.injury_risk_label=rl("injury_risk")
-        s.body_stress_label=rl("joint_stress"); s.fatigue_label=rl("fatigue_index")
-        # Injury risk detail now uses clinical valgus thresholds
-        avg_valgus=float(np.mean([abs(f.l_valgus_clinical)+abs(f.r_valgus_clinical) for f in fms]))/2.
-        ai=float(np.mean([f.injury_risk for f in fms]))
-        if avg_valgus>10.: s.injury_risk_detail="valgus collapse detected (>10°)"
-        elif ai>.5:        s.injury_risk_detail="high knee load / acceleration stress"
-        elif ai>.3:        s.injury_risk_detail="moderate joint stress"
-        else:              s.injury_risk_detail="within normal range"
+        if not self.frame_metrics:
+            return
+        fms = self.frame_metrics
+        s   = self.summary
+        sc  = self.PIX_TO_M or 0.002
 
-    def get_report_string(self) -> str:
-        s = self.summary
-        dm = _detection_layer.mode.upper() if _detection_layer else "BLOB"
-        bio_backend = "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy"
+        s.total_frames    = len(fms)
+        s.duration_seconds = fms[-1].timestamp
 
-        lines = []
-        width = 70
+        spds = np.array([f.speed for f in fms])
+        s.avg_speed = float(np.mean(spds))
+        s.max_speed = float(np.max(spds))
 
-        lines.append("=" * width)
-        lines.append(f"JUVENTUS ANALYTICS v4 — Player #{s.player_id} [{dm}]".center(width))
-        lines.append("=" * width)
+        def anz(a):
+            v = [getattr(f, a) for f in fms if getattr(f, a) > 0]
+            return float(np.mean(v)) if v else 0.
 
-        lines.append("")
-        lines.append("SESSION OVERVIEW")
-        lines.append("-" * width)
-        lines.append(f"  Duration        : {s.duration_seconds:>6.1f} s")
-        lines.append(f"  Total Frames    : {s.total_frames:>6}")
-        lines.append(f"  Total Distance  : {s.total_distance_m:>6.1f} m")
-        lines.append(f"  Angle Backend   : {bio_backend}")
+        s.avg_stride_length        = anz("stride_length")
+        s.avg_step_time            = anz("step_time")
+        s.avg_cadence              = anz("cadence")
+        s.avg_flight_time          = anz("flight_time")
+        s.estimated_energy_kcal_hr = float(np.mean([f.energy_expenditure for f in fms]))
+        s.gait_symmetry_pct        = float(np.mean([f.gait_symmetry for f in fms]))
+        s.stride_variability_pct   = float(np.mean([f.stride_variability for f in fms]))
 
-        lines.append("")
-        lines.append("PLAYER METRICS")
-        lines.append("-" * width)
-        lines.append(f"  Avg Speed       : {s.avg_speed:>6.2f} m/s")
-        lines.append(f"  Max Speed       : {s.max_speed:>6.2f} m/s")
-        lines.append(f"  Avg Stride      : {s.avg_stride_length:>6.2f} m")
-        lines.append(f"  Avg Cadence     : {s.avg_cadence:>6.0f} spm")
-        lines.append(f"  Avg Step Time   : {s.avg_step_time:>6.2f} s")
-        lines.append(f"  Changes/Min     : {s.direction_change_freq:>6.1f}")
-        lines.append(f"  Energy (avg)    : {s.estimated_energy_kcal_hr:>6.0f} W  "
-                     f"(Minetti model, 75 kg)")
+        dc = sum(1 for f in fms if f.direction_change)
+        s.direction_change_freq = dc / max(s.duration_seconds / 60, 1e-6)
+        s.peak_risk_score = float(np.max([f.risk_score for f in fms]))
 
-        # Biomechanics summary if available
-        if self.bio_engine and self.bio_engine.frames:
-            bio = self.bio_engine.summary_dict()
-            lines.append("")
-            lines.append("BIOMECHANICS  (Sports2D angles, Butterworth 6 Hz)")
-            lines.append("-" * width)
-            lines.append(f"  L Knee flexion  : {bio.get('left_knee_flexion_mean',0):>6.1f}° avg  "
-                         f"{bio.get('left_knee_flexion_std',0):.1f}° sd")
-            lines.append(f"  R Knee flexion  : {bio.get('right_knee_flexion_mean',0):>6.1f}° avg  "
-                         f"{bio.get('right_knee_flexion_std',0):.1f}° sd")
-            lines.append(f"  L Hip flexion   : {bio.get('left_hip_flexion_mean',0):>6.1f}°")
-            lines.append(f"  R Hip flexion   : {bio.get('right_hip_flexion_mean',0):>6.1f}°")
-            lines.append(f"  L Ankle dorsi   : {bio.get('left_ankle_dorsiflexion_mean',0):>6.1f}°")
-            lines.append(f"  R Ankle dorsi   : {bio.get('right_ankle_dorsiflexion_mean',0):>6.1f}°")
-            lines.append(f"  Trunk lat lean  : {bio.get('trunk_lateral_lean_mean',0):>6.1f}°")
-            lines.append(f"  Pelvis obliquity: {bio.get('pelvis_obliquity_mean',0):>6.1f}°")
-            lines.append(f"  Arm swing asym  : {bio.get('arm_swing_asymmetry_mean',0):>6.1f}°")
-            lines.append(f"  Double support  : {bio.get('double_support_pct',0):>6.1f}%")
-            lines.append(f"  Heel strikes L/R: {bio.get('lhs_count',0)} / {bio.get('rhs_count',0)}")
+        if len(self.pose_frames) >= 2:
+            s.total_distance_m = sum(
+                dist2d(self.pose_frames[i].kp.hip_center, self.pose_frames[i-1].kp.hip_center) * sc
+                for i in range(1, len(self.pose_frames))
+            )
 
-            lvc = bio.get('left_valgus_clinical_mean', 0)
-            rvc = bio.get('right_valgus_clinical_mean', 0)
-            lvc_flag = "  ⚠ VALGUS" if abs(lvc) > 10 else ""
-            rvc_flag = "  ⚠ VALGUS" if abs(rvc) > 10 else ""
-            lines.append(f"  L Valgus (clin) : {lvc:>+6.1f}°{lvc_flag}")
-            lines.append(f"  R Valgus (clin) : {rvc:>+6.1f}°{rvc_flag}")
+        def rl(a):
+            return self._risk_label(float(np.mean([getattr(f, a) for f in fms])))
 
-        lines.append("")
-        lines.append("RISK INDICATORS")
-        lines.append("-" * width)
-        lines.append(f"  Peak Risk Score : {s.peak_risk_score:>6.0f} / 100")
-        lines.append(f"  Gait Symmetry   : {s.gait_symmetry_pct:>6.1f} %")
-        lines.append(f"  Acute Inj. Risk : {s.injury_risk_label:<10}  "
-                     f"(valgus collapse, knee asym, acceleration)")
-        lines.append(f"  Body Stress     : {s.body_stress_label:<10}  "
-                     f"(joint load, trunk lean)")
-        lines.append(f"  Fatigue Level   : {s.fatigue_label:<10}")
-        lines.append(f"  Risk Detail     : {s.injury_risk_detail:<30}")
-        lines.append(f"  NOTE: Scores discounted when player faces camera")
-        lines.append(f"        (perspective_confidence < 1.0)")
+        s.fall_risk_label    = rl("fall_risk")
+        s.injury_risk_label  = rl("injury_risk")
+        s.body_stress_label  = rl("joint_stress")
+        s.fatigue_label      = rl("fatigue_index")
 
-        lines.append("")
-        lines.append("=" * width)
-        return "\n".join(lines)
+        avg_valgus = float(np.mean(
+            [abs(f.l_valgus_clinical) + abs(f.r_valgus_clinical) for f in fms]
+        )) / 2.
+        ai = float(np.mean([f.injury_risk for f in fms]))
+        if avg_valgus > 10.:
+            s.injury_risk_detail = "valgus collapse detected (>10°)"
+        elif ai > .5:
+            s.injury_risk_detail = "high knee load / acceleration stress"
+        elif ai > .3:
+            s.injury_risk_detail = "moderate joint stress"
+        else:
+            s.injury_risk_detail = "within normal range"
 
     @staticmethod
-    def _risk_label(v): 
+    def _risk_label(v) -> str:
         return "Low" if v < .25 else "Moderate" if v < .55 else "High"
 
-    def export_json(self, path):
+    # ── Sports2D native pipeline ──────────────────────────────────────────────
+
+    def run_sports2d(self, result_dir: str,
+                     mode: str = "balanced",
+                     show_realtime: bool = False,
+                     person_ordering: str = "greatest_displacement",
+                     do_ik: bool = False,
+                     use_augmentation: bool = False,
+                     visible_side: str = "auto front",
+                     participant_mass_kg: float = 75.0) -> dict:
+        if self.PIX_TO_M and self.pose_frames:
+            heights = []
+            for pf in self.pose_frames[-30:]:
+                h = dist2d(pf.kp.head, pf.kp.left_ankle) * self.PIX_TO_M
+                if 1.4 < h < 2.2:
+                    heights.append(h)
+            if heights:
+                self.player_height_m = float(np.median(heights))
+
+        self.sports2d_runner = Sports2DRunner(
+            video_path          = self.video_path,
+            result_dir          = result_dir,
+            player_height_m     = self.player_height_m,
+            participant_mass_kg = participant_mass_kg,
+            mode                = mode,
+            show_realtime       = show_realtime,
+            person_ordering     = person_ordering,
+            do_ik               = do_ik,
+            use_augmentation    = use_augmentation,
+            visible_side        = visible_side,
+        )
+        return self.sports2d_runner.run()
+
+    # ── Unified export ────────────────────────────────────────────────────────
+
+    def export_unified(self, json_path: str, csv_path: str,
+                       trc_path: Optional[str] = None,
+                       mot_path: Optional[str] = None):
+        """
+        Consolidate ALL data into two unified files:
+          - data_output.json : hierarchical structured data
+          - bio_metrics.csv  : flat time-series for analysis
+
+        Optionally writes OpenSim-compatible .trc and .mot files.
+        """
+        # ── Build unified per-frame records ───────────────────────────────────
+        bio_by_frame: dict = {}
+        if self.bio_engine and self.bio_engine.frames:
+            for bf in self.bio_engine.frames:
+                bio_by_frame[bf.frame_idx] = asdict(bf)
+
+        unified_frames = []
+        for fm in self.frame_metrics:
+            record = asdict(fm)
+            bio = bio_by_frame.get(fm.frame_idx, {})
+            # Merge bio fields — prefix with "bio_" to avoid name collision
+            for k, v in bio.items():
+                if k not in ("frame_idx", "timestamp"):
+                    record[f"bio_{k}"] = v
+
+            # Append Sports2D keypoints if available (from TRC data)
+            unified_frames.append(record)
+
+        # ── Sports2D angle summary ────────────────────────────────────────────
+        s2d_angle_summary: dict = {}
+        s2d_pose_summary:  dict = {}
+        if self.sports2d_runner:
+            mot_df = self.sports2d_runner.load_mot_angles()
+            if mot_df is not None and not mot_df.empty:
+                angle_cols = [c for c in mot_df.columns if c.lower() != "time"]
+                for col in angle_cols:
+                    try:
+                        vals = pd.to_numeric(mot_df[col], errors="coerce").dropna()
+                        if len(vals):
+                            s2d_angle_summary[col] = {
+                                "mean": float(vals.mean()),
+                                "max":  float(vals.max()),
+                                "min":  float(vals.min()),
+                                "std":  float(vals.std()),
+                            }
+                    except Exception:
+                        pass
+            trc_df = self.sports2d_runner.load_trc_pose(metres=True)
+            if trc_df is not None and not trc_df.empty:
+                s2d_pose_summary["trc_shape"] = list(trc_df.shape)
+                s2d_pose_summary["trc_columns"] = list(trc_df.columns)
+
+        # ── JSON — hierarchical ───────────────────────────────────────────────
+        payload = {
+            "metadata": {
+                "player_id":   self.player_id,
+                "video_path":  self.video_path,
+                "fps":         self._fps_cache,
+                "pix_to_m":   self.PIX_TO_M,
+                "total_frames": len(self.frame_metrics),
+                "angle_backend": "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy",
+            },
+            "player_summary":   asdict(self.summary),
+            "biomechanics_summary": self.bio_engine.summary_dict() if self.bio_engine else {},
+            "sports2d_angle_summary": s2d_angle_summary,
+            "sports2d_pose_summary":  s2d_pose_summary,
+            "sports2d_output_files":  self.sports2d_runner.outputs if self.sports2d_runner else {},
+            "frames": unified_frames,
+        }
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+        print(f"[EXPORT] data_output.json → {json_path}  ({len(unified_frames)} frames)")
+
+        # ── CSV — flat time-series ────────────────────────────────────────────
+        df = pd.DataFrame(unified_frames)
+
+        # Merge Sports2D MOT angles as additional columns if available
+        if self.sports2d_runner:
+            mot_df = self.sports2d_runner.load_mot_angles()
+            if mot_df is not None and not mot_df.empty and "time" in mot_df.columns:
+                mot_df = mot_df.rename(columns={"time": "timestamp"})
+                mot_df.columns = ["s2d_" + c if c != "timestamp" else c for c in mot_df.columns]
+                df = pd.merge(df, mot_df, on="timestamp", how="left")
+
+        df.to_csv(csv_path, index=False)
+        print(f"[EXPORT] bio_metrics.csv → {csv_path}  ({df.shape[0]} rows × {df.shape[1]} cols)")
+
+        # ── OpenSim TRC ───────────────────────────────────────────────────────
+        if trc_path and self.pose_frames:
+            writer = OpenSimFileWriter()
+            writer.write_trc(
+                pose_frames     = self.pose_frames,
+                path            = trc_path,
+                fps             = self._fps_cache,
+                pix_to_m        = self.PIX_TO_M or 0.002,
+                frame_height_px = self._frame_height_px or 720,
+            )
+
+        # ── OpenSim MOT ───────────────────────────────────────────────────────
+        if mot_path and self.bio_engine and self.bio_engine.frames:
+            writer = OpenSimFileWriter()
+            writer.write_mot(
+                bio_frames = self.bio_engine.frames,
+                path       = mot_path,
+                fps        = self._fps_cache,
+            )
+
+    # ── Legacy export helpers (kept for backward compatibility) ───────────────
+
+    def export_json(self, path: str):
         with open(path, "w") as f:
             json.dump({
                 "player_summary": asdict(self.summary),
-                "frame_metrics": [asdict(m) for m in self.frame_metrics]
+                "frame_metrics":  [asdict(m) for m in self.frame_metrics],
             }, f, indent=2)
         print(f"[EXPORT] JSON → {path}")
 
-    def export_csv(self, path):
+    def export_csv(self, path: str):
         pd.DataFrame([asdict(m) for m in self.frame_metrics]).to_csv(path, index=False)
         print(f"[EXPORT] CSV  → {path}")
+
+    def export_biomechanics_csv(self, path: str):
+        if self.bio_engine and self.bio_engine.frames:
+            self.bio_engine.get_dataframe().to_csv(path, index=False)
+            print(f"[EXPORT] Bio CSV → {path}")
 
     def get_dataframe(self) -> pd.DataFrame:
         return pd.DataFrame([asdict(m) for m in self.frame_metrics])
 
-    def print_report(self):
-        # Use the centralized report string for consistent formatting
-        print(self.get_report_string())
+    # ── Report ────────────────────────────────────────────────────────────────
 
-# TO DO: Test pip install sports2d pose2sim
-# TO DO: Test pip install kineticstoolkit 
+    def get_report_string(self) -> str:
+        s   = self.summary
+        dm  = _detection_layer.mode.upper() if _detection_layer else "BLOB"
+        bio = "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy"
+        W   = 70
+        lines = ["=" * W,
+                 f"JUVENTUS ANALYTICS v5 — Player #{s.player_id} [{dm}]".center(W),
+                 "=" * W, "",
+                 "SESSION OVERVIEW", "-" * W,
+                 f"  Duration        : {s.duration_seconds:>6.1f} s",
+                 f"  Total Frames    : {s.total_frames:>6}",
+                 f"  Total Distance  : {s.total_distance_m:>6.1f} m",
+                 f"  Angle Backend   : {bio}", "",
+                 "PLAYER METRICS", "-" * W,
+                 f"  Avg Speed       : {s.avg_speed:>6.2f} m/s",
+                 f"  Max Speed       : {s.max_speed:>6.2f} m/s",
+                 f"  Avg Stride      : {s.avg_stride_length:>6.2f} m",
+                 f"  Avg Cadence     : {s.avg_cadence:>6.0f} spm",
+                 f"  Avg Step Time   : {s.avg_step_time:>6.2f} s",
+                 f"  Changes/Min     : {s.direction_change_freq:>6.1f}",
+                 f"  Energy (avg)    : {s.estimated_energy_kcal_hr:>6.0f} W"]
 
-# To run :  python run_analysis.py --video match.mp4 --yolo-size l 
+        if self.bio_engine and self.bio_engine.frames:
+            bd = self.bio_engine.summary_dict()
+            lines += ["", "BIOMECHANICS  (Butterworth 6 Hz)", "-" * W,
+                      f"  L Knee flexion  : {bd.get('left_knee_flexion_mean',0):>6.1f}° avg  {bd.get('left_knee_flexion_std',0):.1f}° sd",
+                      f"  R Knee flexion  : {bd.get('right_knee_flexion_mean',0):>6.1f}° avg  {bd.get('right_knee_flexion_std',0):.1f}° sd",
+                      f"  L Hip flexion   : {bd.get('left_hip_flexion_mean',0):>6.1f}°",
+                      f"  R Hip flexion   : {bd.get('right_hip_flexion_mean',0):>6.1f}°",
+                      f"  L Ankle dorsi   : {bd.get('left_ankle_dorsiflexion_mean',0):>6.1f}°",
+                      f"  R Ankle dorsi   : {bd.get('right_ankle_dorsiflexion_mean',0):>6.1f}°",
+                      f"  Trunk lat lean  : {bd.get('trunk_lateral_lean_mean',0):>6.1f}°",
+                      f"  Pelvis obliquity: {bd.get('pelvis_obliquity_mean',0):>6.1f}°",
+                      f"  Arm swing asym  : {bd.get('arm_swing_asymmetry_mean',0):>6.1f}°",
+                      f"  Double support  : {bd.get('double_support_pct',0):>6.1f}%",
+                      f"  Heel strikes L/R: {bd.get('lhs_count',0)} / {bd.get('rhs_count',0)}"]
+            lvc = bd.get('left_valgus_clinical_mean',  0)
+            rvc = bd.get('right_valgus_clinical_mean', 0)
+            lines.append(f"  L Valgus (clin) : {lvc:>+6.1f}°{'  ⚠ VALGUS' if abs(lvc)>10 else ''}")
+            lines.append(f"  R Valgus (clin) : {rvc:>+6.1f}°{'  ⚠ VALGUS' if abs(rvc)>10 else ''}")
+
+        lines += ["", "RISK INDICATORS", "-" * W,
+                  f"  Peak Risk Score : {s.peak_risk_score:>6.0f} / 100",
+                  f"  Gait Symmetry   : {s.gait_symmetry_pct:>6.1f} %",
+                  f"  Acute Inj. Risk : {s.injury_risk_label}",
+                  f"  Body Stress     : {s.body_stress_label}",
+                  f"  Fatigue Level   : {s.fatigue_label}",
+                  f"  Risk Detail     : {s.injury_risk_detail}",
+                  "", "=" * W]
+        return "\n".join(lines)
