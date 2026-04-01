@@ -78,6 +78,7 @@ Input/
 # Output Videos (Generated annotated videos)
 Output/
 output/
+ffmpeg-8.1/
 white_attack_Sports2D/
 output_annotated.mp4
 *.avi
@@ -90,7 +91,7 @@ output_annotated.mp4
 logs/
 *.log
 original_Sports2D/
-
+ffmpeg-8.1/
 # Environment Variables (API Keys, Configs)
 .env
 .env.local
