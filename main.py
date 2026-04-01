@@ -24,9 +24,8 @@ import cloudinary
 import cloudinary.uploader
 from cloudinary.utils import cloudinary_url
 
-# Import the analytics core
-
-from sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D
+# Import the analytics core lazily in the endpoint to speed up startup on Render
+# from sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D
 
 # Load environment variables
 load_dotenv()
@@ -162,6 +161,11 @@ async def dashboard():
     """Serve the analytics dashboard."""
     return FileResponse(os.path.join(static_dir, "dashboard.html"))
 
+@app.get("/health")
+async def health():
+    """Fast health check for Render to detect the open port instantly."""
+    return {"status": "ok", "service": "Juventus Sports Analytics"}
+
 @app.post("/analyze")
 async def analyze_video(
     file: UploadFile = File(...),
@@ -183,7 +187,10 @@ async def analyze_video(
     if not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video.")
 
-    # Generate a unique job ID
+    # Lazy import to prevent blocking startup during port binding
+    from sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D
+
+    # Use a unique job ID
     job_id = str(uuid.uuid4())
     print(f"\n[JOB {job_id[:8]}] Starting analysis for player #{player_id}")
 
