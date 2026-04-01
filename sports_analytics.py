@@ -1,5 +1,5 @@
 """
-Juventus Sports Analytics System  v5
+Sports Analytics System  v5
 ======================================
 Refactored for data integrity, clean video output, and OpenSim compatibility.
 
@@ -196,6 +196,9 @@ class PlayerSummary:
     injury_risk_detail: str = ""
     body_stress_label: str = "Low"
     fatigue_label: str = "Low"
+    double_support_pct: float = 0.
+    avg_pelvic_rotation: float = 0.
+
 
 
 @dataclass
@@ -1158,7 +1161,7 @@ class BiomechanicsEngine:
         hd = kp.left_hip[1] - kp.right_hip[1]
         hw = dist2d(kp.left_hip, kp.right_hip) + 1e-9
         bf.pelvis_obliquity = math.degrees(math.atan2(abs(hd), hw))
-        bf.pelvis_rotation  = abs(hd) / hw * 100.
+        bf.pelvis_rotation  = math.degrees(math.atan2(abs(hd), hw + 1e-6))
 
         bf.left_valgus_clinical  = self._clinical_valgus(kp.left_hip,  kp.left_knee,  kp.left_ankle)
         bf.right_valgus_clinical = self._clinical_valgus(kp.right_hip, kp.right_knee, kp.right_ankle)
@@ -2178,7 +2181,7 @@ class SportsAnalyzer:
         det_layer = _get_detection_layer(yolo_size)
 
         print("\n" + "=" * 50)
-        print(" JUVENTUS SPORTS ANALYTICS: ENGINE READY")
+        print(" SPORTS ANALYTICS: ENGINE READY")
         print("-" * 50)
         print(f" * POSE DETECTION:    {det_layer.mode.upper()}")
         print(f" * BIOMECHANICS:      {'SPORTS2D (Clinical-Grade)' if HAS_SPORTS2D else 'NUMPY (Math Fallback)'}")
@@ -2251,19 +2254,27 @@ class SportsAnalyzer:
         cap.release()
         out.release()
 
+        # Build summary and process gait before potentially re-encoding
         if self.bio_engine:
             self.bio_engine.post_process()
         self._post_gait(fps)
         self._build_summary()
+
         return self.summary
 
     def _create_writer(self, path: str, fps: float, W: int, H: int):
-        for codec in ["mp4v", "avc1", "XVID", "MJPG"]:
+        # For Cloudinary compatibility, we prioritize reliability (mp4v) over browser-native codecs (avc1)
+        # because Cloudinary will transcode it to a web-safe format automatically.
+        for codec in ["mp4v", "avc1", "H264", "VP80", "X264", "DIVX", "MJPG"]:
+
             try:
-                writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*codec), fps, (W, H))
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                writer = cv2.VideoWriter(path, fourcc, fps, (W, H))
                 if writer.isOpened():
+                    # Sanity check: write a dead frame
                     dummy = np.zeros((H, W, 3), np.uint8)
                     writer.write(dummy)
+                    print(f"[VIDEO] Using codec: {codec}")
                     return writer
             except Exception:
                 continue
@@ -2272,6 +2283,7 @@ class SportsAnalyzer:
             def write(self, _): pass
             def release(self): pass
         return _NullWriter()
+
 
     # ── Annotation (skeleton + labels on video frame, NO side panel) ──────────
 
@@ -2566,6 +2578,15 @@ class SportsAnalyzer:
         else:
             s.injury_risk_detail = "within normal range"
 
+        if self.bio_engine:
+            bd = self.bio_engine.summary_dict()
+            s.double_support_pct = bd.get("double_support_pct", 0.0)
+            avg_pr = bd.get("pelvis_rotation_mean", 0.0)
+            # If explicit rotation is missing, estimate from trunk lean as fallback
+            if avg_pr == 0:
+                avg_pr = float(np.mean([f.trunk_lean for f in fms])) * 0.4
+            s.avg_pelvic_rotation = avg_pr
+
     @staticmethod
     def _risk_label(v) -> str:
         return "Low" if v < .25 else "Moderate" if v < .55 else "High"
@@ -2688,7 +2709,11 @@ class SportsAnalyzer:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, default=str)
         print(f"[EXPORT] data_output.json → {json_path}  ({len(unified_frames)} frames)")
+        
+        # ── Return payload for API usage ──
+        return payload
 
+        
         # ── CSV — flat time-series ────────────────────────────────────────────
         df = pd.DataFrame(unified_frames)
 
@@ -2753,7 +2778,7 @@ class SportsAnalyzer:
         bio = "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy"
         W   = 70
         lines = ["=" * W,
-                 f"JUVENTUS ANALYTICS v5 — Player #{s.player_id} [{dm}]".center(W),
+                 f"SPORTS ANALYTICS v5 — Player #{s.player_id} [{dm}]".center(W),
                  "=" * W, "",
                  "SESSION OVERVIEW", "-" * W,
                  f"  Duration        : {s.duration_seconds:>6.1f} s",

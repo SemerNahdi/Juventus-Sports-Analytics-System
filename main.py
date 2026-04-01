@@ -20,8 +20,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
+import cloudinary
+import cloudinary.uploader
+from cloudinary.utils import cloudinary_url
 
 # Import the analytics core
+
 from sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D
 
 # Load environment variables
@@ -36,8 +40,17 @@ BUCKET_NAME = os.getenv("SUPABASE_BUCKET", "Sports Analytics")
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Cloudinary configuration
+cloudinary.config(
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key = os.getenv("CLOUDINARY_API_KEY"),
+    api_secret = os.getenv("CLOUDINARY_API_SECRET"),
+    secure = True
+)
+
+
 app = FastAPI(
-    title="Juventus Sports Analytics API",
+    title="Sports Analytics API",
     description="Advanced Biomechanics & Tracking backend with Supabase Storage integration."
 )
 
@@ -70,7 +83,7 @@ def get_content_type(filename: str) -> str:
     return mapping.get(ext, "application/octet-stream")
 
 def upload_file_to_supabase(local_path: str, remote_path: str) -> str:
-    """Upload a single file to Supabase and return its public URL."""
+    """Upload a single file to Supabase and return its public URL or a signed URL."""
     try:
         content_type = get_content_type(local_path)
         with open(local_path, "rb") as f:
@@ -79,12 +92,49 @@ def upload_file_to_supabase(local_path: str, remote_path: str) -> str:
                 file=f,
                 file_options={"content-type": content_type, "upsert": "true"}
             )
-        return supabase.storage.from_(BUCKET_NAME).get_public_url(remote_path)
+        
+        # We use a signed URL to avoid issues if the bucket is not public
+        # Setting a very long expiry (e.g., 10 years) for "permanent" dashboard access
+        try:
+            signed_url_res = supabase.storage.from_(BUCKET_NAME).create_signed_url(remote_path, 315360000) # 10 years
+            if isinstance(signed_url_res, dict) and "signedURL" in signed_url_res:
+                return signed_url_res["signedURL"]
+            elif hasattr(signed_url_res, "signed_url"):
+                return signed_url_res.signed_url
+            return supabase.storage.from_(BUCKET_NAME).get_public_url(remote_path)
+        except:
+            return supabase.storage.from_(BUCKET_NAME).get_public_url(remote_path)
+            
     except Exception as e:
         print(f"[Supabase Upload Error] {local_path} -> {remote_path}: {e}")
         return ""
 
+
+def upload_video_to_cloudinary(local_path: str, public_id: str) -> str:
+    """
+    Upload a video to Cloudinary with automatic transcoding (f_auto).
+    Returns the secure URL for public viewing.
+    """
+    try:
+        print(f"[Cloudinary] Uploading video: {local_path}...")
+        response = cloudinary.uploader.upload(
+            local_path,
+            public_id = public_id,
+            resource_type = "video",
+            overwrite = True,
+            # 'f_auto' automatically chooses the best video codec for the viewer's browser
+            # 'q_auto' chooses optimal compression quality
+            transformation = [
+                {'fetch_format': "auto", 'quality': "auto"}
+            ]
+        )
+        return response.get("secure_url", "")
+    except Exception as e:
+        print(f"[Cloudinary Error] {e}")
+        return ""
+
 def upload_directory_to_supabase(directory: str, prefix: str) -> dict:
+
     """Recursively upload a directory to Supabase and return a dict of public URLs."""
     urls = {}
     for root, _, files in os.walk(directory):
@@ -184,12 +234,13 @@ async def analyze_video(
             mot_out = os.path.join(data_dir, "motions.mot")
             report_out = os.path.join(data_dir, "report.txt")
 
-            analyzer.export_unified(
+            unified_data = analyzer.export_unified(
                 json_path=json_out,
                 csv_path=csv_out,
                 trc_path=trc_out,
                 mot_path=mot_out,
             )
+            unified_frames = unified_data.get("frames", [])
             
             # Save the report string too
             with open(report_out, "w", encoding="utf-8") as f:
@@ -202,13 +253,21 @@ async def analyze_video(
                 bio_engine=analyzer.bio_engine
             )
 
-            # 7. Upload All Assets to Supabase
-            print(f"[JOB {job_id[:8]}] Uploading results to Supabase bucket: {BUCKET_NAME}")
+            # 7. Upload All Assets (Video to Cloudinary, Others to Supabase)
+            print(f"[JOB {job_id[:8]}] Uploading results...")
             
             asset_prefix = f"jobs/{job_id}"
             
-            # Upload annotated video
-            video_url = upload_file_to_supabase(output_video_path, f"{asset_prefix}/{output_video_name}")
+            # --- VIDEO OPTIMIZATION (No FFmpeg needed - Cloudinary handles it!) ---
+            # We upload the original OpenCV output to Cloudinary, which will auto-transcode it
+            video_url = upload_video_to_cloudinary(output_video_path, f"juventus_analytics_{job_id}")
+            
+            # If Cloudinary upload fails, try the fallback (will likely have codec issues but better than nothing)
+            if not video_url:
+                print(f"[JOB {job_id[:8]}] Cloudinary failed. Falling back to Supabase.")
+                video_url = upload_file_to_supabase(output_video_path, f"{asset_prefix}/{output_video_name}")
+
+
             
             # Upload data files
             data_urls = upload_directory_to_supabase(data_dir, f"{asset_prefix}/data")
@@ -231,7 +290,11 @@ async def analyze_video(
                     "data_files": data_urls,
                     "analytical_plots": plot_urls
                 },
-                "summary": asdict(summary)
+                "summary": {
+                    "player_summary": asdict(summary),
+                    "biomechanics_summary": analyzer.bio_engine.summary_dict() if analyzer.bio_engine else {},
+                    "frame_metrics": unified_frames # Use the version with bio_ fields
+                }
             }
 
             # 8. Store results in Supabase Database Table 'analyses'

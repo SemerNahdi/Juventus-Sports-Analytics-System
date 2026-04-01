@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sports Analytics Dashboard</title>
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation Removed -->
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="top-nav glass">
+                <div class="player-info" id="playerInfo">
+                    <h1 id="viewTitle">Player Analysis</h1>
+                    <p class="subtitle" id="sessionInfo">Select an analysis or start a new one</p>
+                </div>
+                <div class="actions">
+                    <button class="btn btn-secondary" onclick="toggleHistory()">View History</button>
+                    <button class="btn btn-primary" onclick="showUploadModal()">New Analysis</button>
+                </div>
+            </header>
+
+            <!-- Analysis History (Hidden by default) -->
+            <section id="historySection" class="history-section card glass" style="display: none;">
+                <div class="card-header">
+                    <h3>Recent Analyses</h3>
+                    <button class="close-btn" onclick="toggleHistory()">&times;</button>
+                </div>
+                <div class="history-list" id="historyList">
+                    <!-- History items will be injected here -->
+                    <p class="loading-text">Loading history...</p>
+                </div>
+            </section>
+
+            <!-- Upload Modal -->
+            <div id="uploadModal" class="modal-overlay" style="display: none;">
+                <div class="modal-content glass">
+                    <div class="modal-header">
+                        <h2>New Biomechanics Analysis</h2>
+                        <button class="close-btn" onclick="hideUploadModal()">&times;</button>
+                    </div>
+                    <form id="uploadForm" class="analysis-form">
+                        <div class="form-grid">
+                            <div class="form-group span-12">
+                                <label for="videoFile">Video Upload (.MP4)</label>
+                                <div class="file-drop-zone" id="dropZone">
+                                    <input type="file" id="videoFile" accept="video/mp4" required>
+                                    <div class="drop-zone-text">
+                                        <i class="icon-upload"></i>
+                                        <span>Drag & Drop or Click to Upload</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="form-group span-6">
+                                <label for="playerId">Subject ID (Player #)</label>
+                                <input type="number" id="playerId" value="1" min="1">
+                            </div>
+                            
+                            <div class="form-group span-6">
+                                <label for="sessionTags">Session Tags</label>
+                                <input type="text" id="sessionTags" placeholder="milan-derby-2026">
+                            </div>
+
+                            <div class="form-group span-4">
+                                <label for="playerHeight">Height (m)</label>
+                                <input type="number" id="playerHeight" value="1.75" step="0.01">
+                            </div>
+
+                            <div class="form-group span-4">
+                                <label for="massKg">Mass (kg)</label>
+                                <input type="number" id="massKg" value="75.0" step="0.1">
+                            </div>
+
+                            <div class="form-group span-4">
+                                <label for="yoloSize">Tracker Precision</label>
+                                <select id="yoloSize">
+                                    <option value="n">Nano (Fastest)</option>
+                                    <option value="s">Small</option>
+                                    <option value="m" selected>Medium (Recommended)</option>
+                                    <option value="l">Large</option>
+                                    <option value="x">X-Large (Most Precise)</option>
+                                </select>
+                            </div>
+
+                            <div class="form-group span-12 checkbox-group">
+                                <input type="checkbox" id="runSports2d">
+                                <label for="runSports2d">Run Deep Pipeline (Sports2D/Kinematics)</label>
+                            </div>
+                        </div>
+
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" onclick="hideUploadModal()">Cancel</button>
+                            <button type="submit" class="btn btn-primary" id="submitBtn">Start Analysis</button>
+                        </div>
+                    </form>
+
+                    <!-- Progress state -->
+                    <div id="uploadProgress" class="upload-progress" style="display: none;">
+                        <div class="spinner"></div>
+                        <h3>Processing Video...</h3>
+                        <p>This may take a few minutes depending on video length and pipeline options.</p>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar" id="progressBar"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dashboard Grid -->
+            <div class="dashboard-grid">
+                
+                <!-- Video Section -->
+                <section class="video-section card glass span-8">
+                    <div class="card-header">
+                        <h3>Annotated Feed</h3>
+                        <span class="badge live">LIVE</span>
+                    </div>
+                    <div class="video-wrapper">
+                        <video id="analysisVideo" controls controlsList="nodownload" crossorigin="anonymous" playsinline preload="auto" muted autoplay>
+                            <source src="" type="video/mp4">
+                            Your browser does not support the video tag.
+                        </video>
+                    </div>
+                </section>
+
+                <!-- KPI Summary Cards -->
+                <section class="kpi-section span-4 grid-column">
+                    <div class="kpi-card glass risk-low" id="riskCard">
+                        <div class="kpi-icon"></div>
+                        <div class="kpi-details">
+                            <h4>Peak Risk Score</h4>
+                            <h2 id="kpiRisk">--/100</h2>
+                            <p id="kpiRiskLabel">Overall Risk: --</p>
+                        </div>
+                    </div>
+                    
+                    <div class="kpi-card glass">
+                        <div class="kpi-icon speed"></div>
+                        <div class="kpi-details">
+                            <h4>Max Speed</h4>
+                            <h2 id="kpiSpeed">-- m/s</h2>
+                            <p id="kpiSpeedLabel">Avg: -- m/s</p>
+                        </div>
+                    </div>
+                    
+                    <div class="kpi-card glass">
+                        <div class="kpi-icon energy"></div>
+                        <div class="kpi-details">
+                            <h4>Est. Energy Burn</h4>
+                            <h2 id="kpiEnergy">-- kcal/hr</h2>
+                            <p id="kpiDistance">Dist: -- m</p>
+                        </div>
+                    </div>
+
+                    <div class="kpi-card glass" id="fatigueCard">
+                        <div class="kpi-icon fatigue"></div>
+                        <div class="kpi-details">
+                            <h4>Fatigue Level</h4>
+                            <h2 id="kpiFatigue">Low</h2>
+                            <p id="kpiFatigueLabel">Ready for match</p>
+                        </div>
+                    </div>
+
+                    <div class="kpi-card glass">
+                        <div class="kpi-icon gait"></div>
+                        <div class="kpi-details">
+                            <h4>Gait Symmetry</h4>
+                            <h2 id="kpiSymmetry">-- %</h2>
+                            <p id="kpiStride">Stride: -- m</p>
+                        </div>
+                    </div>
+
+                    <div class="kpi-card glass" id="injuryCard">
+                        <div class="kpi-icon risk"></div>
+                        <div class="kpi-details">
+                            <h4>Injury Warning</h4>
+                            <h2 id="kpiInjury">Low</h2>
+                            <p id="kpiInjuryDetail">No anomalies</p>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Detailed Gait Biometrics as Individual Cards -->
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Step Width</h4></div>
+                    <div class="gait-value" id="valStepWidth">-- m</div>
+                </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Trunk Lean</h4></div>
+                    <div class="gait-value" id="valTrunkLean">--°</div>
+                </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Double Support</h4></div>
+                    <div class="gait-value" id="valDoubleSupport">--%</div>
+                </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Pelvic Rotation</h4></div>
+                    <div class="gait-value" id="valPelvicRot">--°</div>
+                </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Trunk Sagittal</h4></div>
+                    <div class="gait-value" id="valTrunkSag">--°</div>
+                </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Arm Swing</h4></div>
+                    <div class="gait-value" id="valArmSwing">--°</div>
+                </section>
+
+                <!-- Charts Section -->
+                <section class="chart-section span-6 card glass">
+                    <div class="card-header">
+                        <h3>Speed & Acceleration</h3>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="speedChart"></canvas>
+                    </div>
+                </section>
+
+                <section class="chart-section span-6 card glass">
+                    <div class="card-header">
+                        <h3>Clinical Valgus (Knee Collapse)</h3>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="valgusChart"></canvas>
+                    </div>
+                </section>
+
+                <section class="chart-section span-12 card glass">
+                    <div class="card-header">
+                        <h3>Knee Flexion (Range of Motion)</h3>
+                    </div>
+                    <div class="chart-container large">
+                        <canvas id="jointChart"></canvas>
+                    </div>
+                </section>
+
+                <section class="chart-section span-8 card glass">
+                    <div class="card-header">
+                        <h3>Trunk Lean & Posture</h3>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="trunkChart"></canvas>
+                    </div>
+                </section>
+                
+                <section class="chart-section span-4 card glass">
+                    <div class="card-header">
+                        <h3>Overall Risk Trends</h3>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="riskChart"></canvas>
+                    </div>
+                </section>
+
+                <section class="chart-section span-12 card glass">
+                    <div class="card-header">
+                        <h3>Session Resources & Data Exports</h3>
+                    </div>
+                    <div class="resource-list-bottom" id="resourceList">
+                        <div class="resource-group-row">
+                            <h4>Raw Data Files</h4>
+                            <div id="dataFilesList" class="file-links-row"></div>
+                        </div>
+                        <div class="resource-group-row">
+                            <h4>Analytical Plots</h4>
+                            <div id="plotFilesList" class="file-links-row"></div>
+                        </div>
+                    </div>
+                </section>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- Scripts -->
+    <script src="dashboard.js"></script>
+</body>
+</html>
