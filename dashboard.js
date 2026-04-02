@@ -1,5 +1,5 @@
 /**
- * Juventus Sports Analytics Dashboard Logic
+ * MitusAI Sports Analytics Dashboard Logic
  */
 
 // Global Chart Options
@@ -8,9 +8,9 @@ Chart.defaults.font.family = "'Inter', sans-serif";
 Chart.defaults.scale.grid.color = 'rgba(0, 0, 0, 0.05)';
 Chart.defaults.scale.grid.borderColor = 'transparent';
 
-const JUVE_GOLD = '#B38E46'; // Muted gold for Light mode default
-const JUVE_BLACK = '#000000';
-const JUVE_WHITE = '#FFFFFF';
+const MITUS_RED = '#ff3131'; 
+const MITUS_BLACK = '#000000';
+const MITUS_WHITE = '#FFFFFF';
 
 // Chart instances
 let speedChartObj = null;
@@ -39,8 +39,8 @@ function setupTheme() {
         Chart.defaults.color = isDark ? '#a0a0a0' : '#333';
         Chart.defaults.scale.grid.color = isDark ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.05)';
         
-        // Dynamic Gold Color
-        const goldValue = isDark ? '#C6A15B' : '#B38E46';
+        // Dynamic Accent Color
+        const accentColor = isDark ? '#ff3131' : '#ff3131'; // Keep consistent red for now
         
         // Re-render charts
         if (speedChartObj) speedChartObj.destroy();
@@ -63,7 +63,7 @@ function setupExport() {
             const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
-            a.download = 'Juventus_Analytics_Report.txt';
+            a.download = 'MitusAI_Analytics_Report.txt';
             document.body.appendChild(a);
             a.click();
             window.URL.revokeObjectURL(url);
@@ -210,8 +210,8 @@ function renderCharts(frames) {
                 {
                     label: 'Speed (m/s)',
                     data: sampledFrames.map(f => f.speed),
-                    borderColor: JUVE_GOLD,
-                    backgroundColor: 'rgba(198, 161, 91, 0.1)',
+                    borderColor: MITUS_RED,
+                    backgroundColor: 'rgba(255, 49, 49, 0.1)',
                     borderWidth: 3,
                     tension: 0.4,
                     fill: true,
@@ -264,8 +264,8 @@ function renderCharts(frames) {
                 {
                     label: 'Joint Stress',
                     data: sampledFrames.map(f => f.joint_stress * 100),
-                    borderColor: JUVE_GOLD,
-                    backgroundColor: 'rgba(198, 161, 91, 0.15)',
+                    borderColor: MITUS_RED,
+                    backgroundColor: 'rgba(255, 49, 49, 0.15)',
                     borderWidth: 2,
                     tension: 0.3,
                     fill: true,
@@ -309,7 +309,7 @@ function renderCharts(frames) {
                 {
                     label: 'Stride Length (m)',
                     data: [0, avgStride],
-                    backgroundColor: JUVE_GOLD,
+                    backgroundColor: MITUS_RED,
                     borderRadius: 8,
                     yAxisID: 'y1'
                 }
