@@ -1,8 +1,8 @@
 ---
 title: Mitus Sports Analytics
 emoji: ⚽
-colorFrom: black
-colorTo: white
+colorFrom: gray
+colorTo: indigo
 sdk: docker
 app_port: 7860
 ---
