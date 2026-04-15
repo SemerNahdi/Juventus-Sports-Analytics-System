@@ -1,3 +1,12 @@
+---
+title: Mitus Sports Analytics
+emoji: ⚽
+colorFrom: black
+colorTo: white
+sdk: docker
+app_port: 7860
+---
+
 # Sports Analytics System
 
 An advanced biomechanical analysis platform designed for professional football performance tracking, injury risk assessment, and musculoskeletal modeling. This system utilizes a hybrid pipeline combining custom YOLOv11-based tracking with Sports2D for clinical-grade joint kinematics and OpenSim compatibility.
@@ -114,7 +123,19 @@ python -c "import opensim; import sports2d; from ultralytics import YOLO; print(
 Run the full pipeline with interactive player picking:
 
 ```bash
+I'm running a backend analysis with this command:
 python run_analysis.py --video videos/20.mp4 --sports2d --s2d-pick
+
+Currently, the sports2D picker is a command-line tool. I want to integrate this functionality into the frontend website so users can:
+1. Upload or select a video
+2. Use an interactive player picker (from the sports2D picker) directly in the browser
+3. Select their desired player visually
+4. Submit the selection to trigger the backend analysis
+
+How should I:
+- Expose the sports2D picker functionality to the frontend?
+- Create an interactive UI component for player selection?
+- Handle the communication between frontend selection and backend processing?
 ```
 
 ### 2. Advanced OpenSim IK
