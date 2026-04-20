@@ -50,7 +50,12 @@ Sports Analytics System/
 📂 models/             # YOLO model weights (.pt files)
 📂 src/                # Core Package Source
   📂 analytics/        # Biomechanical engine
-    📄sports_analytics.py
+    📄core.py          # Shared foundations and biomechanics
+    📄sports2d_runner.py # Sports2D invocation and config
+    📄output_manager.py  # OpenSim export utilities
+    📄visualization.py   # Plot generation and chart export
+    📄analysis_engine.py # Pipeline orchestrator
+    📄sports_analytics.py # Backward-compatible legacy facade
   📂 api/              # FastAPI Backend and local servers
     📄main.py
     📄serve_dashboard.py
@@ -80,8 +85,8 @@ This guide covers the complete setup including Anaconda installation, environmen
 Create a dedicated environment to avoid dependency conflicts:
 
 ```bash
-conda create -n sports2d-full python=3.10 -y
-conda activate sports2d-full
+conda create -n sports2d python=3.10 -y
+conda activate sports2d
 ```
 
 ### 3. Dependency Installation
@@ -123,20 +128,24 @@ python -c "import opensim; import sports2d; from ultralytics import YOLO; print(
 Run the full pipeline with interactive player picking:
 
 ```bash
-I'm running a backend analysis with this command:
 python run_analysis.py --video videos/20.mp4 --sports2d --s2d-pick
-
-Currently, the sports2D picker is a command-line tool. I want to integrate this functionality into the frontend website so users can:
-1. Upload or select a video
-2. Use an interactive player picker (from the sports2D picker) directly in the browser
-3. Select their desired player visually
-4. Submit the selection to trigger the backend analysis
-
-How should I:
-- Expose the sports2D picker functionality to the frontend?
-- Create an interactive UI component for player selection?
-- Handle the communication between frontend selection and backend processing?
 ```
+
+---
+
+## Development & Roadmap
+
+### Frontend Integration: Interactive Player Selection
+
+Currently, the Sports2D picker is a command-line tool. We are working to integrate this functionality into the frontend website so users can:
+1. **Upload or select a video** directly in the browser.
+2. **Use an interactive player picker** (based on the Sports2D logic) to select subjects visually.
+3. **Submit the selection** to trigger the backend analysis pipeline.
+
+**Technical Implementation Goals:**
+- Expose the Sports2D picker functionality via a specialized API endpoint.
+- Create a React/JS interactive UI component for canvas-based player selection.
+- Handle asynchronous communication between frontend selection events and backend processing.
 
 ### 2. Advanced OpenSim IK
 

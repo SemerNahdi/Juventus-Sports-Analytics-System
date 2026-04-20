@@ -17,6 +17,10 @@ RECOMMENDED (maximum value):
 import argparse
 import os
 import sys
+import time
+import psutil
+import json
+import datetime
 from pathlib import Path
 
 from src.analytics.sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D
@@ -74,6 +78,11 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    total_start_time = time.time()
+    process = psutil.Process(os.getpid())
+    process.cpu_percent()  # Initialize CPU percent tracking
+    perf_breakdown = {}
+
     parser = create_parser()
     args = parser.parse_args()
 
@@ -83,20 +92,23 @@ def main():
 
     # ── Directory Setup ─────────────────────────────────────────────────────
     output_dir = Path("Output")
-    sports2d_dir = output_dir / "Sports2D"
-    results_dir = output_dir / "results"
+    sports2d_dir = output_dir / "Sports2D"  # keep native Sports2D folder unchanged
+    media_dir = output_dir / "media"
+    analytics_data_dir = output_dir / "analytics" / "data"
+    analytics_plots_dir = output_dir / "analytics" / "plots"
+    opensim_dir = output_dir / "opensim"
 
-    output_dir.mkdir(exist_ok=True)
-    results_dir.mkdir(exist_ok=True)
-    sports2d_dir.mkdir(exist_ok=True)
+    for d in (output_dir, sports2d_dir, media_dir, analytics_data_dir, analytics_plots_dir, opensim_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
     # Output paths
-    video_out = output_dir / args.output
-    json_out = output_dir / "data_output.json"
-    csv_out = output_dir / "bio_metrics.csv"
-    trc_out = output_dir / "player_markers.trc"
-    mot_out = output_dir / "joint_angles.mot"
-    report_out = output_dir / "report.txt"
+    video_out = media_dir / args.output
+    json_out = analytics_data_dir / "data_output.json"
+    csv_out = analytics_data_dir / "bio_metrics.csv"
+    report_out = analytics_data_dir / "report.txt"
+    perf_out = analytics_data_dir / "performance_metrics.json"
+    trc_out = opensim_dir / "player_markers.trc"
+    mot_out = opensim_dir / "joint_angles.mot"
 
     print("\n" + "=" * 70)
     print("   JUVENTUS SPORTS ANALYTICS v5")
@@ -107,8 +119,9 @@ def main():
         print("Picker: Sports2D on_click (recommended)")
     print("-" * 70)
 
-    # ── Step 1: Custom Tracking + Biomechanics ───────────────────────────────
-    print("\n[STEP 1/5] Initialising Custom Tracker + Biomechanics Engine")
+    # ── Step 1: Initialise Engine ────────────────────────────────────────────
+    print("\n[STEP 1/5] Initialising Analytics Engine")
+    step1_start = time.time()
     analyzer = SportsAnalyzer(
         video_path=args.video,
         output_video_path=str(video_out),
@@ -117,16 +130,18 @@ def main():
         pick=args.pick,
         yolo_size=args.yolo_size,
         player_height_m=args.height,
+        player_mass_kg=args.mass,
     )
-
-    analyzer.process_video(stride=args.stride, target_height=args.target_height)
+    perf_breakdown["Step 1: Initialise Engine"] = time.time() - step1_start
 
     # ── Step 2: Sports2D Pipeline (if requested) ─────────────────────────────
+    # If using Sports2D, we run it FIRST because its picker can seed our
+    # custom tracker, ensuring both pipelines follow the same player.
+    step2_start = time.time()
     if args.sports2d:
         print("\n[STEP 2/5] Running Sports2D Pipeline")
         if not HAS_SPORTS2D:
             print("   ⚠  Sports2D not installed — skipping.")
-            print("      pip install sports2d pose2sim")
         else:
             person_ordering = "on_click" if args.s2d_pick else "greatest_displacement"
             analyzer.run_sports2d(
@@ -139,47 +154,104 @@ def main():
                 visible_side=args.s2d_side,
                 participant_mass_kg=args.mass,
             )
+    perf_breakdown["Step 2: Sports2D Pipeline"] = time.time() - step2_start
 
-    # ── Step 3: Unified Export ───────────────────────────────────────────────
-    print("\n[STEP 3/5] Exporting Unified Data (JSON + CSV + OpenSim)")
+    # ── Step 3: Custom Tracking + Biomechanics ───────────────────────────────
+    # Now run the custom tracker (potentially seeded by Sports2D above)
+    print("\n[STEP 3/5] Running Custom Tracker + Biomechanics Engine")
+    step3_start = time.time()
+    analyzer.process_video(stride=args.stride, target_height=args.target_height)
+    perf_breakdown["Step 3: Custom Tracking"] = time.time() - step3_start
+
+    # ── Step 4: Unified Export ───────────────────────────────────────────────
+    print("\n[STEP 4/5] Exporting Unified Data (JSON + CSV + OpenSim)")
+    step4_start = time.time()
+    has_native_s2d_trc = False
+    has_native_s2d_mot = False
+    if args.sports2d and getattr(analyzer, "sports2d_runner", None) and analyzer.sports2d_runner.outputs:
+        outputs = analyzer.sports2d_runner.outputs
+        has_native_s2d_trc = bool(outputs.get("trc_pose_m") or outputs.get("trc_pose_px"))
+        has_native_s2d_mot = bool(outputs.get("mot_angles"))
+
+    # Avoid duplicate OpenSim exports when native Sports2D TRC/MOT already exist.
+    trc_export_path = None if has_native_s2d_trc else str(trc_out)
+    mot_export_path = None if has_native_s2d_mot else str(mot_out)
+
     analyzer.export_unified(
         json_path=str(json_out),
         csv_path=str(csv_out),
-        trc_path=str(trc_out),
-        mot_path=str(mot_out),
+        trc_path=trc_export_path,
+        mot_path=mot_export_path,
     )
+    perf_breakdown["Step 3: Unified Export"] = time.time() - step3_start
 
-    # ── Step 4: Generate Plots ───────────────────────────────────────────────
-    print("\n[STEP 4/5] Generating Analytical Plots → Output/results/")
-    plotter = AnalyticsPlotter(results_dir=str(results_dir), player_id=args.player)
+    # ── Step 5: Generate Plots & Report ──────────────────────────────────────
+    print("\n[STEP 5/5] Generating Analytical Plots & Report")
+    step5_start = time.time()
+    plotter = AnalyticsPlotter(results_dir=str(analytics_plots_dir), player_id=args.player)
     plotter.generate_all(
         frame_metrics=analyzer.frame_metrics,
         bio_engine=analyzer.bio_engine,
     )
 
-    # ── Step 5: Generate Report ──────────────────────────────────────────────
-    print("\n[STEP 5/5] Generating Final Report")
     report_str = analyzer.get_report_string()
     with open(report_out, "w", encoding="utf-8") as f:
         f.write(report_str)
+    perf_breakdown["Step 5: Generate Plots & Report"] = time.time() - step5_start
 
     # ── Final Summary ────────────────────────────────────────────────────────
+    total_time = time.time() - total_start_time
+    final_memory_mb = process.memory_info().rss / (1024 * 1024)
+    cpu_percent = process.cpu_percent()
+
     print("\n" + "=" * 70)
     print("   ANALYSIS COMPLETE")
     print("=" * 70)
 
-    print(f"\n📁 Main Outputs:")
-    print(f"   • Annotated Video     : {video_out.name}")
-    print(f"   • Unified JSON        : {json_out.name}")
-    print(f"   • Unified CSV         : {csv_out.name}")
-    print(f"   • OpenSim TRC         : {trc_out.name}")
-    print(f"   • OpenSim MOT         : {mot_out.name}")
-    print(f"   • Report              : {report_out.name}")
+    print("\n⏱️  Performance & Resource Breakdown:")
+    print("-" * 60)
+    for step, duration in perf_breakdown.items():
+        print(f"   • {step:<35}: {duration:.2f} seconds")
+    print("-" * 60)
+    print(f"   • {'Total Execution Time':<35}: {total_time:.2f} seconds")
+    print(f"   • {'Peak Memory Usage (approx)':<35}: {final_memory_mb:.2f} MB")
+    print(f"   • {'Avg CPU Utilization (process)':<35}: {cpu_percent:.1f}%")
 
-    print(f"\n📊 Plots saved to: Output/results/")
+    print(f"\n📁 Main Outputs:")
+    print(f"   • Annotated Video     : {video_out}")
+    print(f"   • Unified JSON        : {json_out}")
+    print(f"   • Unified CSV         : {csv_out}")
+    if trc_export_path:
+        print(f"   • OpenSim TRC         : {trc_out}")
+    else:
+        print("   • OpenSim TRC         : reused native Sports2D TRC (not duplicated)")
+    if mot_export_path:
+        print(f"   • OpenSim MOT         : {mot_out}")
+    else:
+        print("   • OpenSim MOT         : reused native Sports2D MOT (not duplicated)")
+    print(f"   • Report              : {report_out}")
+
+    print(f"\n📊 Plots saved to: {analytics_plots_dir}")
+
+    # ── Performance Logging ──────────────────────────────────────────────────
+    perf_data = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "video_source": str(Path(args.video).resolve()),
+        "execution_time_seconds": round(total_time, 2),
+        "peak_memory_mb": round(final_memory_mb, 2),
+        "avg_cpu_percent": round(cpu_percent, 1),
+        "perf_breakdown": {k: round(v, 3) for k, v in perf_breakdown.items()},
+        "system_info": {
+            "os": sys.platform,
+            "python_version": sys.version.split()[0]
+        }
+    }
+    with open(perf_out, "w", encoding="utf-8") as f:
+        json.dump(perf_data, f, indent=2)
+    print(f"   • Performance Metrics : {perf_out}")
 
     if args.sports2d and getattr(analyzer, 'sports2d_runner', None) and analyzer.sports2d_runner.outputs:
-        print(f"\n🏟️  Sports2D Outputs (Output/Sports2D/):")
+        print(f"\n🏟️  Sports2D Outputs ({sports2d_dir}):")
         s2d = analyzer.sports2d_runner.outputs
         for key, files in s2d.items():
             if files:
@@ -189,7 +261,7 @@ def main():
                 else:
                     print(f"   • {Path(str(files)).name}")
 
-    print(f"\n✅ Done. All files saved in './Output/' folder.")
+    print(f"\n✅ Done. All files saved under: {output_dir.resolve()}")
     print("=" * 70)
 
 
