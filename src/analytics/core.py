@@ -425,45 +425,15 @@ class KalmanTrack:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DetectionLayer:
-    def __init__(self, model_size="m"):
-        self._yolo = None
+    def __init__(self, model_size="m", shared_yolo=None):
+        self._yolo = shared_yolo
         self._bg = cv2.createBackgroundSubtractorMOG2(
             history=400, varThreshold=40, detectShadows=False
         )
-        self._mode = "blob"
-        if HAS_YOLO:
+        self._mode = "yolo" if self._yolo is not None else "blob"
+        if self._yolo is None and HAS_YOLO:
             try:
-                # Prefer YOLOv8 pose checkpoints (faster / widely available),
-                # but keep yolo11 pose as a fallback for existing installs.
-                # Supports absolute paths via env var for deploys.
-                env_model = os.getenv("YOLO_MODEL_PATH") or os.getenv("YOLO_POSE_MODEL")
-                model_candidates = []
-                if env_model:
-                    model_candidates.append(env_model)
-                model_candidates.extend([
-                    f"yolov8{model_size}-pose.pt",
-                    f"yolo11{model_size}-pose.pt",
-                ])
-
-                potential_paths = []
-                for mn in model_candidates:
-                    potential_paths.extend([
-                        mn,
-                        os.path.join("models", mn),
-                        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models", mn),  # ../../../models/
-                        os.path.join(os.path.dirname(__file__), "..", "..", "models", mn),  # ../../models/
-                    ])
-
-                model_path = None
-                for p in potential_paths:
-                    if os.path.exists(p):
-                        model_path = p
-                        break
-                if model_path is None:
-                    # Let ultralytics resolve/download if none found locally.
-                    model_path = model_candidates[0]
-
-                self._yolo = _YOLO(model_path)
+                self._yolo = _YOLO(_resolve_yolo_model_path(model_size))
                 self._mode = "yolo"
             except Exception:
                 pass
@@ -814,14 +784,58 @@ class TargetLock:
 #  MODULE-LEVEL DETECTION SINGLETON
 # ══════════════════════════════════════════════════════════════════════════════
 
-_detection_layers: dict[str, DetectionLayer] = {}
+_yolo_models: dict[str, object] = {}
+_yolo_models_lock = threading.RLock()
+
+
+def _resolve_yolo_model_path(model_size: str) -> str:
+    # Prefer YOLOv8 pose checkpoints (faster / widely available),
+    # but keep yolo11 pose as a fallback for existing installs.
+    # Supports absolute paths via env var for deploys.
+    env_model = os.getenv("YOLO_MODEL_PATH") or os.getenv("YOLO_POSE_MODEL")
+    model_candidates = []
+    if env_model:
+        model_candidates.append(env_model)
+    model_candidates.extend([
+        f"yolov8{model_size}-pose.pt",
+        f"yolo11{model_size}-pose.pt",
+    ])
+
+    potential_paths = []
+    for mn in model_candidates:
+        potential_paths.extend([
+            mn,
+            os.path.join("models", mn),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models", mn),  # ../../../models/
+            os.path.join(os.path.dirname(__file__), "..", "..", "models", mn),  # ../../models/
+        ])
+
+    for p in potential_paths:
+        if os.path.exists(p):
+            return p
+    # Let ultralytics resolve/download if none found locally.
+    return model_candidates[0]
+
+
+def _get_or_load_yolo_model(model_size="m"):
+    if not HAS_YOLO:
+        return None
+    with _yolo_models_lock:
+        model = _yolo_models.get(model_size)
+        if model is None:
+            model = _YOLO(_resolve_yolo_model_path(model_size))
+            _yolo_models[model_size] = model
+        return model
 
 
 def get_detection_layer(model_size="m") -> DetectionLayer:
-    global _detection_layers
-    if model_size not in _detection_layers:
-        _detection_layers[model_size] = DetectionLayer(model_size)
-    return _detection_layers[model_size]
+    """
+    Return an isolated detection layer instance per caller.
+    Mutable detection state (e.g., background model) is no longer shared
+    across jobs, while YOLO weights are reused safely.
+    """
+    shared_yolo = _get_or_load_yolo_model(model_size)
+    return DetectionLayer(model_size=model_size, shared_yolo=shared_yolo)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -77,6 +77,22 @@ app.add_middleware(
 # --- GLOBAL STATE FOR JOB TRACKING ---
 # Stores {job_id: threading.Event()} to signal cancellation
 active_jobs: Dict[str, threading.Event] = {}
+active_jobs_lock = threading.RLock()
+
+
+def register_active_job(job_id: str, cancel_event: threading.Event) -> None:
+    with active_jobs_lock:
+        active_jobs[job_id] = cancel_event
+
+
+def get_active_job_event(job_id: str) -> Optional[threading.Event]:
+    with active_jobs_lock:
+        return active_jobs.get(job_id)
+
+
+def unregister_active_job(job_id: str) -> None:
+    with active_jobs_lock:
+        active_jobs.pop(job_id, None)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -262,7 +278,9 @@ def run_full_analysis_job(
     original_filename: str,
     email: Optional[str] = None,
     stride: int = DEFAULT_STRIDE,
-    target_height: int = DEFAULT_TARGET_HEIGHT
+    target_height: int = DEFAULT_TARGET_HEIGHT,
+    seed_bbox: Optional[List[int]] = None,
+    seed_frame_idx: int = 0
 ):
     """
     The heavy-lifting background task that runs the AI analysis and uploads results.
@@ -277,7 +295,7 @@ def run_full_analysis_job(
     
     # Initialize cancellation event for this job
     cancel_event = threading.Event()
-    active_jobs[job_id] = cancel_event
+    register_active_job(job_id, cancel_event)
 
     def log_step(msg):
         # Check for cancellation before every major step
@@ -329,15 +347,12 @@ def run_full_analysis_job(
                 player_id=player_id,
                 yolo_size=yolo_size,
                 player_height_m=player_height,
-                pick=False 
+                pick=False,
+                seed_bbox=tuple(seed_bbox) if seed_bbox and len(seed_bbox) == 4 else None,
+                seed_frame_idx=seed_frame_idx
             )
-            
-            log_step("Commencing Pose Estimation & Tracking...")
-            summary = analyzer.process_video(stride=stride, target_height=target_height, cancel_event=cancel_event)
-            log_step(f"Tracking concluded. {len(analyzer.frame_metrics)} frames analyzed.")
-            gc.collect()
 
-            # 4. Run optional Sports2D pipeline
+            # 4. Run optional Sports2D pipeline FIRST (seeds tracker + enables TRC fast-path)
             if run_sports2d:
                 log_step("Invoking deep clinical pipeline (Sports2D)...")
                 s2d_dir = os.path.join(temp_dir, "Sports2D")
@@ -348,6 +363,11 @@ def run_full_analysis_job(
                 )
                 log_step("Clinical data extracted.")
                 gc.collect()
+
+            log_step("Commencing Pose Estimation & Tracking...")
+            summary = analyzer.process_video(stride=stride, target_height=target_height, cancel_event=cancel_event)
+            log_step(f"Tracking concluded. {len(analyzer.frame_metrics)} frames analyzed.")
+            gc.collect()
 
             # 5. Export unified data (JSON, CSV, TRC, MOT)
             log_step("Synchronizing biomechanical datasets...")
@@ -454,8 +474,7 @@ def run_full_analysis_job(
                 except: pass
 
             # Always clean up the job tracker
-            if job_id in active_jobs:
-                del active_jobs[job_id]
+            unregister_active_job(job_id)
 
 @app.post("/analyze")
 async def analyze_video(
@@ -469,7 +488,9 @@ async def analyze_video(
     run_sports2d: bool = False,
     email: Optional[str] = None,
     stride: int = DEFAULT_STRIDE,
-    target_height: int = DEFAULT_TARGET_HEIGHT
+    target_height: int = DEFAULT_TARGET_HEIGHT,
+    seed_bbox: Optional[str] = None,
+    seed_frame_idx: int = 0
 ):
     """
     Asynchronous analysis endpoint:
@@ -479,6 +500,21 @@ async def analyze_video(
     """
     if not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video.")
+
+    parsed_seed_bbox: Optional[List[int]] = None
+    if seed_bbox:
+        try:
+            # Accept JSON array string "[x,y,w,h]" or CSV form "x,y,w,h".
+            raw = seed_bbox.strip()
+            if raw.startswith("["):
+                vals = json.loads(raw)
+            else:
+                vals = [v.strip() for v in raw.split(",")]
+            parsed_seed_bbox = [int(float(v)) for v in vals]
+            if len(parsed_seed_bbox) != 4:
+                raise ValueError("seed_bbox must have exactly 4 values: x,y,w,h")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid seed_bbox format: {e}")
 
     job_id = str(uuid.uuid4())
     print(f"\n[JOB {job_id[:8]}] Attempting to initialize job record...")
@@ -536,7 +572,9 @@ async def analyze_video(
         file.filename,
         email,
         stride,
-        target_height
+        target_height,
+        parsed_seed_bbox,
+        seed_frame_idx
     )
 
     return JSONResponse(
@@ -553,9 +591,10 @@ async def cancel_analysis(job_id: str):
     """
     Cancel a running or queued job.
     """
-    if job_id in active_jobs:
+    job_event = get_active_job_event(job_id)
+    if job_event is not None:
         print(f"[API] Signaling cancellation for job {job_id[:8]}...")
-        active_jobs[job_id].set()
+        job_event.set()
         
         # Immediate DB update to reflect intent
         try:

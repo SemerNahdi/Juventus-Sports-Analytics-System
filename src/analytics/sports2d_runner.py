@@ -1,6 +1,27 @@
 """Sports2D execution and native output discovery."""
 
 from .core import *  # noqa: F401,F403
+import multiprocessing as mp
+
+
+def _sports2d_worker(config: dict, result_queue):
+    """Run Sports2D in a child process and report success/failure."""
+    try:
+        from .core import SPORTS2D_PROCESS  # local import for spawn safety on Windows
+        if SPORTS2D_PROCESS is None:
+            raise RuntimeError(
+                "Sports2D Python API not available (could not resolve process()). "
+                "Install/repair with: pip install sports2d pose2sim"
+            )
+        SPORTS2D_PROCESS(config)
+        result_queue.put({"ok": True})
+    except Exception as e:
+        import traceback
+        result_queue.put({
+            "ok": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })
 
 class Sports2DRunner:
     JOINT_ANGLES = [
@@ -156,17 +177,47 @@ class Sports2DRunner:
             },
         }
 
+        # Run Sports2D out-of-process so heavy execution does not block the
+        # current Python execution thread and remains killable via timeout.
+        timeout_s = int(os.getenv("SPORTS2D_TIMEOUT_SEC", "1200"))
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        p = ctx.Process(target=_sports2d_worker, args=(config, q), daemon=True)
+        p.start()
+        p.join(timeout=timeout_s)
+
+        if p.is_alive():
+            p.terminate()
+            p.join(10)
+            print(f"[S2D] Sports2D timed out after {timeout_s}s and was terminated.")
+            return {}
+
+        worker_result = None
         try:
-            if SPORTS2D_PROCESS is None:
-                raise RuntimeError(
-                    "Sports2D Python API not available (could not resolve process()). "
-                    "Install/repair with: pip install sports2d pose2sim"
-                )
-            SPORTS2D_PROCESS(config)
-        except Exception as e:
-            import traceback
-            print(f"[S2D] Sports2D.process() failed: {e}")
-            traceback.print_exc()
+            if not q.empty():
+                worker_result = q.get_nowait()
+        except Exception:
+            worker_result = None
+        finally:
+            try:
+                q.close()
+            except Exception:
+                pass
+
+        if p.exitcode not in (0, None):
+            print(f"[S2D] Sports2D subprocess exited with code {p.exitcode}.")
+            if worker_result and not worker_result.get("ok", False):
+                print(f"[S2D] Sports2D.process() failed: {worker_result.get('error')}")
+                tb = worker_result.get("traceback")
+                if tb:
+                    print(tb)
+            return {}
+
+        if worker_result and not worker_result.get("ok", False):
+            print(f"[S2D] Sports2D.process() failed: {worker_result.get('error')}")
+            tb = worker_result.get("traceback")
+            if tb:
+                print(tb)
             return {}
 
         self.outputs = self._collect_outputs()
@@ -278,11 +329,6 @@ class Sports2DRunner:
                 except Exception:
                     return float("nan")
 
-            preferred = [
-                "Hip_Center", "Hip_Centre", "Hip",
-                "L_Hip", "R_Hip", "LHip", "RHip",
-                "Left_Hip", "Right_Hip", "MidHip",
-            ]
             xs: List[float] = []
             ys: List[float] = []
 
@@ -298,28 +344,30 @@ class Sports2DRunner:
                     xs.append(x)
                     ys.append(y)
 
-            # Prefer hip-based markers (most stable for bbox seeding).
-            for b in preferred:
+            # Use ALL available markers to find true min/max bounds
+            for b in bases.keys():
                 _add_marker(b)
-
-            # Fallback: use all markers with valid X/Y.
-            if not xs or not ys:
-                for b in bases.keys():
-                    _add_marker(b)
 
             if not xs or not ys:
                 return None
 
-            cx = float(np.mean(xs))
-            cy = float(np.mean(ys))
-            # Estimate a reasonable bounding box (~person is ~0.4w × 0.7h of frame)
-            spread_x = float(np.ptp(xs)) if len(xs) > 1 else 80.
-            spread_y = float(np.ptp(ys)) if len(ys) > 1 else 180.
-            w = max(60., spread_x * 1.5)
-            h = max(120., spread_y * 1.3)
-            bx = int(cx - w / 2)
-            by = int(cy - h / 2)
-            seed_bbox = (bx, by, int(w), int(h))
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            
+            # Base width and height
+            w = max(40., max_x - min_x)
+            h = max(100., max_y - min_y)
+            
+            # Add moderate percentage padding
+            pad_x = w * 0.15
+            pad_y = h * 0.10
+            
+            bx = int(min_x - pad_x)
+            by = int(min_y - pad_y)
+            bw = int(w + 2 * pad_x)
+            bh = int(h + 2 * pad_y)
+
+            seed_bbox = (bx, by, bw, bh)
 
             # Try to sample a histogram from the source video at frame 0
             hist = None
