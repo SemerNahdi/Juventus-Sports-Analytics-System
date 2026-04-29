@@ -89,6 +89,8 @@ output_annotated.mp4
 # metrics.json
 # metrics.csv
 
+docs/
+
 # Logs
 logs/
 *.log

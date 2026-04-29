@@ -80,7 +80,26 @@ def create_parser() -> argparse.ArgumentParser:
 def main():
     total_start_time = time.time()
     process = psutil.Process(os.getpid())
-    process.cpu_percent()  # Initialize CPU percent tracking
+    # psutil's cpu_percent() is interval-based; to get a meaningful run-average,
+    # we sample in the background for the duration of the job.
+    import threading
+    cpu_samples: list[float] = []
+    stop_cpu_sampler = threading.Event()
+
+    def _cpu_sampler():
+        # Prime measurement
+        try:
+            process.cpu_percent(interval=None)
+        except Exception:
+            return
+        while not stop_cpu_sampler.is_set():
+            try:
+                cpu_samples.append(process.cpu_percent(interval=0.25))
+            except Exception:
+                break
+
+    cpu_thread = threading.Thread(target=_cpu_sampler, daemon=True)
+    cpu_thread.start()
     perf_breakdown = {}
 
     parser = create_parser()
@@ -183,7 +202,7 @@ def main():
         trc_path=trc_export_path,
         mot_path=mot_export_path,
     )
-    perf_breakdown["Step 3: Unified Export"] = time.time() - step3_start
+    perf_breakdown["Step 4: Unified Export"] = time.time() - step4_start
 
     # ── Step 5: Generate Plots & Report ──────────────────────────────────────
     print("\n[STEP 5/5] Generating Analytical Plots & Report")
@@ -200,9 +219,15 @@ def main():
     perf_breakdown["Step 5: Generate Plots & Report"] = time.time() - step5_start
 
     # ── Final Summary ────────────────────────────────────────────────────────
+    stop_cpu_sampler.set()
+    try:
+        cpu_thread.join(timeout=1.0)
+    except Exception:
+        pass
+
     total_time = time.time() - total_start_time
     final_memory_mb = process.memory_info().rss / (1024 * 1024)
-    cpu_percent = process.cpu_percent()
+    cpu_percent = round((sum(cpu_samples) / len(cpu_samples)), 1) if cpu_samples else 0.0
 
     print("\n" + "=" * 70)
     print("   ANALYSIS COMPLETE")
@@ -239,7 +264,19 @@ def main():
         "video_source": str(Path(args.video).resolve()),
         "execution_time_seconds": round(total_time, 2),
         "peak_memory_mb": round(final_memory_mb, 2),
-        "avg_cpu_percent": round(cpu_percent, 1),
+        "avg_cpu_percent": cpu_percent,
+        "run_config": {
+            "sports2d": bool(args.sports2d),
+            "s2d_pick": bool(args.s2d_pick),
+            "s2d_mode": args.s2d_mode,
+            "s2d_ik": bool(args.s2d_ik),
+            "s2d_augment": bool(args.s2d_augment),
+            "s2d_side": args.s2d_side,
+            "stride": args.stride,
+            "target_height": args.target_height,
+            "yolo_size": args.yolo_size,
+            "player_id": args.player,
+        },
         "perf_breakdown": {k: round(v, 3) for k, v in perf_breakdown.items()},
         "system_info": {
             "os": sys.platform,

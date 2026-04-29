@@ -120,6 +120,10 @@ class SportsAnalyzer:
     # ── Video processing ──────────────────────────────────────────────────────
 
     def process_video(self, stride: int = 2, target_height: int = 640, cancel_event: Optional[threading.Event] = None) -> PlayerSummary:
+        # Rendering toggles for latency-focused runs.
+        # Defaults keep current behavior; set env vars to disable expensive overlays.
+        draw_badge = os.getenv("ANALYSIS_DRAW_BADGE", "1").strip() not in ("0", "false", "False", "no", "NO")
+        draw_aura  = os.getenv("ANALYSIS_DRAW_AURA", "1").strip() not in ("0", "false", "False", "no", "NO")
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             raise FileNotFoundError(self.video_path)
@@ -300,8 +304,9 @@ class SportsAnalyzer:
                     self._accel_burst -= 1
 
                 # Annotate frame: skeleton + labels only (no side panel)
-                frame = self._annotate(frame, pf, fm)
-                frame = self._draw_player_aura(frame, kp, fm)
+                frame = self._annotate(frame, pf, fm, draw_badge=draw_badge)
+                if draw_aura:
+                    frame = self._draw_player_aura(frame, kp, fm)
 
             out.write(frame)
             idx += 1
@@ -343,7 +348,7 @@ class SportsAnalyzer:
 
     # ── Annotation (skeleton + labels on video frame, NO side panel) ──────────
 
-    def _annotate(self, frame, pf: PoseFrame, fm: FrameMetrics) -> np.ndarray:
+    def _annotate(self, frame, pf: PoseFrame, fm: FrameMetrics, draw_badge: bool = True) -> np.ndarray:
         kp = pf.kp
         rt = clamp01(fm.risk_score / 100.)
         render_skeleton(frame, kp, risk_tint=rt)
@@ -356,18 +361,19 @@ class SportsAnalyzer:
             cv2.putText(frame, f"{ang:.0f}°", (kx + 12, ky - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, ac, 1, cv2.LINE_AA)
 
-        # Player badge above head
-        hx       = int(kp.head[0])  # use head X, not hip, for correct lateral position
-        head_y   = int(kp.head[1]) - 35
-        badge    = f"  #{self.player_id}  "
-        (tw, _), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-        bx0      = hx - tw // 2
-        overlay  = frame.copy()
-        cv2.rectangle(overlay, (bx0, head_y - 22), (bx0 + tw, head_y + 6), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-        cv2.rectangle(frame, (bx0, head_y - 22), (bx0 + tw, head_y + 6), (255, 215, 0), 1)
-        cv2.putText(frame, badge, (bx0 + 2, head_y + 1),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+        if draw_badge:
+            # Player badge above head (uses a blended rectangle for readability)
+            hx       = int(kp.head[0])  # use head X, not hip, for correct lateral position
+            head_y   = int(kp.head[1]) - 35
+            badge    = f"  #{self.player_id}  "
+            (tw, _), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            bx0      = hx - tw // 2
+            overlay  = frame.copy()
+            cv2.rectangle(overlay, (bx0, head_y - 22), (bx0 + tw, head_y + 6), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+            cv2.rectangle(frame, (bx0, head_y - 22), (bx0 + tw, head_y + 6), (255, 215, 0), 1)
+            cv2.putText(frame, badge, (bx0 + 2, head_y + 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Speed & risk overlay near player bbox
         bx, by, bw, bh = pf.bbox
@@ -767,22 +773,19 @@ class SportsAnalyzer:
         Optionally writes OpenSim-compatible .trc and .mot files.
         """
         # ── Build unified per-frame records ───────────────────────────────────
+        #
+        # Streaming-first export to keep peak memory stable on long videos:
+        # - Avoid building a giant in-memory list of dicts
+        # - Avoid building a full pandas DataFrame just to write CSV
+        import csv as _csv
+        from pathlib import Path
+
+        export_jsonl = os.getenv("ANALYTICS_EXPORT_JSONL", "0").strip() in ("1", "true", "True", "yes", "YES")
+
         bio_by_frame: dict = {}
         if self.bio_engine and self.bio_engine.frames:
             for bf in self.bio_engine.frames:
                 bio_by_frame[bf.frame_idx] = asdict(bf)
-
-        unified_frames = []
-        for fm in self.frame_metrics:
-            record = asdict(fm)
-            bio = bio_by_frame.get(fm.frame_idx, {})
-            # Merge bio fields — prefix with "bio_" to avoid name collision
-            for k, v in bio.items():
-                if k not in ("frame_idx", "timestamp"):
-                    record[f"bio_{k}"] = v
-
-            # Append Sports2D keypoints if available (from TRC data)
-            unified_frames.append(record)
 
         # ── Sports2D angle summary ────────────────────────────────────────────
         s2d_angle_summary: dict = {}
@@ -823,7 +826,6 @@ class SportsAnalyzer:
             "sports2d_angle_summary": s2d_angle_summary,
             "sports2d_pose_summary":  s2d_pose_summary,
             "sports2d_output_files":  self.sports2d_runner.outputs if self.sports2d_runner else {},
-            "frames": unified_frames,
         }
 
         # Proactively clean nested objects to convert NaN/Inf into standard JSON null
@@ -839,29 +841,101 @@ class SportsAnalyzer:
 
         payload = clean_nans(payload)
 
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, default=str)
-        print(f"[EXPORT] data_output.json → {json_path}  ({len(unified_frames)} frames)")
-
-        # ── CSV — flat time-series ────────────────────────────────────────────
-        df = pd.DataFrame(unified_frames)
-
-        # Merge Sports2D MOT angles as additional columns if available
-        if not df.empty and self.sports2d_runner:
+        # ── Optional: index Sports2D MOT angles by rounded timestamp ──────────
+        mot_by_ts: dict[float, dict] = {}
+        if self.sports2d_runner:
             mot_df = self.sports2d_runner.load_mot_angles()
             if mot_df is not None and not mot_df.empty and "time" in mot_df.columns:
-                mot_df = mot_df.rename(columns={"time": "timestamp"})
-                mot_df.columns = ["s2d_" + c if c != "timestamp" else c for c in mot_df.columns]
-                if "timestamp" in df.columns:
-                    df['timestamp'] = df['timestamp'].round(3)
-                    mot_df['timestamp'] = pd.to_numeric(mot_df['timestamp'], errors='coerce').round(3)
-                    df = pd.merge(df, mot_df, on="timestamp", how="left")
+                try:
+                    mot_df = mot_df.rename(columns={"time": "timestamp"})
+                    mot_df["timestamp"] = pd.to_numeric(mot_df["timestamp"], errors="coerce").round(3)
+                    angle_cols = [c for c in mot_df.columns if c != "timestamp"]
+                    for _, r in mot_df.iterrows():
+                        ts = r.get("timestamp")
+                        if ts is None or (isinstance(ts, float) and np.isnan(ts)):
+                            continue
+                        row = {}
+                        for c in angle_cols:
+                            row[f"s2d_{c}"] = r.get(c)
+                        mot_by_ts[float(ts)] = row
+                except Exception:
+                    mot_by_ts = {}
 
-        if not df.empty:
-            df.to_csv(csv_path, index=False)
-            print(f"[EXPORT] bio_metrics.csv → {csv_path}  ({df.shape[0]} rows × {df.shape[1]} cols)")
-        else:
-            print(f"[EXPORT] bio_metrics.csv → SKIPPED (no frames analyzed)")
+        # ── Stream frames to JSON + CSV ───────────────────────────────────────
+        n_frames = 0
+        csv_f = None
+        jf = None
+        csv_writer = None
+
+        # If JSONL is enabled, write to `*.jsonl` (one frame per line) and keep
+        # `payload` as the metadata header line.
+        jsonl_path = str(Path(json_path).with_suffix(".jsonl"))
+        out_json_path = jsonl_path if export_jsonl else json_path
+
+        try:
+            jf = open(out_json_path, "w", encoding="utf-8")
+            csv_f = open(csv_path, "w", encoding="utf-8", newline="")
+
+            if export_jsonl:
+                jf.write(json.dumps(payload, default=str) + "\n")
+            else:
+                jf.write("{\n")
+                keys = list(payload.keys())
+                for k in keys:
+                    if k == "frames":
+                        continue
+                    jf.write(json.dumps(k) + ": " + json.dumps(payload[k], indent=2, default=str) + ",\n")
+                jf.write("\"frames\": [\n")
+
+            for fm in self.frame_metrics:
+                record = asdict(fm)
+                bio = bio_by_frame.get(fm.frame_idx, {})
+                for k, v in bio.items():
+                    if k not in ("frame_idx", "timestamp"):
+                        record[f"bio_{k}"] = v
+
+                ts_key = round(float(record.get("timestamp", 0.0)), 3)
+                extra = mot_by_ts.get(ts_key)
+                if extra:
+                    record.update(extra)
+
+                record = clean_nans(record)
+
+                if csv_writer is None:
+                    csv_writer = _csv.DictWriter(csv_f, fieldnames=list(record.keys()), extrasaction="ignore")
+                    csv_writer.writeheader()
+                csv_writer.writerow(record)
+
+                if export_jsonl:
+                    jf.write(json.dumps(record, default=str) + "\n")
+                else:
+                    if n_frames > 0:
+                        jf.write(",\n")
+                    jf.write(json.dumps(record, default=str))
+
+                n_frames += 1
+
+            if export_jsonl:
+                print(f"[EXPORT] data_output.jsonl → {out_json_path}  ({n_frames} frames)")
+            else:
+                jf.write("\n]\n}\n")
+                print(f"[EXPORT] data_output.json → {out_json_path}  ({n_frames} frames)")
+
+            if n_frames > 0:
+                print(f"[EXPORT] bio_metrics.csv → {csv_path}  ({n_frames} rows)")
+            else:
+                print(f"[EXPORT] bio_metrics.csv → SKIPPED (no frames analyzed)")
+        finally:
+            if jf is not None:
+                try:
+                    jf.close()
+                except Exception:
+                    pass
+            if csv_f is not None:
+                try:
+                    csv_f.close()
+                except Exception:
+                    pass
 
         # ── OpenSim TRC ───────────────────────────────────────────────────────
         if trc_path and self.pose_frames:

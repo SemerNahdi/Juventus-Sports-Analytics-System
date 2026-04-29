@@ -3,10 +3,6 @@ Sports Analytics System  v6
 ======================================
 Refactored for data integrity, clean video output, and OpenSim compatibility.
 
-Install:
-    pip install ultralytics opencv-python numpy pandas scipy matplotlib
-    pip install sports2d pose2sim          # for Sports2D pipeline
-    # For OpenSim IK: conda install -c opensim-org opensim
 """
 
 import cv2
@@ -549,6 +545,12 @@ class ByteTracker:
         self.lost_tracks:   List[KalmanTrack] = []
 
     def update(self, detections: List[dict], frame) -> List[KalmanTrack]:
+        # Precompute per-detection appearance histograms once per frame.
+        # This avoids repeated cv2.cvtColor/calcHist inside association loops.
+        for d in detections:
+            if d.get("_hist") is None:
+                d["_hist"] = crop_hist(frame, d["bbox"])
+
         for t in self.active_tracks + self.lost_tracks:
             t.predict()
         high = [d for d in detections if d['conf'] >= self.HIGH_THRESH]
@@ -584,7 +586,7 @@ class ByteTracker:
             th = t.ref_hist
             for di, d in enumerate(dets):
                 iou = bbox_iou(tb, d['bbox'])
-                hs  = hist_sim(th, crop_hist(frame, d['bbox']))
+                hs  = hist_sim(th, d.get("_hist"))
                 cost[ti, di] = 1.0 - (iou * 0.60 + hs * 0.40)
 
         # Use Hungarian matching when scipy is available
