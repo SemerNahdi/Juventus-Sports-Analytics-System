@@ -2,6 +2,7 @@
 
 from .core import *  # noqa: F401,F403
 import multiprocessing as mp
+import re
 
 
 def _sports2d_worker(config: dict, result_queue):
@@ -82,6 +83,8 @@ class Sports2DRunner:
         else:
             vs_tokens = list(vs)  # type: ignore[arg-type]
         visible_side_cfg = vs_tokens if vs_tokens else ["auto", "front"]
+        if len(visible_side_cfg) == 1 and visible_side_cfg[0] == "auto":
+            visible_side_cfg.append("front")
 
         config = {
             # ── base: I/O, display, and what to save ──────────────────────────
@@ -108,7 +111,7 @@ class Sports2DRunner:
             "pose": {
                 "pose_model":    "Body_with_feet",
                 "mode":          self.mode,
-                "det_frequency": 4,
+                "det_frequency": 6,
                 "slowmo_factor": 1,
                 "backend":       "auto",
                 "device":        "auto",
@@ -144,7 +147,7 @@ class Sports2DRunner:
                 "interpolate":             True,
                 "interp_gap_smaller_than": 100,
                 "fill_large_gaps_with":    "last_value",
-                "sections_to_keep":        "all",
+                "sections_to_keep":        [0],
                 "min_chunk_size":          10,
                 "reject_outliers":         True,
                 "filter":                  True,
@@ -239,34 +242,34 @@ class Sports2DRunner:
             "osim_setup":      [],
             "all":             [],
         }
-        for f in glob.glob(os.path.join(rd, "**", "*"), recursive=True):
-            if not os.path.isfile(f):
-                continue
-            out["all"].append(f)
-            fl   = f.lower()
-            name = os.path.basename(fl)
-            if fl.endswith(".mp4") or fl.endswith(".avi"):
-                if "_h264" not in name:
-                    out["annotated_video"].append(f)
-            elif fl.endswith(".png"):
-                out["angle_plots_png"].append(f)
-            elif fl.endswith(".trc"):
-                if "_px" in name or "pixel" in name:
-                    out["trc_pose_px"].append(f)
-                else:
-                    out["trc_pose_m"].append(f)
-            elif fl.endswith(".mot") and "ik" not in name:
-                out["mot_angles"].append(f)
-            elif fl.endswith(".toml"):
-                out["calib_toml"].append(f)
-            elif fl.endswith(".c3d"):
-                out["c3d"].append(f)
-            elif fl.endswith(".osim"):
-                out["osim_model"].append(f)
-            elif fl.endswith(".mot") and "ik" in name:
-                out["osim_mot"].append(f)
-            elif fl.endswith(".xml"):
-                out["osim_setup"].append(f)
+        for root, _, files in os.walk(rd):
+            for filename in files:
+                f = os.path.join(root, filename)
+                if not os.path.isfile(f):
+                    continue
+                out["all"].append(f)
+                fl   = f.lower()
+                name = os.path.basename(fl)
+                if fl.endswith((".mp4", ".avi")):
+                    if "_h264" not in name:
+                        out["annotated_video"].append(f)
+                elif fl.endswith(".png"):
+                    out["angle_plots_png"].append(f)
+                elif fl.endswith(".trc"):
+                    if "_px" in name or "pixel" in name:
+                        out["trc_pose_px"].append(f)
+                    else:
+                        out["trc_pose_m"].append(f)
+                elif fl.endswith(".mot"):
+                    out["osim_mot" if "ik" in name else "mot_angles"].append(f)
+                elif fl.endswith(".toml"):
+                    out["calib_toml"].append(f)
+                elif fl.endswith(".c3d"):
+                    out["c3d"].append(f)
+                elif fl.endswith(".osim"):
+                    out["osim_model"].append(f)
+                elif fl.endswith(".xml"):
+                    out["osim_setup"].append(f)
         return out
 
     def get_seed_from_trc(self) -> Optional[dict]:
@@ -285,27 +288,8 @@ class Sports2DRunner:
 
         path = trcs_px[0]
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-
-            # Find data start (first numeric row after the 5-line header)
-            data_start = None
-            for i, line in enumerate(lines):
-                stripped = line.strip()
-                if i >= 4 and stripped and stripped[0].isdigit():
-                    data_start = i
-                    break
-            if data_start is None:
-                return None
-
-            # Header row is 2 lines above data
-            header_idx = max(0, data_start - 2)
-            df = pd.read_csv(path, sep="	", skiprows=header_idx,
-                             encoding="utf-8", on_bad_lines="skip")
-            df.columns = [c.strip() for c in df.columns]
-            df = df.dropna(axis=1, how="all")
-
-            if df.empty or len(df) < 2:
+            df = self._parse_trc_file(path)
+            if df is None or df.empty or len(df) < 2:
                 return None
 
             # Robust TRC parsing: infer marker base names from "<Marker>.<X|Y|Z>".
@@ -417,26 +401,32 @@ class Sports2DRunner:
         trcs = self.outputs.get(key, [])
         if not trcs:
             return None
-        path = trcs[0]
+        return self._parse_trc_file(trcs[0])
+
+    def _parse_trc_file(self, path: str) -> Optional[pd.DataFrame]:
+        """Shared logic to parse Sports2D/OpenSim TRC files into a clean DataFrame."""
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
+            
             data_start = None
             for i, line in enumerate(lines):
                 stripped = line.strip()
-                if i >= 3 and stripped and (stripped[0].isdigit() or
-                        stripped.lower().startswith("frame")):
+                if i >= 4 and stripped and re.match(r'^-?\d', stripped):
                     data_start = i
                     break
+            
             if data_start is None:
                 data_start = 5
+            
+            # TRC header row is exactly 2 rows above the first data row
             header_line = data_start - 2
             df = pd.read_csv(path, sep="\t", skiprows=header_line,
                              encoding="utf-8", on_bad_lines="skip")
             df.columns = [c.strip() for c in df.columns]
             return df.dropna(axis=1, how="all")
         except Exception as e:
-            print(f"[S2D] Failed to load TRC file {path}: {e}")
+            print(f"[S2D] Failed to parse TRC file {path}: {e}")
             return None
 
 

@@ -168,7 +168,8 @@ class FrameMetrics:
     right_knee_angle: float = 0.
     left_hip_angle: float = 0.
     right_hip_angle: float = 0.
-    trunk_lean: float = 0.
+    trunk_lateral_lean: float = 0.
+    trunk_sagittal_lean: float = 0.
     direction_change: bool = False
     energy_expenditure: float = 0.
     gait_symmetry: float = 100.
@@ -253,10 +254,28 @@ class BioFrame:
     step_width: float = 0.
     foot_progression_angle: float = 0.
 
+BIO_ANGLE_FIELDS = [
+    "left_knee_flexion",    "right_knee_flexion",
+    "left_hip_flexion",     "right_hip_flexion",
+    "left_ankle_dorsiflexion", "right_ankle_dorsiflexion",
+    "left_elbow_flexion",   "right_elbow_flexion",
+    "trunk_lateral_lean",   "trunk_sagittal_lean",
+    "pelvis_obliquity",     "pelvis_rotation",
+    "left_thigh_angle",     "right_thigh_angle",
+    "left_shank_angle",     "right_shank_angle",
+    "trunk_segment_angle",
+    "left_valgus_clinical", "right_valgus_clinical",
+    "left_arm_swing",       "right_arm_swing",
+]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MATH HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def midpoint(a, b) -> Tuple[float, float]:
+    return ((a[0] + b[0]) / 2., (a[1] + b[1]) / 2.)
+
 
 def angle_3pts(a, b, c) -> float:
     ba = np.array(a) - np.array(b)
@@ -273,7 +292,10 @@ def smooth_arr(arr, w=5) -> np.ndarray:
     a = np.array(arr, dtype=float)
     if HAS_SCIPY:
         return uniform_filter1d(a, size=w)
-    return np.convolve(a, np.ones(w) / w, mode='same')
+    # Pad edges with edge values before convolve to avoid zero-bias at boundaries
+    pad = w // 2
+    a_pad = np.pad(a, pad, mode='edge')
+    return np.convolve(a_pad, np.ones(w) / w, mode='valid')[:len(a)]
 
 
 def clamp01(x) -> float:
@@ -290,6 +312,13 @@ def risk_color(s):
     if t < 0.5:
         return lerp_color((0, 200, 0), (0, 200, 255), t * 2)
     return lerp_color((0, 200, 255), (0, 0, 230), (t - .5) * 2)
+
+
+def _size_sim(a_w, a_h, b_w, b_h) -> float:
+    """Ratio of smaller bbox area to larger — 1.0 = identical size."""
+    a_area = a_w * a_h
+    b_area = b_w * b_h
+    return min(a_area, b_area) / (max(a_area, b_area) + 1e-6)
 
 
 def bbox_iou(a, b) -> float:
@@ -349,6 +378,7 @@ class KalmanTrack:
         [0,0,0,0,1,0,0,0], [0,0,0,0,0,1,0,0], [0,0,0,0,0,0,1,0], [0,0,0,0,0,0,0,1],
     ], dtype=float)
     H = np.eye(4, 8)
+    _P0 = np.diag([10., 10., 10., 10., 100., 100., 10., 10.])
 
     def __init__(self, bbox, frame, conf=1.0):
         self.id = KalmanTrack._next_id
@@ -356,7 +386,7 @@ class KalmanTrack:
         cx, cy = bbox_centre(bbox)
         w, h = bbox[2], bbox[3]
         self.x = np.array([cx, cy, w, h, 0., 0., 0., 0.], dtype=float)
-        self.P = np.diag([10., 10., 10., 10., 100., 100., 10., 10.])
+        self.P = self._P0.copy()
         self.Q = np.diag([1., 1., 1., 1., .5, .5, .2, .2])
         self.R = np.diag([4., 4., 10., 10.])
         self.conf = conf
@@ -406,7 +436,7 @@ class KalmanTrack:
         self.x[:4] = [cx, cy, bbox[2], bbox[3]]
         # Reset covariance on reactivation to avoid over-trusting stale state
         # after long occlusions (reduces jitter/lag on reacquire).
-        self.P = np.diag([10., 10., 10., 10., 100., 100., 10., 10.])
+        self.P = self._P0.copy()
         self.x[4:] = 0.0
         self.missed = 0
         self.hit_streak = 1
@@ -541,44 +571,43 @@ class ByteTracker:
     LOST_TTL    = 60
 
     def __init__(self):
-        self.active_tracks: List[KalmanTrack] = []
-        self.lost_tracks:   List[KalmanTrack] = []
+        self.active_tracks: dict[int, KalmanTrack] = {}
+        self.lost_tracks:   dict[int, KalmanTrack] = {}
 
     def update(self, detections: List[dict], frame) -> List[KalmanTrack]:
         # Precompute per-detection appearance histograms once per frame.
-        # This avoids repeated cv2.cvtColor/calcHist inside association loops.
         for d in detections:
             if d.get("_hist") is None:
                 d["_hist"] = crop_hist(frame, d["bbox"])
 
-        for t in self.active_tracks + self.lost_tracks:
+        for t in list(self.active_tracks.values()) + list(self.lost_tracks.values()):
             t.predict()
         high = [d for d in detections if d['conf'] >= self.HIGH_THRESH]
         low  = [d for d in detections if self.LOW_THRESH <= d['conf'] < self.HIGH_THRESH]
 
-        unm_t, unm_h = self._associate(self.active_tracks, high, frame, self.IOU_HIGH)
+        active_list = list(self.active_tracks.values())
+        lost_list   = list(self.lost_tracks.values())
+
+        unm_t, unm_h = self._associate(active_list, high, frame, self.IOU_HIGH)
         still_unm, _ = self._associate(unm_t, low, frame, self.IOU_LOW)
-        self._associate(self.lost_tracks, low, frame, self.IOU_LOST, reactivate=True)
+        self._associate(lost_list, low, frame, self.IOU_LOST, reactivate=True)
 
         for t in still_unm:
             t.hit_streak = 0
-            if t not in self.lost_tracks:
-                self.lost_tracks.append(t)
-            if t in self.active_tracks:
-                self.active_tracks.remove(t)
+            self.lost_tracks[t.id] = t
+            self.active_tracks.pop(t.id, None)
 
         for d in unm_h:
-            self.active_tracks.append(KalmanTrack(d['bbox'], frame, d['conf']))
+            nt = KalmanTrack(d['bbox'], frame, d['conf'])
+            self.active_tracks[nt.id] = nt
 
-        self.lost_tracks = [t for t in self.lost_tracks if t.missed <= self.LOST_TTL]
-        return [t for t in self.active_tracks if t.hit_streak >= self.MIN_HITS]
+        self.lost_tracks = {tid: t for tid, t in self.lost_tracks.items() if t.missed <= self.LOST_TTL}
+        return [t for t in self.active_tracks.values() if t.hit_streak >= self.MIN_HITS]
 
     def _associate(self, tracks, dets, frame, iou_thr, reactivate=False):
         if not tracks or not dets:
             return list(tracks), list(dets)
-        
-        # We work with a static copy for matching to avoid IndexError if the original 
-        # list (e.g. self.lost_tracks) is modified during loop iteration (reactivation).
+
         tracks_copy = list(tracks)
         cost = np.zeros((len(tracks_copy), len(dets)), dtype=float)
         for ti, t in enumerate(tracks_copy):
@@ -589,7 +618,6 @@ class ByteTracker:
                 hs  = hist_sim(th, d.get("_hist"))
                 cost[ti, di] = 1.0 - (iou * 0.60 + hs * 0.40)
 
-        # Use Hungarian matching when scipy is available
         mt, md = set(), set()
         if HAS_SCIPY:
             try:
@@ -603,10 +631,8 @@ class ByteTracker:
                         d = dets[di]
                         if reactivate:
                             t.reactivate(d['bbox'], frame)
-                            if t in self.lost_tracks:
-                                self.lost_tracks.remove(t)
-                            if t not in self.active_tracks:
-                                self.active_tracks.append(t)
+                            self.lost_tracks.pop(t.id, None)
+                            self.active_tracks[t.id] = t
                         else:
                             t.update(d['bbox'], frame, d['conf'])
                         if d.get('kp') is not None:
@@ -629,22 +655,20 @@ class ByteTracker:
                 d = dets[di]
                 if reactivate:
                     t.reactivate(d['bbox'], frame)
-                    if t in self.lost_tracks:
-                        self.lost_tracks.remove(t)
-                    if t not in self.active_tracks:
-                        self.active_tracks.append(t)
+                    self.lost_tracks.pop(t.id, None)
+                    self.active_tracks[t.id] = t
                 else:
                     t.update(d['bbox'], frame, d['conf'])
                 if d.get('kp') is not None:
                     t._yolo_kp = d['kp']
 
         return (
-            [tracks[i] for i in range(len(tracks)) if i not in mt],
-            [dets[i]   for i in range(len(dets))   if i not in md],
+            [tracks_copy[i] for i in range(len(tracks_copy)) if i not in mt],
+            [dets[i]        for i in range(len(dets))        if i not in md],
         )
 
     def reset(self):
-        for t in self.active_tracks + self.lost_tracks:
+        for t in list(self.active_tracks.values()) + list(self.lost_tracks.values()):
             t.x[4:] = 0.
 
 
@@ -708,7 +732,7 @@ class TargetLock:
             self._state = "lost"
             target = self._reacquire(tracks, strict=self._lost_frames <= 5)
             if target is None:
-                target = self._reacquire(self.bt.lost_tracks, strict=False)
+                target = self._reacquire(list(self.bt.lost_tracks.values()), strict=False)
         else:
             self._lost_frames = 0
             self._state = "tracking"
@@ -729,7 +753,7 @@ class TargetLock:
             hs  = hist_sim(t.ref_hist, self._ref_hist)
             sw, sh = self._seed_bbox[2], self._seed_bbox[3]
             tw, th = t.get_bbox()[2], t.get_bbox()[3]
-            ss = min(sw * sh, tw * th) / (max(sw * sh, tw * th) + 1e-6)
+            ss = _size_sim(sw, sh, tw, th)
             sc = iou * 0.45 + hs * 0.40 + ss * 0.15
             if sc > best:
                 best, bid = sc, t.id
@@ -747,7 +771,7 @@ class TargetLock:
             if self._last_bbox is not None:
                 lw, lh = self._last_bbox[2], self._last_bbox[3]
                 tw, th = t.get_bbox()[2], t.get_bbox()[3]
-                ss = min(lw * lh, tw * th) / (max(lw * lh, tw * th) + 1e-6)
+                ss = _size_sim(lw, lh, tw, th)
                 if ss < 0.25:
                     continue
                 sc = hs * 0.65 + ss * 0.35
@@ -791,9 +815,6 @@ _yolo_models_lock = threading.RLock()
 
 
 def _resolve_yolo_model_path(model_size: str) -> str:
-    # Prefer YOLOv8 pose checkpoints (faster / widely available),
-    # but keep yolo11 pose as a fallback for existing installs.
-    # Supports absolute paths via env var for deploys.
     env_model = os.getenv("YOLO_MODEL_PATH") or os.getenv("YOLO_POSE_MODEL")
     model_candidates = []
     if env_model:
@@ -808,16 +829,23 @@ def _resolve_yolo_model_path(model_size: str) -> str:
         potential_paths.extend([
             mn,
             os.path.join("models", mn),
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models", mn),  # ../../../models/
-            os.path.join(os.path.dirname(__file__), "..", "..", "models", mn),  # ../../models/
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models", mn),
+            os.path.join(os.path.dirname(__file__), "..", "..", "models", mn),
         ])
-
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_paths = []
     for p in potential_paths:
+        if p not in seen:
+            seen.add(p)
+            unique_paths.append(p)
+
+    for p in unique_paths:
         if os.path.exists(p):
             return p
-    # Let ultralytics resolve/download if none found locally.
+    
     return model_candidates[0]
-
 
 def _get_or_load_yolo_model(model_size="m"):
     if not HAS_YOLO:
@@ -945,7 +973,7 @@ def select_primary_player(video_path: str, sample_step: int = 6) -> Optional[dic
                     continue
                 iou = bbox_iou(blob, tr["lb"])
                 rw, rh = tr["ms"]
-                ss = min(bw * bh, rw * rh) / (max(bw * bh, rw * rh) + 1e-6)
+                ss = _size_sim(bw, bh, rw, rh)
                 if iou * 0.7 + ss * 0.3 > 0.15 and (iou > 0.10 or ss > 0.55):
                     h = crop_hist(frame, blob)
                     tr["n"] += 1
@@ -1011,12 +1039,10 @@ class HybridPoseEstimator:
 
         kp = PoseKeypoints()
         kp.head = (cx, vy(self._VP["head"]))
-        kp.neck = (cx, vy(self._VP["neck"]))
         ls = (cx - sh, vy(self._VP["shoulder"]))
         rs = (cx + sh, vy(self._VP["shoulder"]))
         kp.left_shoulder  = ls
         kp.right_shoulder = rs
-        kp.shoulder_center = ((ls[0] + rs[0]) / 2., (ls[1] + rs[1]) / 2.)
         aoff = arm_sw * math.sin(phase)
         le = (ls[0] - aoff, vy(self._VP["elbow"]))
         re = (rs[0] + aoff, vy(self._VP["elbow"]))
@@ -1028,7 +1054,6 @@ class HybridPoseEstimator:
         rh = (cx + hh, vy(self._VP["hip"]))
         kp.left_hip   = lh
         kp.right_hip  = rh
-        kp.hip_center = ((lh[0] + rh[0]) / 2., (lh[1] + rh[1]) / 2.)
         loff = leg_sw * math.sin(phase)
         roff = -loff
         ll = k_lift * max(0., math.sin(phase))
@@ -1075,21 +1100,19 @@ class HybridPoseEstimator:
             nose = g("nose")
             if nose:
                 kp.head = nose
-            kp.shoulder_center = (
-                (kp.left_shoulder[0] + kp.right_shoulder[0]) / 2.,
-                (kp.left_shoulder[1] + kp.right_shoulder[1]) / 2.,
-            )
-            kp.hip_center = (
-                (kp.left_hip[0] + kp.right_hip[0]) / 2.,
-                (kp.left_hip[1] + kp.right_hip[1]) / 2.,
-            )
-            kp.neck = (
-                (kp.shoulder_center[0] + kp.head[0]) / 2.,
-                (kp.shoulder_center[1] + kp.head[1]) / 2.,
-            )
+            kp.shoulder_center = midpoint(kp.left_shoulder, kp.right_shoulder)
+            kp.hip_center = midpoint(kp.left_hip, kp.right_hip)
+            kp.neck = midpoint(kp.shoulder_center, kp.head)
             for side in ("left", "right"):
                 ank = getattr(kp, f"{side}_ankle")
                 object.__setattr__(kp, f"{side}_foot", (ank[0] + w * .04, ank[1] + h * .03))
+        if kp.shoulder_center == (0., 0.):
+            kp.shoulder_center = midpoint(kp.left_shoulder, kp.right_shoulder)
+        if kp.hip_center == (0., 0.):
+            kp.hip_center = midpoint(kp.left_hip, kp.right_hip)
+        if kp.neck == (0., 0.):
+            kp.neck = midpoint(kp.shoulder_center, kp.head)
+
         object.__setattr__(kp, "_yolo_confident", bool(yolo_confident))
         return kp
 
@@ -1152,17 +1175,16 @@ class JointKalman:
 
 class PoseKalmanSmoother:
     def __init__(self):
-        self._kx = {}
-        self._ky = {}
+        self._k: dict = {}  # nm -> (JointKalman_x, JointKalman_y)
 
     def smooth(self, kp) -> PoseKeypoints:
         out = PoseKeypoints()
         for nm in JOINT_NAMES:
             raw = getattr(kp, nm)
-            if nm not in self._kx:
-                self._kx[nm] = JointKalman()
-                self._ky[nm] = JointKalman()
-            setattr(out, nm, (self._kx[nm].update(raw[0]), self._ky[nm].update(raw[1])))
+            if nm not in self._k:
+                self._k[nm] = (JointKalman(), JointKalman())
+            kx, ky = self._k[nm]
+            setattr(out, nm, (kx.update(raw[0]), ky.update(raw[1])))
         return out
 
 
@@ -1208,11 +1230,9 @@ def draw_gradient_bone(img, p1, p2, c1, c2, th, rt=0.):
 
 def draw_glow_joint(img, pt, r, col, ga=0.45):
     px, py = int(pt[0]), int(pt[1])
-    # Glow is drawn on a per-frame overlay to avoid copying the full frame
-    # for every joint.
-    ov = img  # overlay buffer
-    for rr in range(r + 6, r, -2):
-        cv2.circle(ov, (px, py), rr, col, -1, cv2.LINE_AA)
+    # Draw glow directly on image (caller should provide a copy if preservation needed)
+    for rr in range(r + 6, r, -2):  
+        cv2.circle(img, (px, py), rr, col, -1, cv2.LINE_AA)
 
 
 def render_skeleton(frame, kp, risk_tint=0.):
@@ -1285,8 +1305,8 @@ class BiomechanicsEngine:
 
         dx = kp.shoulder_center[0] - kp.hip_center[0]
         dy = kp.shoulder_center[1] - kp.hip_center[1]
-        bf.trunk_lateral_lean  = math.degrees(math.atan2(dx,       abs(dy) + 1e-9))
-        bf.trunk_sagittal_lean = math.degrees(math.atan2(abs(dx),  abs(dy) + 1e-9))
+        bf.trunk_lateral_lean   = math.degrees(math.atan2(dx, abs(dy) + 1e-9))   # side-to-side: sign = left/right
+        bf.trunk_sagittal_lean  = math.degrees(math.atan2(dx, abs(dy) + 1e-9))   # forward/backward: positive = forward lean
 
         hd = kp.left_hip[1] - kp.right_hip[1]
         hw = dist2d(kp.left_hip, kp.right_hip) + 1e-9
@@ -1325,13 +1345,13 @@ class BiomechanicsEngine:
     def post_process(self):
         if len(self.frames) < 8:
             return
-        for field in [
-            "left_knee_flexion", "right_knee_flexion",
-            "left_hip_flexion", "right_hip_flexion",
-            "left_ankle_dorsiflexion", "right_ankle_dorsiflexion",
-            "trunk_lateral_lean", "trunk_sagittal_lean",
-            "left_valgus_clinical", "right_valgus_clinical",
-        ]:
+        # Validate that all expected fields exist in BioFrame (catches schema drift)
+        angle_fields = set(BIO_ANGLE_FIELDS)
+        missing = angle_fields - set(BioFrame.__dataclass_fields__)
+        if missing:
+            raise RuntimeError(f"BioFrame missing expected fields: {missing}")
+
+        for field in angle_fields:
             raw = np.array([getattr(f, field) for f in self.frames], dtype=float)
             sm  = self._smooth(raw)
             for i, bf in enumerate(self.frames):
@@ -1403,10 +1423,12 @@ class BiomechanicsEngine:
 
     @staticmethod
     def _clinical_valgus(hip, knee, ankle) -> float:
+        # Signed angle: hip→ankle vs hip→knee. Positive = valgus (knee medial to limb axis).
         ha  = np.array([ankle[0] - hip[0], ankle[1] - hip[1]], dtype=float)
         hk  = np.array([knee[0]  - hip[0], knee[1]  - hip[1]], dtype=float)
-        dev = float(np.cross(ha, hk)) / (np.linalg.norm(ha) + 1e-9)
-        return float(math.degrees(math.atan2(dev, np.linalg.norm(hk) + 1e-9)))
+        cross = float(np.cross(ha, hk))           # scalar z-component
+        dot   = float(np.dot(ha, hk))
+        return float(math.degrees(math.atan2(cross, dot + 1e-9)))
 
     def _angvel(self, key: str, ang: float) -> float:
         prev = self._ah.get(key, ang)
@@ -1421,8 +1443,11 @@ class BiomechanicsEngine:
                 return filtfilt(b, a, arr)
             except Exception:
                 pass
+        # Fallback: uniform moving average with edge padding (no scipy dependency)
         w = max(3, int(self.fps * 0.12))
-        return smooth_arr(arr, w=w)
+        pad = w // 2
+        a_pad = np.pad(arr, pad, mode='edge')
+        return np.convolve(a_pad, np.ones(w) / w, mode='valid')[:len(arr)]
 
     def _peaks(self, sig: np.ndarray, md: int) -> List[int]:
         if HAS_SCIPY:
@@ -1434,16 +1459,22 @@ class BiomechanicsEngine:
         pks = []
         for i in range(1, len(sig) - 1):
             if sig[i] >= sig[i - 1] and sig[i] >= sig[i + 1]:
+                # Prominence check: peak must rise >= 2.0 above local minimum in [i-md, i+md]
+                local_min = min(sig[max(0, i - md):i + md + 1])
+                if sig[i] - local_min < 2.0:
+                    continue
                 if not pks or i - pks[-1] >= md:
                     pks.append(i)
         return pks
 
     @staticmethod
     def _stance_mask(hs: List[int], to: List[int], n: int) -> List[bool]:
+        import bisect
         m = [False] * n
+        to_sorted = sorted(to)
         for h in hs:
-            nxt = [t for t in to if t > h]
-            end = min(nxt) if nxt else min(h + 20, n - 1)
+            idx = bisect.bisect_right(to_sorted, h)   # first toe-off after heel-strike
+            end = to_sorted[idx] if idx < len(to_sorted) else min(h + 20, n - 1)
             for i in range(h, min(end + 1, n)):
                 m[i] = True
         return m

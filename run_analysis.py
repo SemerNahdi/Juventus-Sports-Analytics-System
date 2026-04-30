@@ -208,10 +208,10 @@ def main():
     print("\n[STEP 5/5] Generating Analytical Plots & Report")
     step5_start = time.time()
     plotter = AnalyticsPlotter(results_dir=str(analytics_plots_dir), player_id=args.player)
-    plotter.generate_all(
-        frame_metrics=analyzer.frame_metrics,
-        bio_engine=analyzer.bio_engine,
-    )
+    # plotter.generate_all(
+    #     frame_metrics=analyzer.frame_metrics,
+    #     bio_engine=analyzer.bio_engine,
+    # )
 
     report_str = analyzer.get_report_string()
     with open(report_out, "w", encoding="utf-8") as f:

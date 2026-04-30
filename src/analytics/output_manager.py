@@ -93,12 +93,11 @@ class OpenSimFileWriter:
                 for _ in self.OPENSIM_MARKERS:
                     xyz_row += "\tX\tY\tZ"
                 f.write(xyz_row + "\n")
-                # Line 5: blank separator (OpenSim expects this)
-                f.write("\n")
 
                 # ── Data rows ─────────────────────────────────────────────────
-                for pf in pose_frames:
-                    row = f"{pf.frame_idx + 1}\t{pf.timestamp:.6f}"
+                for i, pf in enumerate(pose_frames):
+                    # Frame index is 1-based sequential counter (OpenSim expects this)
+                    row = f"{i + 1}\t{pf.timestamp:.6f}"
                     for nm in self.OPENSIM_MARKERS:
                         px, py = getattr(pf.kp, nm)
                         x =  px * pix_to_m
@@ -124,20 +123,8 @@ class OpenSimFileWriter:
             print("[MOT] No biomechanics frames — skipping MOT export.")
             return False
 
-        # Columns to export (all continuous angle fields from BioFrame)
-        angle_fields = [
-            "left_knee_flexion",    "right_knee_flexion",
-            "left_hip_flexion",     "right_hip_flexion",
-            "left_ankle_dorsiflexion", "right_ankle_dorsiflexion",
-            "left_elbow_flexion",   "right_elbow_flexion",
-            "trunk_lateral_lean",   "trunk_sagittal_lean",
-            "pelvis_obliquity",     "pelvis_rotation",
-            "left_thigh_angle",     "right_thigh_angle",
-            "left_shank_angle",     "right_shank_angle",
-            "trunk_segment_angle",
-            "left_valgus_clinical", "right_valgus_clinical",
-            "left_arm_swing",       "right_arm_swing",
-        ]
+        # Use shared fields list for consistency with BiomechanicsEngine
+        angle_fields = BIO_ANGLE_FIELDS
 
         n_rows = len(bio_frames)
         n_cols = 1 + len(angle_fields)  # time + angles

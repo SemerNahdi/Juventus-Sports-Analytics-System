@@ -390,12 +390,12 @@ def run_full_analysis_job(
                 f.write(analyzer.get_report_string())
 
             # 6. Generate Analytics Plots
-            log_step("Synthesizing graphical metrics...")
-            plotter = AnalyticsPlotter(results_dir=results_dir, player_id=player_id)
-            plotter.generate_all(
-                frame_metrics=analyzer.frame_metrics,
-                bio_engine=analyzer.bio_engine
-            )
+            # log_step("Synthesizing graphical metrics...")
+            # plotter = AnalyticsPlotter(results_dir=results_dir, player_id=player_id)
+            # plotter.generate_all(
+            #     frame_metrics=analyzer.frame_metrics,
+            #     bio_engine=analyzer.bio_engine
+            # )
 
             # 7. Upload All Assets (Video to Cloudinary, Others to Supabase)
             log_step("Uploading finalized assets to cloud storage...")
