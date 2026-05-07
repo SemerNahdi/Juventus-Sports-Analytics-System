@@ -23,7 +23,7 @@ import json
 import datetime
 from pathlib import Path
 
-from src.analytics.sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D
+from src.analytics.sports_analytics import SportsAnalyzer, Sports2DRunner, AnalyticsPlotter, HAS_SPORTS2D
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -162,17 +162,35 @@ def main():
         if not HAS_SPORTS2D:
             print("   ⚠  Sports2D not installed — skipping.")
         else:
-            person_ordering = "on_click" if args.s2d_pick else "greatest_displacement"
-            analyzer.run_sports2d(
-                result_dir=str(sports2d_dir),
-                mode=args.s2d_mode,
-                show_realtime=args.s2d_realtime,
-                person_ordering=person_ordering,
-                do_ik=args.s2d_ik,
-                use_augmentation=args.s2d_augment,
-                visible_side=args.s2d_side,
-                participant_mass_kg=args.mass,
-            )
+            # Artifact Bypass check
+            video_stem = Path(args.video).stem
+            # Sports2D naming convention: <video_stem>_yolo_pose.trc
+            potential_trc = sports2d_dir / f"{video_stem}_yolo_pose.trc"
+            
+            if potential_trc.exists() and os.getenv("S2D_CACHE_BYPASS") != "1":
+                print(f"   ✓  Found cached Sports2D results: {potential_trc.name}")
+                print("   ✓  Skipping Step 2 (Artifact Bypass active)")
+                # We still need to initialize the runner to load these outputs later
+                sports2d_runner = Sports2DRunner(
+                    video_path=args.video,
+                    result_dir=str(sports2d_dir),
+                    player_height_m=args.height,
+                    participant_mass_kg=args.mass,
+                )
+                sports2d_runner.outputs = sports2d_runner._collect_outputs()
+                analyzer.sports2d_runner = sports2d_runner
+            else:
+                person_ordering = "on_click" if args.s2d_pick else "greatest_displacement"
+                analyzer.run_sports2d(
+                    result_dir=str(sports2d_dir),
+                    mode=args.s2d_mode,
+                    show_realtime=args.s2d_realtime,
+                    person_ordering=person_ordering,
+                    do_ik=args.s2d_ik,
+                    use_augmentation=args.s2d_augment,
+                    visible_side=args.s2d_side,
+                    participant_mass_kg=args.mass,
+                )
     perf_breakdown["Step 2: Sports2D Pipeline"] = time.time() - step2_start
 
     # ── Step 3: Custom Tracking + Biomechanics ───────────────────────────────
@@ -187,8 +205,9 @@ def main():
     step4_start = time.time()
     has_native_s2d_trc = False
     has_native_s2d_mot = False
-    if args.sports2d and getattr(analyzer, "sports2d_runner", None) and analyzer.sports2d_runner.outputs:
-        outputs = analyzer.sports2d_runner.outputs
+    sports2d_runner = analyzer.sports2d_runner
+    if args.sports2d and sports2d_runner and sports2d_runner.outputs:
+        outputs = sports2d_runner.outputs
         has_native_s2d_trc = bool(outputs.get("trc_pose_m") or outputs.get("trc_pose_px"))
         has_native_s2d_mot = bool(outputs.get("mot_angles"))
 
@@ -205,9 +224,9 @@ def main():
     perf_breakdown["Step 4: Unified Export"] = time.time() - step4_start
 
     # ── Step 5: Generate Plots & Report ──────────────────────────────────────
-    print("\n[STEP 5/5] Generating Analytical Plots & Report")
-    step5_start = time.time()
-    plotter = AnalyticsPlotter(results_dir=str(analytics_plots_dir), player_id=args.player)
+    # print("\n[STEP 5/5] Generating Analytical Plots & Report")
+    # step5_start = time.time()
+    # plotter = AnalyticsPlotter(results_dir=str(analytics_plots_dir), player_id=args.player)
     # plotter.generate_all(
     #     frame_metrics=analyzer.frame_metrics,
     #     bio_engine=analyzer.bio_engine,
@@ -216,7 +235,7 @@ def main():
     report_str = analyzer.get_report_string()
     with open(report_out, "w", encoding="utf-8") as f:
         f.write(report_str)
-    perf_breakdown["Step 5: Generate Plots & Report"] = time.time() - step5_start
+    # perf_breakdown["Step 5: Generate Plots & Report"] = time.time() - step5_start
 
     # ── Final Summary ────────────────────────────────────────────────────────
     stop_cpu_sampler.set()
@@ -287,9 +306,9 @@ def main():
         json.dump(perf_data, f, indent=2)
     print(f"   • Performance Metrics : {perf_out}")
 
-    if args.sports2d and getattr(analyzer, 'sports2d_runner', None) and analyzer.sports2d_runner.outputs:
+    if args.sports2d and sports2d_runner and sports2d_runner.outputs:
         print(f"\n🏟️  Sports2D Outputs ({sports2d_dir}):")
-        s2d = analyzer.sports2d_runner.outputs
+        s2d = sports2d_runner.outputs
         for key, files in s2d.items():
             if files:
                 if isinstance(files, list):

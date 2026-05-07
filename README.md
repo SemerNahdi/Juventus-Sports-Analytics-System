@@ -126,11 +126,13 @@ python -c "import opensim; import sports2d; from ultralytics import YOLO; print(
 ### 1. Local CLI Analysis
 
 Run the full pipeline with interactive player picking:
+source .venv12/Scripts/activate
 
 ```bash
 python run_analysis.py --video videos/20.mp4 --sports2d --s2d-pick
-```
+python -m uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 
+```
 ---
 
 ## Development & Roadmap
@@ -138,11 +140,13 @@ python run_analysis.py --video videos/20.mp4 --sports2d --s2d-pick
 ### Frontend Integration: Interactive Player Selection
 
 Currently, the Sports2D picker is a command-line tool. We are working to integrate this functionality into the frontend website so users can:
+
 1. **Upload or select a video** directly in the browser.
 2. **Use an interactive player picker** (based on the Sports2D logic) to select subjects visually.
 3. **Submit the selection** to trigger the backend analysis pipeline.
 
 **Technical Implementation Goals:**
+
 - Expose the Sports2D picker functionality via a specialized API endpoint.
 - Create a React/JS interactive UI component for canvas-based player selection.
 - Handle asynchronous communication between frontend selection events and backend processing.

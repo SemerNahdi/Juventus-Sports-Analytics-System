@@ -953,6 +953,17 @@ video {
     transform: translateY(-3px);
 }
 
+.file-link-static {
+    cursor: default;
+    opacity: 0.9;
+}
+
+.file-link-static:hover {
+    transform: none;
+    border-color: transparent;
+    background: rgba(255, 255, 255, 0.03);
+}
+
 .file-link .badge {
     background: rgba(0, 240, 255, 0.1);
     color: var(--accent-neon);

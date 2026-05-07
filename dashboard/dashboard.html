@@ -9,13 +9,14 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="dashboard.css">
+    <link rel="stylesheet" href="dashboard.css?v=3">
     <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
+<body>
     <div class="app-container">
         <!-- Sidebar -->
-        <aside class="sidebar">
+        <!-- <aside class="sidebar">
             <div class="brand">
                 <div class="brand-logo" onclick="toggleSidebar()" style="cursor: pointer;">M</div>
                 <div class="brand-text">
@@ -41,7 +42,7 @@
                 </div>
                 <i class="fa-solid fa-gear" style="margin-left: auto; color: var(--text-secondary); cursor: pointer;"></i>
             </div>
-        </aside>
+        </aside> -->
 
         <!-- Main Content Area -->
         <main class="main-content">
@@ -171,6 +172,22 @@
                     <div class="card-header"><h4>Arm Swing</h4></div>
                     <div class="gait-value" id="valArmSwing">--°</div>
                 </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Stride Length</h4></div>
+                    <div class="gait-value" id="valStrideLength">-- m</div>
+                </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Step Time</h4></div>
+                    <div class="gait-value" id="valStepTime">-- s</div>
+                </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Cadence</h4></div>
+                    <div class="gait-value" id="valCadence">-- bpm</div>
+                </section>
+                <section class="span-4 card glass gait-metric-card">
+                    <div class="card-header"><h4>Flight Time</h4></div>
+                    <div class="gait-value" id="valFlightTime">-- s</div>
+                </section>
 
                 <!-- Charts Section -->
                 <section class="chart-section span-6 card glass">
@@ -220,16 +237,24 @@
 
                 <section class="chart-section span-12 card glass">
                     <div class="card-header">
-                        <h3>Session Resources & Data Exports</h3>
+                        <h3>Unified Output Manifest</h3>
                     </div>
                     <div class="resource-list-bottom" id="resourceList">
                         <div class="resource-group-row">
-                            <h4>Raw Data Files</h4>
+                            <h4>Session Snapshot</h4>
+                            <div id="analysisMetaList" class="file-links-row"></div>
+                        </div>
+                        <div class="resource-group-row">
+                            <h4>Unified Data</h4>
                             <div id="dataFilesList" class="file-links-row"></div>
                         </div>
                         <div class="resource-group-row">
-                            <h4>Analytical Plots</h4>
+                            <h4>Clinical Plots</h4>
                             <div id="plotFilesList" class="file-links-row"></div>
+                        </div>
+                        <div class="resource-group-row">
+                            <h4>Sports2D Artifacts</h4>
+                            <div id="sports2dFilesList" class="file-links-row"></div>
                         </div>
                     </div>
                 </section>
@@ -242,6 +267,6 @@
     <div class="toast-container" id="toastContainer"></div>
 
     <!-- Scripts -->
-    <script src="dashboard.js"></script>
+    <script src="dashboard.js?v=3"></script>
 </body>
 </html>

@@ -17,6 +17,79 @@ let trunkChartObj = null;
 // API Base URL (adjust if running on different port)
 const API_BASE = window.location.origin;
 
+function toNumber(value, fallback = 0) {
+    if (value === null || value === undefined || value === '') return fallback;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function asArray(value) {
+    return Array.isArray(value) ? value : [];
+}
+
+function parseMaybeJson(value, fallback) {
+    if (value && typeof value === 'object') return value;
+    if (typeof value !== 'string') return fallback;
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : fallback;
+    } catch (_error) {
+        return fallback;
+    }
+}
+
+function getAnalysisEnvelope(analysis) {
+    const summary = parseMaybeJson(analysis?.summary, {});
+    const metadata = parseMaybeJson(analysis?.metadata || summary.metadata, {});
+    const playerSummary = parseMaybeJson(summary.player_summary || analysis?.player_summary, {});
+    const biomechanicsSummary = parseMaybeJson(analysis?.biomechanics_summary || summary.biomechanics_summary, {});
+    const frameMetrics = asArray(parseMaybeJson(summary.frame_metrics || analysis?.frame_metrics || analysis?.frames, []));
+    const dataUrls = parseMaybeJson(analysis?.data_urls || summary.data_urls, {});
+    const plotUrls = parseMaybeJson(analysis?.plot_urls || summary.plot_urls, {});
+    const sports2dFiles = parseMaybeJson(analysis?.sports2d_output_files || summary.sports2d_output_files, {});
+
+    return {
+        summary,
+        metadata,
+        playerSummary,
+        biomechanicsSummary,
+        frameMetrics,
+        dataUrls,
+        plotUrls,
+        sports2dFiles,
+    };
+}
+
+function getMetricAverage(frames, key) {
+    const values = frames
+        .map(frame => toNumber(frame?.[key], NaN))
+        .filter(value => Number.isFinite(value));
+    if (!values.length) return 0;
+    return values.reduce((total, value) => total + value, 0) / values.length;
+}
+
+function getMetricAverageFromKeys(frames, keys) {
+    const values = frames
+        .map(frame => {
+            for (const key of keys) {
+                const value = toNumber(frame?.[key], NaN);
+                if (Number.isFinite(value)) return value;
+            }
+            return NaN;
+        })
+        .filter(value => Number.isFinite(value));
+    if (!values.length) return 0;
+    return values.reduce((total, value) => total + value, 0) / values.length;
+}
+
+function getSummaryValue(summary, keys, fallback = 0) {
+    for (const key of keys) {
+        const value = toNumber(summary?.[key], NaN);
+        if (Number.isFinite(value)) return value;
+    }
+    return fallback;
+}
+
 // Toast Utility
 function showToast(title, message, icon = 'fa-check') {
     const container = document.getElementById('toastContainer');
@@ -192,10 +265,16 @@ function renderHistory(data) {
 
 function displayAnalysis(analysis) {
     if (!analysis) return;
+    const envelope = getAnalysisEnvelope(analysis);
 
     // Update Header
-    document.getElementById('viewTitle').textContent = `Analysis: Player #${analysis.player_id}`;
-    document.getElementById('sessionInfo').textContent = `${analysis.session_tags || 'Baseline Scan'} | ${new Date(analysis.created_at).toLocaleDateString()}`;
+    const playerId = envelope.playerSummary.player_id || analysis.player_id || '--';
+    const backendLabel = envelope.metadata.angle_backend || envelope.metadata.pipeline || 'unified';
+    const totalFrames = envelope.metadata.total_frames || envelope.playerSummary.total_frames || envelope.frameMetrics.length || 0;
+    const sessionLabel = analysis.session_tags || analysis.created_at || envelope.metadata.video_path || envelope.metadata.video_source || 'Local output';
+    const sessionStamp = analysis.created_at ? new Date(analysis.created_at).toLocaleDateString() : sessionLabel;
+    document.getElementById('viewTitle').textContent = `Analysis: Player #${playerId}`;
+    document.getElementById('sessionInfo').textContent = `${totalFrames} frames | ${backendLabel} | ${sessionStamp}`;
 
     // Update Video (Adopted from Old DASH / Native compatibility)
     const video = document.getElementById('analysisVideo');
@@ -252,55 +331,88 @@ function displayAnalysis(analysis) {
     }
 
     // Update KPIs and Charts
-    updateSummary(analysis.summary);
+    updateSummary(analysis);
     
     // Update Resources
     populateResources(analysis);
     
-    if (analysis.summary && analysis.summary.frame_metrics) {
-        renderCharts(analysis.summary.frame_metrics);
-    } else if (analysis.data_urls && analysis.data_urls['analytics_unified.json']) {
+    if (envelope.frameMetrics.length > 0) {
+        renderCharts(envelope.frameMetrics);
+    } else if (envelope.dataUrls && envelope.dataUrls['analytics_unified.json']) {
         // Fallback: fetch from public URL
-        fetch(analysis.data_urls['analytics_unified.json'])
+        fetch(envelope.dataUrls['analytics_unified.json'])
             .then(res => res.json())
-            .then(data => renderCharts(data.frame_metrics));
+            .then(data => renderCharts(data.frame_metrics || data.frames || []));
     }
 }
 
 function populateResources(analysis) {
     const dataList = document.getElementById('dataFilesList');
     const plotList = document.getElementById('plotFilesList');
+    const sports2dList = document.getElementById('sports2dFilesList');
+    const metaList = document.getElementById('analysisMetaList');
+    const envelope = getAnalysisEnvelope(analysis);
 
     dataList.innerHTML = '';
     plotList.innerHTML = '';
+    if (sports2dList) sports2dList.innerHTML = '';
+    if (metaList) metaList.innerHTML = '';
+
+    if (metaList) {
+        const metadataItems = [
+            ['Player ID', envelope.playerSummary.player_id || analysis.player_id || '--', 'ID'],
+            ['Frames', envelope.metadata.total_frames || envelope.playerSummary.total_frames || envelope.frameMetrics.length || 0, 'FRM'],
+            ['Backend', envelope.metadata.angle_backend || 'unified', 'PIPE'],
+            ['Source', envelope.metadata.video_path ? (String(envelope.metadata.video_path).split(/[\\/]/).pop() || envelope.metadata.video_path) : 'session', 'SRC'],
+        ];
+
+        metadataItems.forEach(([name, value, type]) => {
+            metaList.appendChild(createFileLink(`${name}: ${value}`, null, type));
+        });
+    }
 
     // Data Files
-    if (analysis.data_urls) {
-        Object.entries(analysis.data_urls).forEach(([name, url]) => {
+    if (envelope.dataUrls) {
+        Object.entries(envelope.dataUrls).forEach(([name, url]) => {
             const ext = name.split('.').pop().toUpperCase();
             dataList.appendChild(createFileLink(name, url, ext));
         });
     }
 
     // Static Plots
-    if (analysis.plot_urls) {
-        Object.entries(analysis.plot_urls).forEach(([name, url]) => {
+    if (envelope.plotUrls) {
+        Object.entries(envelope.plotUrls).forEach(([name, url]) => {
             const ext = name.split('.').pop().toUpperCase();
             plotList.appendChild(createFileLink(name, url, ext));
         });
     }
+
+    if (sports2dList) {
+        const sports2dEntries = Object.entries(envelope.sports2dFiles || {});
+        if (sports2dEntries.length === 0) {
+            sports2dList.appendChild(createFileLink('No native Sports2D files', null, 'N/A'));
+        } else {
+            sports2dEntries.forEach(([name, url]) => {
+                const ext = name.split('.').pop().toUpperCase();
+                sports2dList.appendChild(createFileLink(name, url, ext));
+            });
+        }
+    }
 }
 
 function createFileLink(name, url, type) {
-    const a = document.createElement('a');
-    a.href = url;
-    a.target = '_blank';
-    a.className = 'file-link';
-    a.innerHTML = `
+    const el = document.createElement(url ? 'a' : 'div');
+    if (url) {
+        el.href = url;
+        el.target = '_blank';
+        el.rel = 'noreferrer';
+    }
+    el.className = url ? 'file-link' : 'file-link file-link-static';
+    el.innerHTML = `
         <span>${name}</span>
         <span class="badge type-icon">${type}</span>
     `;
-    return a;
+    return el;
 }
 
 // --- Upload & Analysis ---
@@ -308,13 +420,14 @@ function createFileLink(name, url, type) {
 
 // --- Chart Rendering (adapted from original) ---
 
-function updateSummary(summary) {
-    if (!summary || !summary.player_summary) return;
-    const s = summary.player_summary;
+function updateSummary(analysis) {
+    const envelope = getAnalysisEnvelope(analysis);
+    const s = envelope.playerSummary;
+    if (!s) return;
 
     // Peak Risk
-    const peakRisk = s.peak_risk_score.toFixed(1);
-    const riskLabel = s.fall_risk_label || 'Low';
+    const peakRisk = toNumber(s.peak_risk_score, 0).toFixed(1);
+    const riskLabel = s.fall_risk_label || s.injury_risk_label || 'Low';
     document.getElementById('kpiRisk').textContent = `${peakRisk}/100`;
     document.getElementById('kpiRiskLabel').textContent = `Overall Risk: ${riskLabel}`;
     
@@ -340,35 +453,73 @@ function updateSummary(summary) {
     if (s.injury_risk_label === 'High') iCard.classList.add('risk-high');
     else iCard.classList.add('risk-low');
 
-    document.getElementById('kpiSpeed').textContent = `${s.max_speed.toFixed(2)} m/s`;
-    document.getElementById('kpiSpeedLabel').textContent = `Avg: ${s.avg_speed.toFixed(2)} m/s`;
+    document.getElementById('kpiSpeed').textContent = `${toNumber(s.max_speed, 0).toFixed(2)} m/s`;
+    document.getElementById('kpiSpeedLabel').textContent = `Avg: ${toNumber(s.avg_speed, 0).toFixed(2)} m/s`;
 
-    // Detailed Biometrics Calculation (Restore from Old Dash logic)
-    const metrics = summary.frame_metrics || [];
-    if (metrics.length > 0) {
-        const avg = (key) => {
-            const vals = metrics.map(m => m[key] || m[`bio_${key}`]).filter(v => v !== undefined && !isNaN(v));
-            return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
-        };
+    // ── Gait Metrics Rendering ─────────────────────────────────────────────────
+    // NOTE: setVal runs unconditionally — existing cards use bioSummary as primary,
+    // new gait cards use playerSummary directly. Neither requires frameMetrics to be loaded.
+    const metrics = envelope.frameMetrics;
+    const bioSummary = envelope.biomechanicsSummary || {};
 
-        const setVal = (id, val, unit = '') => {
-            const el = document.getElementById(id);
-            if (el) el.textContent = `${val.toFixed(id.includes('Width') ? 2 : 1)}${unit}`;
-        };
+    console.log('[Dashboard] updateSummary: playerSummary =', s);
+    console.log('[Dashboard] updateSummary: biomechanicsSummary =', bioSummary);
+    console.log('[Dashboard] updateSummary: frameMetrics length =', metrics.length);
 
-        setVal('valStepWidth', s.avg_stride_length * 0.12, ' m'); 
-        setVal('valTrunkLean', Math.abs(avg('trunk_lean')), '°');
-        setVal('valDoubleSupport', s.double_support_pct || 0, '%'); 
-        setVal('valPelvicRot', Math.abs(s.avg_pelvic_rotation || 0), '°');
-        setVal('valTrunkSag', Math.abs(avg('bio_trunk_sagittal_lean')), '°');
-        setVal('valArmSwing', avg('bio_left_arm_swing'), '°');
+    const setVal = (id, val, unit = '', precision = null) => {
+        const el = document.getElementById(id);
+        if (!el) {
+            console.warn(`[Dashboard] setVal: element #${id} NOT FOUND in DOM`);
+            return;
+        }
+        // Default precision: 2 for width/stride/time, 1 for angles etc.
+        const p = precision !== null ? precision :
+                 (id.toLowerCase().includes('width') || id.toLowerCase().includes('stride') || id.toLowerCase().includes('time') ? 2 : 1);
+        const num = toNumber(val, null);
+        if (num === null) {
+            // val was non-numeric — keep placeholder
+            console.log(`[Dashboard] setVal: #${id} — value missing/non-numeric (raw: ${val}), keeping placeholder`);
+            return;
+        }
+        el.textContent = `${num.toFixed(p)}${unit}`;
+    };
+
+    try {
+        // Biometric detail cards — bioSummary is primary, frame averages are fallback only
+        setVal('valStepWidth',     getSummaryValue(bioSummary, ['step_width_mean'],          toNumber(s.avg_stride_length, 0) * 0.12), ' m');
+        setVal('valTrunkLean',     Math.abs(getSummaryValue(bioSummary, ['trunk_lateral_lean_mean'],  getMetricAverageFromKeys(metrics, ['trunk_lateral_lean', 'trunk_lean', 'bio_trunk_lateral_lean']))), '°');
+        setVal('valDoubleSupport', getSummaryValue(bioSummary, ['double_support_pct'],        toNumber(s.double_support_pct, 0)), '%');
+        setVal('valPelvicRot',     Math.abs(getSummaryValue(bioSummary, ['pelvis_rotation_mean'],     toNumber(s.avg_pelvic_rotation, 0))), '°');
+        setVal('valTrunkSag',      Math.abs(getSummaryValue(bioSummary, ['trunk_sagittal_lean_mean'], getMetricAverage(metrics, 'bio_trunk_sagittal_lean'))), '°');
+        setVal('valArmSwing',      getSummaryValue(bioSummary, ['arm_swing_asymmetry_mean', 'left_arm_swing_mean', 'right_arm_swing_mean'], getMetricAverage(metrics, 'bio_arm_swing_asymmetry')), '°');
+
+        // Gait metrics — read from playerSummary directly (multiple key aliases for resilience)
+        const strideLen   = s.avg_stride_length   ?? s.stride_length   ?? s.avgStrideLength;
+        const stepTime    = s.avg_step_time       ?? s.step_time       ?? s.avgStepTime;
+        const cadence     = s.avg_cadence         ?? s.cadence         ?? s.avgCadence;
+        const flightTime  = s.avg_flight_time     ?? s.flight_time     ?? s.avgFlightTime;
+
+        console.log('[Dashboard] Gait raw values — stride:', strideLen, 'stepTime:', stepTime, 'cadence:', cadence, 'flightTime:', flightTime);
+
+        setVal('valStrideLength', strideLen,   ' m');
+        setVal('valStepTime',     stepTime,    ' s');
+        setVal('valCadence',      cadence,     ' bpm', 1);
+        setVal('valFlightTime',   flightTime,  ' s');
+    } catch (gaitErr) {
+        console.error('[Dashboard] Error in gait setVal block:', gaitErr);
     }
 
-    document.getElementById('kpiEnergy').textContent = `${s.estimated_energy_kcal_hr.toFixed(0)} kcal/hr`;
-    document.getElementById('kpiDistance').textContent = `Dist: ${s.total_distance_m.toFixed(1)} m`;
-
-    document.getElementById('kpiSymmetry').textContent = `${s.gait_symmetry_pct.toFixed(1)} %`;
-    document.getElementById('kpiStride').textContent = `Stride: ${s.avg_stride_length.toFixed(2)} m`;
+    try {
+        const energyFallback = getMetricAverage(metrics, 'energy_expenditure');
+        const energySummary = toNumber(s.estimated_energy_kcal_hr, NaN);
+        const energyValue = Number.isFinite(energySummary) && energySummary > 0 ? energySummary : energyFallback;
+        document.getElementById('kpiEnergy').textContent = `${energyValue.toFixed(0)} kcal/hr`;
+        document.getElementById('kpiDistance').textContent = `Dist: ${toNumber(s.total_distance_m, 0).toFixed(1)} m`;
+        document.getElementById('kpiSymmetry').textContent = `${toNumber(s.gait_symmetry_pct, 0).toFixed(1)} %`;
+        document.getElementById('kpiStride').textContent = `Stride: ${toNumber(s.avg_stride_length, 0).toFixed(2)} m`;
+    } catch (kpiErr) {
+        console.error('[Dashboard] Error in KPI bottom block:', kpiErr);
+    }
 }
 
 function renderCharts(frames) {
@@ -383,7 +534,7 @@ function renderCharts(frames) {
 
     const step = Math.max(1, Math.floor(frames.length / 150));
     const sampledFrames = frames.filter((_, i) => i % step === 0);
-    const labels = sampledFrames.map(f => f.timestamp.toFixed(2) + 's');
+    const labels = sampledFrames.map(f => `${toNumber(f.timestamp, 0).toFixed(2)}s`);
     
     // --- Speed Chart ---
     const speedCtx = document.getElementById('speedChart').getContext('2d');
@@ -397,7 +548,7 @@ function renderCharts(frames) {
             labels: labels,
             datasets: [{
                 label: 'Speed (m/s)',
-                data: sampledFrames.map(f => f.speed),
+                data: sampledFrames.map(f => toNumber(f.speed, 0)),
                 borderColor: '#00f0ff',
                 backgroundColor: speedGradient,
                 fill: true,
@@ -416,7 +567,7 @@ function renderCharts(frames) {
             labels: labels,
             datasets: [{
                 label: 'L. Valgus',
-                data: sampledFrames.map(f => f.l_valgus_clinical),
+                data: sampledFrames.map(f => toNumber(f.l_valgus_clinical, 0)),
                 borderColor: '#ef4444',
                 tension: 0.4,
                 pointRadius: 0
@@ -439,7 +590,7 @@ function renderCharts(frames) {
             labels: labels,
             datasets: [{
                 label: 'Risk Score (%)',
-                data: sampledFrames.map(f => f.risk_score),
+                data: sampledFrames.map(f => toNumber(f.risk_score, 0)),
                 borderColor: '#ff00ff',
                 tension: 0.4,
                 pointRadius: 0
@@ -456,13 +607,13 @@ function renderCharts(frames) {
             labels: labels,
             datasets: [{
                 label: 'L. Knee Angle',
-                data: sampledFrames.map(f => f.left_knee_angle),
+                data: sampledFrames.map(f => toNumber(f.left_knee_angle, 0)),
                 borderColor: '#10b981',
                 borderWidth: 2,
                 pointRadius: 0
             }, {
                 label: 'R. Knee Angle',
-                data: sampledFrames.map(f => f.right_knee_angle),
+            data: sampledFrames.map(f => toNumber(f.right_knee_angle, 0)),
                 borderColor: '#8b5cf6',
                 borderWidth: 2,
                 pointRadius: 0
@@ -479,7 +630,7 @@ function renderCharts(frames) {
             labels: labels,
             datasets: [{
                 label: 'Trunk Lean (Deg)',
-                data: sampledFrames.map(f => f.trunk_lean),
+                data: sampledFrames.map(f => toNumber(f.trunk_lateral_lean ?? f.trunk_lean ?? f.bio_trunk_lateral_lean, 0)),
                 borderColor: '#60a5fa',
                 backgroundColor: 'rgba(96, 165, 250, 0.2)',
                 fill: true,

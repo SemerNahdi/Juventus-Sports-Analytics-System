@@ -2,6 +2,10 @@
 
 from .core import *  # noqa: F401,F403
 
+
+# TO DO 
+# Remove the Opensim caalcultion as i get them in sports2S natively 
+
 class OpenSimFileWriter:
     """
     Generates valid OpenSim input files from tracked pose data.
@@ -154,6 +158,172 @@ class OpenSimFileWriter:
         except Exception as e:
             print(f"[MOT] Failed to write {path}: {e}")
             return False
+
+
+def export_unified_results(analyzer, json_path: str, csv_path: str,
+                           trc_path: Optional[str] = None,
+                           mot_path: Optional[str] = None):
+    """Standalone result exporter for SportsAnalyzer results."""
+    import csv as _csv
+    import json
+    from pathlib import Path
+    from dataclasses import asdict
+    from .math_utils import clean_nans
+
+    export_jsonl = os.getenv("ANALYTICS_EXPORT_JSONL", "0").strip() in ("1", "true", "True", "yes", "YES")
+
+    bio_by_frame: dict = {}
+    if analyzer.bio_engine and analyzer.bio_engine.frames:
+        for bf in analyzer.bio_engine.frames:
+            bio_by_frame[bf.frame_idx] = asdict(bf)
+
+    s2d_angle_summary: dict = {}
+    s2d_pose_summary:  dict = {}
+    s2d_mot_df: Optional[pd.DataFrame] = None
+    
+    if analyzer.sports2d_runner:
+        s2d_mot_df = analyzer.sports2d_runner.load_mot_angles()
+        if s2d_mot_df is not None and not s2d_mot_df.empty:
+            angle_cols = [c for c in s2d_mot_df.columns if c.lower() != "time"]
+            for col in angle_cols:
+                try:
+                    vals = pd.to_numeric(s2d_mot_df[col], errors="coerce").dropna()
+                    if len(vals):
+                        s2d_angle_summary[col] = {
+                            "mean": float(vals.mean()),
+                            "max":  float(vals.max()),
+                            "min":  float(vals.min()),
+                            "std":  float(vals.std()),
+                        }
+                except (ValueError, TypeError, KeyError):
+                    pass
+        trc_df = analyzer.sports2d_runner.load_trc_pose(metres=True)
+        if trc_df is not None and not trc_df.empty:
+            s2d_pose_summary["trc_shape"] = list(trc_df.shape)
+            s2d_pose_summary["trc_columns"] = list(trc_df.columns)
+
+    payload = {
+        "metadata": {
+            "player_id":   analyzer.player_id,
+            "video_path":  analyzer.video_path,
+            "fps":         analyzer._fps_cache,
+            "pix_to_m":    analyzer.PIX_TO_M,
+            "total_frames": len(analyzer.frame_metrics),
+            "angle_backend": "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy",
+        },
+        "player_summary":   asdict(analyzer.summary),
+        "biomechanics_summary": analyzer.bio_engine.summary_dict() if analyzer.bio_engine else {},
+        "sports2d_angle_summary": s2d_angle_summary,
+        "sports2d_pose_summary":  s2d_pose_summary,
+        "sports2d_output_files":  analyzer.sports2d_runner.outputs if analyzer.sports2d_runner else {},
+    }
+
+    payload = clean_nans(payload)
+
+    mot_by_ts: dict[float, dict] = {}
+    if s2d_mot_df is not None and not s2d_mot_df.empty and "time" in s2d_mot_df.columns:
+        try:
+            sdf = s2d_mot_df.rename(columns={"time": "timestamp"})
+            sdf["timestamp"] = pd.to_numeric(sdf["timestamp"], errors="coerce").round(3)
+            angle_cols = [c for c in sdf.columns if c != "timestamp"]
+            for _, r in sdf.iterrows():
+                ts = r.get("timestamp")
+                if ts is None or (isinstance(ts, float) and np.isnan(ts)):
+                    continue
+                row = {}
+                for c in angle_cols:
+                    row[f"s2d_{c}"] = r.get(c)
+                mot_by_ts[float(ts)] = row
+        except (ValueError, TypeError, KeyError):
+            mot_by_ts = {}
+
+    n_frames = 0
+    csv_f = None
+    jf = None
+    csv_writer = None
+
+    jsonl_path = str(Path(json_path).with_suffix(".jsonl"))
+    out_json_path = jsonl_path if export_jsonl else json_path
+
+    try:
+        jf = open(out_json_path, "w", encoding="utf-8")
+        csv_f = open(csv_path, "w", encoding="utf-8", newline="")
+
+        if export_jsonl:
+            jf.write(json.dumps(payload, default=str) + "\n")
+        else:
+            jf.write("{\n")
+            keys = list(payload.keys())
+            for k in keys:
+                if k == "frames":
+                    continue
+                jf.write(json.dumps(k) + ": " + json.dumps(payload[k], indent=2, default=str) + ",\n")
+            jf.write("\"frames\": [\n")
+
+        for fm in analyzer.frame_metrics:
+            record = asdict(fm)
+            bio = bio_by_frame.get(fm.frame_idx, {})
+            for k, v in bio.items():
+                if k not in ("frame_idx", "timestamp"):
+                    record[f"bio_{k}"] = v
+
+            ts_key = round(float(record.get("timestamp", 0.0)), 3)
+            extra = mot_by_ts.get(ts_key)
+            if extra:
+                record.update(extra)
+
+            record = clean_nans(record)
+
+            if csv_writer is None:
+                csv_writer = _csv.DictWriter(csv_f, fieldnames=list(record.keys()), extrasaction="ignore")
+                csv_writer.writeheader()
+            csv_writer.writerow(record)
+
+            if export_jsonl:
+                jf.write(json.dumps(record, default=str) + "\n")
+            else:
+                if n_frames > 0:
+                    jf.write(",\n")
+                jf.write(json.dumps(record, default=str))
+
+            n_frames += 1
+
+        if export_jsonl:
+            print(f"[EXPORT] data_output.jsonl → {out_json_path}  ({n_frames} frames)")
+        else:
+            jf.write("\n]\n}\n")
+            print(f"[EXPORT] data_output.json → {out_json_path}  ({n_frames} frames)")
+
+    finally:
+        if jf is not None:
+            try:
+                jf.close()
+            except Exception:
+                pass
+        if csv_f is not None:
+            try:
+                csv_f.close()
+            except Exception:
+                pass
+
+    if (trc_path and analyzer.pose_frames) or (mot_path and analyzer.bio_engine and analyzer.bio_engine.frames):
+        writer = OpenSimFileWriter()
+        if trc_path and analyzer.pose_frames:
+            writer.write_trc(
+                pose_frames     = analyzer.pose_frames,
+                path            = trc_path,
+                fps             = analyzer._fps_cache,
+                pix_to_m        = analyzer.PIX_TO_M or 0.002,
+                frame_height_px = analyzer._frame_height_px or 720,
+            )
+        if mot_path and analyzer.bio_engine and analyzer.bio_engine.frames:
+            writer.write_mot(
+                bio_frames = analyzer.bio_engine.frames,
+                path       = mot_path,
+                fps        = analyzer._fps_cache,
+            )
+
+    return payload
 
 
 # ══════════════════════════════════════════════════════════════════════════════

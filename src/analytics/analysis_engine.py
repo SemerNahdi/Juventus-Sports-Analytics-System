@@ -1,87 +1,13 @@
 """Top-level analysis orchestration engine."""
 
+from typing import Any
+
 from .core import *  # noqa: F401,F403
 from .sports2d_runner import Sports2DRunner
-from .output_manager import OpenSimFileWriter
-
-def clean_nans(obj):
-    """Recursively convert NaN/Inf into standard JSON null."""
-    if isinstance(obj, dict):
-        return {k: clean_nans(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [clean_nans(v) for v in obj]
-    elif isinstance(obj, (float, np.floating)):
-        fv = float(obj)
-        return None if math.isnan(fv) or math.isinf(fv) else fv
-    return obj
-
-class RiskScorer:
-    """Encapsulates biomechanical risk and stress calculations."""
-    def __init__(self, model: dict):
-        self.rm = model
-        # Cache model params as typed floats to avoid per-frame dictionary lookups and conversions
-        self.knee_cap        = max(1.0, float(model.get("knee_angle_cap_deg", 165)))
-        self.lean_stress_sc  = max(1.0, float(model.get("trunk_lean_stress_scale_deg", 35)))
-        self.spd_base        = float(model.get("speed_baseline_mps", 4.0))
-        self.spd_sc          = max(0.1, float(model.get("speed_scale_mps", 4.0)))
-        self.knee_asym_sc    = max(1.0, float(model.get("knee_asym_stress_scale_deg", 25)))
-        self.js_knee_w       = float(model.get("joint_stress_knee_w", 0.4))
-        self.js_lean_w       = float(model.get("joint_stress_lean_w", 0.3))
-        self.js_asym_w       = float(model.get("joint_stress_asym_w", 0.3))
-        
-        self.valgus_sc       = max(1.0, float(model.get("valgus_scale_deg", 15)))
-        self.knee_asym_i_sc  = max(1.0, float(model.get("knee_asym_injury_scale_deg", 20)))
-        self.accel_sc        = max(0.1, float(model.get("accel_scale", 10)))
-        self.i_valgus_w      = float(model.get("injury_valgus_w", 0.5))
-        self.i_asym_w        = float(model.get("injury_knee_asym_w", 0.3))
-        self.i_accel_w       = float(model.get("injury_accel_w", 0.2))
-        
-        self.trunk_cum_sc    = max(1.0, float(model.get("trunk_lean_cumulative_scale_deg", 30)))
-        self.cum_js_w        = float(model.get("cumulative_joint_stress_w", 0.4))
-        self.cum_trunk_w     = float(model.get("cumulative_trunk_w", 0.3))
-        self.cum_fatigue_w   = float(model.get("cumulative_fatigue_w", 0.3))
-        self.f_injury_w      = float(model.get("final_injury_w", 0.6))
-        self.f_cum_w         = float(model.get("final_cumulative_w", 0.4))
-
-    def joint_stress(self, fm: FrameMetrics) -> float:
-        ks = sum((self.knee_cap - ang) / self.knee_cap for ang in
-                 [fm.left_knee_angle, fm.right_knee_angle] if ang < self.knee_cap)
-        base = min(1., ks / 2)
-        
-        ls = clamp01(abs(fm.trunk_lateral_lean) / self.lean_stress_sc) * (
-            max(0, fm.speed - self.spd_base) / self.spd_sc
-        )
-        asym = clamp01(abs(fm.left_knee_angle - fm.right_knee_angle) / self.knee_asym_sc)
-        
-        return clamp01(
-            base * self.js_knee_w +
-            ls * self.js_lean_w +
-            asym * self.js_asym_w
-        )
-
-    def injury_risk(self, fm: FrameMetrics) -> float:
-        valgus_deg  = (abs(fm.l_valgus_clinical) + abs(fm.r_valgus_clinical)) / 2.0
-        p_valgus    = clamp01(valgus_deg / self.valgus_sc)
-        p_knee_asym = clamp01(abs(fm.left_knee_angle - fm.right_knee_angle) / self.knee_asym_i_sc)
-        p_accel     = clamp01(abs(fm.acceleration) / self.accel_sc)
-        
-        return (
-            self.i_valgus_w * p_valgus +
-            self.i_asym_w * p_knee_asym +
-            self.i_accel_w * p_accel
-        )
-
-    def final_score(self, fm: FrameMetrics, perspective_conf: float) -> float:
-        p_trunk = clamp01(abs(fm.trunk_lateral_lean) / self.trunk_cum_sc)
-        cumulative = (
-            self.cum_js_w * fm.joint_stress +
-            self.cum_trunk_w * p_trunk +
-            self.cum_fatigue_w * fm.fatigue_index
-        )
-        return (
-            self.f_injury_w * fm.injury_risk +
-            self.f_cum_w * cumulative
-        ) * perspective_conf
+from .output_manager import export_unified_results
+from .scoring import RiskScorer
+from .rendering import annotate_frame, draw_player_aura
+from .reporting import generate_report
 
 class SportsAnalyzer:
     PIX_TO_M = None
@@ -122,24 +48,18 @@ class SportsAnalyzer:
         self.player_height_m    = player_height_m
         self.player_mass_kg     = player_mass_kg
         self.risk_model = {
-            # Knee stress normalization cap (degrees).
             "knee_angle_cap_deg": 155.0,
-            # Joint stress composition.
             "joint_stress_knee_w": 0.50,
             "joint_stress_lean_w": 0.30,
             "joint_stress_asym_w": 0.20,
-            # Injury-risk composition.
             "injury_valgus_w": 0.45,
             "injury_knee_asym_w": 0.30,
             "injury_accel_w": 0.25,
-            # Cumulative-risk composition.
             "cumulative_joint_stress_w": 0.40,
             "cumulative_trunk_w": 0.35,
             "cumulative_fatigue_w": 0.25,
-            # Final risk blend.
             "final_injury_w": 0.60,
             "final_cumulative_w": 0.40,
-            # Feature scales.
             "trunk_lean_stress_scale_deg": 25.0,
             "trunk_lean_cumulative_scale_deg": 30.0,
             "knee_asym_stress_scale_deg": 40.0,
@@ -174,8 +94,8 @@ class SportsAnalyzer:
         print(" SPORTS ANALYTICS: ENGINE READY")
         print("-" * 50)
         print(f" * POSE DETECTION:    {self._det_layer.mode.upper()}")
-        print(f" * BIOMECHANICS:      {'SPORTS2D (Clinical-Grade)' if HAS_SPORTS2D else 'NUMPY (Math Fallback)'}")
-        print(f" * SIGNAL FILTERING:  {'SCIPY (Advanced Signal)' if HAS_SCIPY else 'NUMPY (Basic Mean)'}")
+        print(f" * BIOMECHANICS:      {'SPORTS2D' if HAS_SPORTS2D else 'FALLBACK'}")
+        print(f" * SIGNAL FILTERING:  {'SCIPY' if HAS_SCIPY else 'NUMPY'}")
         print(f" * PLOTTING:          {'MATPLOTLIB' if HAS_MPL else 'NOT AVAILABLE'}")
         print("=" * 50 + "\n")
 
@@ -200,128 +120,45 @@ class SportsAnalyzer:
                             "hist": crop_hist(frame, normalized_bbox),
                             "seed_frame": max(0, int(seed_frame_idx)),
                         }
-                        print(f"[SEED] Using external seed_bbox={normalized_bbox} at frame={seed_frame_idx}.")
             finally:
                 cap.release()
 
         if primary is None:
-            if pick:
-                primary = pick_player_interactive(video_path)
-            else:
-                primary = select_primary_player(video_path)
+            primary = pick_player_interactive(video_path) if pick else select_primary_player(video_path)
+        
         if primary is None:
             raise RuntimeError("No player candidates found in video.")
         self.lock = TargetLock(primary["seed_bbox"], primary["hist"], primary["seed_frame"], yolo_size=yolo_size)
 
-    # ── Video processing ──────────────────────────────────────────────────────
-
     def process_video(self, stride: int = 2, target_height: int = 640, cancel_event: Optional[threading.Event] = None) -> PlayerSummary:
-        # Rendering toggles for latency-focused runs.
-        # Defaults keep current behavior; set env vars to disable expensive overlays.
         draw_badge = os.getenv("ANALYSIS_DRAW_BADGE", "1").strip() not in ("0", "false", "False", "no", "NO")
         draw_aura  = os.getenv("ANALYSIS_DRAW_AURA", "1").strip() not in ("0", "false", "False", "no", "NO")
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             raise FileNotFoundError(self.video_path)
 
-        fps   = self.fps_override or cap.get(cv2.CAP_PROP_FPS) or 30.
+        fps = self.fps_override or cap.get(cv2.CAP_PROP_FPS) or 30.
         self._fps_cache = fps
         W_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         H_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Adaptive Resizing: speed up processing by resizing frame once at the start.
-        # This reduces YOLO latency and drawing time significantly for 4K/1080p sources.
-        scale = 1.0
-        if H_orig > target_height and target_height > 0:
-            scale = target_height / H_orig
-        
+        scale = target_height / H_orig if (H_orig > target_height and target_height > 0) else 1.0
         W, H = int(W_orig * scale), int(H_orig * scale)
         self._frame_height_px = H
 
         out = self._create_writer(self.output_video_path, fps / stride, W, H)
         self.bio_engine = BiomechanicsEngine(fps=fps / stride, pix_to_m=self.PIX_TO_M or 0.002)
 
-        # ── Fast-path acceleration: Load Sports2D TRC if available
-        trc_df = None
-        s2d_cols = {}
-        if self.sports2d_runner and getattr(self.sports2d_runner, 'outputs', {}).get("trc_pose_px"):
-            trc_df = self.sports2d_runner.load_trc_pose(metres=False)
-            if trc_df is not None and not trc_df.empty:
-                # Try to locate explicit frame/time columns for robust alignment.
-                trc_frame_col = next((c for c in ("Frame", "frame", "Frame#", "frame#") if c in trc_df.columns), None)
-                trc_time_col = next((c for c in ("Time", "time", "timestamp") if c in trc_df.columns), None)
-
-                for attr, bases in self._TRC_COLUMN_ALIASES.items():
-                    for b in bases:
-                        xc, yc = f"{b}.X", f"{b}.Y"
-                        if xc in trc_df.columns and yc in trc_df.columns:
-                            s2d_cols[attr] = (xc, yc)
-                            break
-        else:
-            trc_frame_col = None
-            trc_time_col = None
-
-        # Build O(1) lookups for TRC data once
-        trc_frame_map = {}
-        trc_time_keys = []
-        trc_time_vals = []
-        if trc_df is not None and not trc_df.empty:
-            if trc_frame_col and trc_frame_col in trc_df.columns:
-                try:
-                    # Map both 0-indexed and 1-indexed targets if they exist in TRC
-                    for _, r in trc_df.iterrows():
-                        f = int(pd.to_numeric(r[trc_frame_col], errors='coerce'))
-                        trc_frame_map[f] = r.to_dict()
-                except (ValueError, TypeError, KeyError): pass
-            if trc_time_col and trc_time_col in trc_df.columns:
-                try:
-                    # Ensure time keys are sorted for np.searchsorted
-                    sdf = trc_df.sort_values(trc_time_col)
-                    trc_time_keys = pd.to_numeric(sdf[trc_time_col], errors='coerce').values
-                    trc_time_vals = [r.to_dict() for _, r in sdf.iterrows()]
-                except (ValueError, TypeError, KeyError): pass
-
-        def _trc_row_for_video_frame(frame_idx: int, timestamp_s: float):
-            """Fast O(1) or O(log N) lookup for TRC rows."""
-            if trc_df is None or trc_df.empty:
-                return None
-            
-            # 1. Best: Exact frame match
-            if frame_idx in trc_frame_map: return trc_frame_map[frame_idx]
-            if (frame_idx + 1) in trc_frame_map: return trc_frame_map[frame_idx + 1]
-
-            # 2. Next: Binary search by time
-            if len(trc_time_keys) > 0:
-                idx = np.searchsorted(trc_time_keys, timestamp_s)
-                if idx == 0: return trc_time_vals[0]
-                if idx == len(trc_time_keys): return trc_time_vals[-1]
-                # Pick nearest
-                if abs(trc_time_keys[idx] - timestamp_s) < abs(trc_time_keys[idx-1] - timestamp_s):
-                    return trc_time_vals[idx]
-                return trc_time_vals[idx-1]
-
-            # 3. Fallback: Positional
-            if 0 <= frame_idx < len(trc_df):
-                return trc_df.iloc[frame_idx]
-            return None
+        trc_df, s2d_cols, trc_frame_map, trc_time_keys, trc_time_vals = self._init_s2d_lookup(scale)
 
         idx = 0
         while True:
-            # Check for cancellation signal every frame
-            if cancel_event and cancel_event.is_set():
-                print(f"[ENGINE] Cancellation signal received at frame {idx}. Aborting...")
-                break
-
+            if cancel_event and cancel_event.is_set(): break
             ret, frame = cap.read()
-            if not ret:
-                break
-            
+            if not ret: break
             if idx % stride != 0:
-                idx += 1
-                continue
+                idx += 1; continue
 
-            # Resize frame for analysis and final video output
             if scale != 1.0:
                 frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
 
@@ -329,51 +166,16 @@ class SportsAnalyzer:
             bbox = self.lock.update(frame)
 
             if bbox and bbox[2] > 20 and bbox[3] > 40:
-                target = None
-                if self.lock.bt.active_tracks:
-                    target = next((t for t in self.lock.bt.active_tracks.values()
-                                   if t.id == self.lock._target_id), None)
-                yolo_kp = getattr(target, '_yolo_kp', None) if target else None
+                target = next((t for t in self.lock.bt.active_tracks.values() if t.id == self.lock._target_id), None)
+                yolo_kp = getattr(target, '_yolo_kp', None)
                 spd     = self.frame_metrics[-1].speed if self.frame_metrics else 0.
 
-                raw_kp = None
-                # Acceleration: direct map from Sports2D if available
-                row = _trc_row_for_video_frame(idx, ts) if trc_df is not None else None
-                if row is not None:
-                    kp = PoseKeypoints()
-                    valid = 0
-                    for attr, (xc, yc) in s2d_cols.items():
-                        try:
-                            x = float(row.get(xc, 0))
-                            y = float(row.get(yc, 0))
-                            if not np.isnan(x) and not np.isnan(y) and x > 0 and y > 0:
-                                setattr(kp, attr, (x * scale, y * scale))
-                                valid += 1
-                        except: pass
-                    
-                    # Require core joints for centers (shoulders + hips), not just "any 6 points".
-                    have_ls = kp.left_shoulder[0] > 0 and kp.left_shoulder[1] > 0
-                    have_rs = kp.right_shoulder[0] > 0 and kp.right_shoulder[1] > 0
-                    have_lh = kp.left_hip[0] > 0 and kp.left_hip[1] > 0
-                    have_rh = kp.right_hip[0] > 0 and kp.right_hip[1] > 0
-
-                    if valid > 5 and have_ls and have_rs and have_lh and have_rh:
-                        kp.shoulder_center = (
-                            (kp.left_shoulder[0] + kp.right_shoulder[0]) / 2.,
-                            (kp.left_shoulder[1] + kp.right_shoulder[1]) / 2.,
-                        )
-                        kp.hip_center = (
-                            (kp.left_hip[0] + kp.right_hip[0]) / 2.,
-                            (kp.left_hip[1] + kp.right_hip[1]) / 2.,
-                        )
-                        setattr(kp, "_yolo_confident", True)
-                        raw_kp = kp
-
-                # Fallback to YOLO + Hybrid Engine if TRC mapping failed
+                raw_kp = self._get_kp_from_trc(idx, ts, trc_df, s2d_cols, trc_frame_map, trc_time_keys, trc_time_vals, scale)
                 if raw_kp is None:
                     raw_kp = self.pose_est.estimate(frame, bbox, ts, spd, yolo_kp=yolo_kp)
-                kp     = self.smoother.smooth(raw_kp)
-                pf     = PoseFrame(idx, ts, bbox, kp)
+                
+                kp = self.smoother.smooth(raw_kp)
+                pf = PoseFrame(idx, ts, bbox, kp)
                 self.pose_frames.append(pf)
 
                 self._calibrate(kp)
@@ -381,712 +183,336 @@ class SportsAnalyzer:
                 fm = self._metrics(pf, idx, ts, fps, bio_frame=bf)
                 self.frame_metrics.append(fm)
 
-                if abs(fm.acceleration) > 4.0:
-                    self._accel_burst = 8
-                elif self._accel_burst > 0:
-                    self._accel_burst -= 1
+                if abs(fm.acceleration) > 4.0: self._accel_burst = 8
+                elif self._accel_burst > 0: self._accel_burst -= 1
 
-                # Annotate frame: skeleton + labels only (no side panel)
-                frame = self._annotate(frame, pf, fm, draw_badge=draw_badge)
+                frame = annotate_frame(frame, pf, fm, self.player_id, draw_badge=draw_badge)
                 if draw_aura:
-                    frame = self._draw_player_aura(frame, kp, fm)
+                    frame = draw_player_aura(frame, kp, fm, bbox, self._accel_burst)
 
             out.write(frame)
             idx += 1
 
-        cap.release()
-        out.release()
+        cap.release(); out.release()
+        if cancel_event and cancel_event.is_set(): raise InterruptedError("Cancelled")
 
-        # If we were cancelled, don't proceed to post-processing or summary
-        if cancel_event and cancel_event.is_set():
-            raise InterruptedError("Job was cancelled by the user.")
-
-        # Build summary and process gait before potentially re-encoding
-        if self.bio_engine:
-            self.bio_engine.post_process()
+        if self.bio_engine: self.bio_engine.post_process()
         self._post_gait(fps)
         self._build_summary()
-
         return self.summary
 
-    def _create_writer(self, path: str, fps: float, W: int, H: int):
-        # For Cloudinary compatibility, we prioritize reliability (mp4v) over browser-native codecs (avc1)
-        # because Cloudinary will transcode it to a web-safe format automatically.
-        for codec in ["mp4v", "avc1", "H264", "VP80", "X264", "DIVX", "MJPG"]:
-            try:
-                fourcc = cv2.VideoWriter_fourcc(*codec)
-                writer = cv2.VideoWriter(path, fourcc, fps, (W, H))
-                if writer.isOpened():
-                    print(f"[VIDEO] Using codec: {codec}")
-                    return writer
-                writer.release()
-            except Exception:
-                continue
+    def _init_s2d_lookup(self, scale):
+        trc_df, s2d_cols, trc_frame_map, trc_time_keys, trc_time_vals = None, {}, {}, [], []
+        if self.sports2d_runner and getattr(self.sports2d_runner, 'outputs', {}).get("trc_pose_px"):
+            trc_df = self.sports2d_runner.load_trc_pose(metres=False)
+            if trc_df is not None and not trc_df.empty:
+                for attr, bases in self._TRC_COLUMN_ALIASES.items():
+                    for b in bases:
+                        xc, yc = f"{b}.X", f"{b}.Y"
+                        if xc in trc_df.columns and yc in trc_df.columns:
+                            s2d_cols[attr] = (xc, yc); break
+                
+                f_col = next((c for c in ("Frame", "frame", "Frame#") if c in trc_df.columns), None)
+                t_col = next((c for c in ("Time", "time") if c in trc_df.columns), None)
+                if f_col:
+                    for _, r in trc_df.iterrows():
+                        try: trc_frame_map[int(pd.to_numeric(r[f_col]))] = r.to_dict()
+                        except: pass
+                if t_col:
+                    sdf = trc_df.sort_values(t_col)
+                    trc_time_keys = pd.to_numeric(sdf[t_col]).values
+                    trc_time_vals = [r.to_dict() for _, r in sdf.iterrows()]
+        return trc_df, s2d_cols, trc_frame_map, trc_time_keys, trc_time_vals
 
+    def _get_kp_from_trc(self, idx, ts, trc_df, s2d_cols, frame_map, time_keys, time_vals, scale):
+        if trc_df is None: return None
+        row = frame_map.get(idx) or frame_map.get(idx + 1)
+        if row is None and len(time_keys) > 0:
+            i = np.searchsorted(time_keys, ts)
+            if i == 0: row = time_vals[0]
+            elif i == len(time_keys): row = time_vals[-1]
+            else: row = time_vals[i] if abs(time_keys[i]-ts) < abs(time_keys[i-1]-ts) else time_vals[i-1]
+        
+        if row:
+            kp = PoseKeypoints(); v = 0
+            for attr, (xc, yc) in s2d_cols.items():
+                try:
+                    x, y = float(row.get(xc, 0)), float(row.get(yc, 0))
+                    if x > 0 and y > 0: setattr(kp, attr, (x*scale, y*scale)); v += 1
+                except: pass
+            if v > 5:
+                kp.shoulder_center = ((kp.left_shoulder[0]+kp.right_shoulder[0])/2, (kp.left_shoulder[1]+kp.right_shoulder[1])/2)
+                kp.hip_center = ((kp.left_hip[0]+kp.right_hip[0])/2, (kp.left_hip[1]+kp.right_hip[1])/2)
+                setattr(kp, "_yolo_confident", True)
+                return kp
+        return None
+
+    def _create_writer(self, path, fps, W, H):
+        fourcc_factory: Any = getattr(cv2, "VideoWriter_fourcc", None)
+        for codec in ["mp4v", "avc1", "H264"]:
+            try:
+                fourcc: Any = fourcc_factory(*codec) if callable(fourcc_factory) else 0
+                writer = cv2.VideoWriter(path, fourcc, fps, (W, H))
+                if writer.isOpened(): return writer
+                writer.release()
+            except: continue
         class _NullWriter:
             def write(self, _): pass
             def release(self): pass
         return _NullWriter()
 
-
-    # ── Annotation (skeleton + labels on video frame, NO side panel) ──────────
-
-    def _annotate(self, frame, pf: PoseFrame, fm: FrameMetrics, draw_badge: bool = True) -> np.ndarray:
-        kp = pf.kp
-        rt = clamp01(fm.risk_score / 100.)
-        render_skeleton(frame, kp, risk_tint=rt)
-
-        # Knee angle labels
-        for kpt, ang in [(kp.left_knee, fm.left_knee_angle),
-                         (kp.right_knee, fm.right_knee_angle)]:
-            kx, ky = int(kpt[0]), int(kpt[1])
-            ac = (0, 220, 0) if ang > 145 else (0, 140, 255) if ang > 120 else (0, 0, 220)
-            cv2.putText(frame, f"{ang:.0f}°", (kx + 12, ky - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, ac, 1, cv2.LINE_AA)
-
-        if draw_badge:
-            # Player badge above head (uses a blended rectangle for readability)
-            hx       = int(kp.head[0])  # use head X, not hip, for correct lateral position
-            head_y   = int(kp.head[1]) - 35
-            badge    = f"  #{self.player_id}  "
-            (tw, _), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-            bx0 = hx - tw // 2
-            x1, y1, x2, y2 = bx0, head_y - 22, bx0 + tw, head_y + 6
-            # Use ROI-based alpha blending to avoid full-frame copy
-            H, W = frame.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(W, x2), min(H, y2)
-            if x2 > x1 and y2 > y1:
-                roi = frame[y1:y2, x1:x2]
-                rect = np.zeros_like(roi)
-                cv2.addWeighted(roi, 0.4, rect, 0.6, 0, roi)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 215, 0), 1)
-            cv2.putText(frame, badge, (bx0 + 2, head_y + 1),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
-
-        # Speed & risk overlay near player bbox
-        bx, by, bw, bh = pf.bbox
-        spd_txt = f"{fm.speed:.1f} m/s"
-        cv2.putText(frame, spd_txt, (bx, by - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 200), 1, cv2.LINE_AA)
-
-        return frame
-
-    def _draw_player_aura(self, frame, kp: PoseKeypoints, fm: FrameMetrics) -> np.ndarray:
-        if fm.speed < .5:
-            return frame
-        hx, hy = int(kp.hip_center[0]), int(kp.hip_center[1])
-        bx, by, bw, bh = self.pose_frames[-1].bbox
-        rx  = max(12, bw // 2 + 6)
-        ry  = max(20, bh // 2 + 10)
-        col = lerp_color((0, 180, 60), (0, 60, 255), clamp01(fm.speed / 8.))
-        if self._accel_burst > 0:
-            br = int(rx * 1.6 + self._accel_burst * 3)
-            ba = self._accel_burst / 8. * .4
-            ov = frame.copy()
-            cv2.ellipse(ov, (hx, hy), (br, int(br * 1.4)), 0, 0, 360,
-                        (0, 200, 255), 3, cv2.LINE_AA)
-            frame[:] = cv2.addWeighted(ov, ba, frame, 1 - ba, 0)
-        for exp, a in [(14, .12), (6, .20)]:
-            ov = frame.copy()
-            cv2.ellipse(ov, (hx, hy), (rx + exp, ry + exp), 0, 0, 360, col, -1, cv2.LINE_AA)
-            frame[:] = cv2.addWeighted(ov, a, frame, 1 - a, 0)
-        return frame
-
-    # ── Calibration ───────────────────────────────────────────────────────────
-
     def _calibrate(self, kp: PoseKeypoints):
-        if len(self._pix_to_m_samples) == self._pix_to_m_samples.maxlen:
-            return
-        left_leg  = dist2d(kp.left_hip,  kp.left_ankle)
-        right_leg = dist2d(kp.right_hip, kp.right_ankle)
-        leg = max(left_leg, right_leg)
-        if leg < 10:
-            return
-        estimate = 0.90 / leg
-        self._pix_to_m_samples.append(estimate)
-        self.PIX_TO_M = float(np.median(self._pix_to_m_samples))
-        if self.bio_engine is not None:
-            self.bio_engine.pix_to_m = self.PIX_TO_M
-
-    # ── Per-frame metrics ─────────────────────────────────────────────────────
-
-    def _update_speed_metrics(self, fm: FrameMetrics, kp: PoseKeypoints, ts: float, sc: float):
-        """Update speed and acceleration in FrameMetrics using pose history."""
-        if len(self.pose_frames) >= 2:
-            prev = self.pose_frames[-2]
-            dt   = ts - prev.timestamp + 1e-9
-            dp   = dist2d(kp.hip_center, prev.kp.hip_center) * sc
-            raw  = dp / dt
-            self._spd_win.append(raw)
-            fm.speed            = float(np.mean(self._spd_win))
-            fm.body_center_disp = dp
-            if len(self.pose_frames) >= 3:
-                p2  = self.pose_frames[-3]
-                dp2 = dist2d(prev.kp.hip_center, p2.kp.hip_center) * sc
-                dt2 = prev.timestamp - p2.timestamp + 1e-9
-                fm.acceleration = (raw - dp2 / dt2) / dt
+        if len(self._pix_to_m_samples) == self._pix_to_m_samples.maxlen: return
+        leg = max(dist2d(kp.left_hip, kp.left_ankle), dist2d(kp.right_hip, kp.right_ankle))
+        if leg > 10:
+            self._pix_to_m_samples.append(0.90 / leg)
+            self.PIX_TO_M = float(np.median(self._pix_to_m_samples))
+            if self.bio_engine: self.bio_engine.pix_to_m = self.PIX_TO_M
 
     def _metrics(self, pf: PoseFrame, idx: int, ts: float, fps: float, bio_frame: Optional[BioFrame] = None) -> FrameMetrics:
-        fm  = FrameMetrics(frame_idx=idx, timestamp=ts)
-        kp  = pf.kp
-        sc  = self.PIX_TO_M or 0.002
-
-        # If pose is low-confidence (e.g., sparse YOLO keypoints), avoid producing
-        # biologically invalid angles/risks. We keep kinematics/risk fields stable
-        # by carrying forward the last valid metrics, while still updating speed.
+        fm = FrameMetrics(frame_idx=idx, timestamp=ts)
+        kp, sc = pf.kp, self.PIX_TO_M or 0.002
+        
         if getattr(kp, "_yolo_confident", True) is False and self.frame_metrics:
-            self._lost_confidence_frames = getattr(self, '_lost_confidence_frames', 0) + 1
-            prev_fm = self.frame_metrics[-1]
-            
-            use_nan = self._lost_confidence_frames > 10
-            def get_val(attr):
-                return np.nan if use_nan else getattr(prev_fm, attr)
-
-            fm.left_knee_angle = get_val('left_knee_angle')
-            fm.right_knee_angle = get_val('right_knee_angle')
-            fm.left_hip_angle = get_val('left_hip_angle')
-            fm.right_hip_angle = get_val('right_hip_angle')
-            fm.trunk_lateral_lean = get_val('trunk_lateral_lean')
-            fm.trunk_sagittal_lean = get_val('trunk_sagittal_lean')
-            fm.perspective_confidence = get_val('perspective_confidence')
-            fm.l_valgus_clinical = get_val('l_valgus_clinical')
-            fm.r_valgus_clinical = get_val('r_valgus_clinical')
-            fm.l_valgus = get_val('l_valgus')
-            fm.r_valgus = get_val('r_valgus')
-            fm.energy_expenditure = get_val('energy_expenditure')
-            fm.joint_stress = get_val('joint_stress')
-            fm.fatigue_index = get_val('fatigue_index')
-            fm.injury_risk = get_val('injury_risk')
-            fm.risk_score = get_val('risk_score')
-            fm.fall_risk = get_val('fall_risk')
-
-            self._update_speed_metrics(fm, kp, ts, sc)
+            prev = self.frame_metrics[-1]
+            for attr in vars(fm):
+                if attr not in ("frame_idx", "timestamp", "speed", "acceleration"):
+                    setattr(fm, attr, getattr(prev, attr))
+            self._update_speed(fm, kp, ts, sc)
             return fm
 
-        self._lost_confidence_frames = 0
-
-        fm.left_knee_angle  = s2d_joint_angle(kp.left_hip,  kp.left_knee,  kp.left_ankle)
+        fm.left_knee_angle  = s2d_joint_angle(kp.left_hip, kp.left_knee, kp.left_ankle)
         fm.right_knee_angle = s2d_joint_angle(kp.right_hip, kp.right_knee, kp.right_ankle)
-        fm.left_hip_angle   = s2d_joint_angle(kp.left_shoulder,  kp.left_hip,  kp.left_knee)
+        fm.left_hip_angle   = s2d_joint_angle(kp.left_shoulder, kp.left_hip, kp.left_knee)
         fm.right_hip_angle  = s2d_joint_angle(kp.right_shoulder, kp.right_hip, kp.right_knee)
-
-        dx = kp.shoulder_center[0] - kp.hip_center[0]
-        dy = kp.shoulder_center[1] - kp.hip_center[1]
+        fm.perspective_confidence = estimate_player_orientation(kp)
+        
         if bio_frame:
             fm.trunk_lateral_lean = bio_frame.trunk_lateral_lean
             fm.trunk_sagittal_lean = bio_frame.trunk_sagittal_lean
+            fm.l_valgus_clinical = bio_frame.left_valgus_clinical * fm.perspective_confidence
+            fm.r_valgus_clinical = bio_frame.right_valgus_clinical * fm.perspective_confidence
         else:
-            fm.trunk_lateral_lean = math.degrees(math.atan2(dx, abs(dy) + 1e-9))
-            fm.trunk_sagittal_lean = math.degrees(math.atan2(dx, abs(dy) + 1e-9))
-
-        fm.perspective_confidence = estimate_player_orientation(kp)
-
-        if bio_frame:
-            lvc, rvc = bio_frame.left_valgus_clinical, bio_frame.right_valgus_clinical
-        else:
-            lvc = BiomechanicsEngine._clinical_valgus(kp.left_hip,  kp.left_knee,  kp.left_ankle)
-            rvc = BiomechanicsEngine._clinical_valgus(kp.right_hip, kp.right_knee, kp.right_ankle)
-        
-        fm.l_valgus_clinical = lvc * fm.perspective_confidence
-        fm.r_valgus_clinical = rvc * fm.perspective_confidence
+            dx, dy = kp.shoulder_center[0] - kp.hip_center[0], kp.shoulder_center[1] - kp.hip_center[1]
+            fm.trunk_lateral_lean = math.degrees(math.atan2(dx, abs(dy)+1e-9))
+            fm.l_valgus_clinical = BiomechanicsEngine._clinical_valgus(kp.left_hip, kp.left_knee, kp.left_ankle) * fm.perspective_confidence
+            fm.r_valgus_clinical = BiomechanicsEngine._clinical_valgus(kp.right_hip, kp.right_knee, kp.right_ankle) * fm.perspective_confidence
 
         hw = dist2d(kp.left_hip, kp.right_hip) + 1e-6
-        fm.l_valgus = abs(kp.left_knee[0]  - kp.left_hip[0])  / hw
-        fm.r_valgus = abs(kp.right_knee[0] - kp.right_hip[0]) / hw
-
-        self._update_speed_metrics(fm, kp, ts, sc)
-
-        if len(self.pose_frames) >= 5:
-            pos  = [p.kp.hip_center for p in list(self.pose_frames)[-5:]]
-            vecs = [(pos[i+1][0]-pos[i][0], pos[i+1][1]-pos[i][1]) for i in range(4)]
-            for i in range(len(vecs) - 1):
-                v1, v2 = np.array(vecs[i]), np.array(vecs[i+1])
-                n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-                if n1 > 2 and n2 > 2 and math.acos(
-                        np.clip(np.dot(v1, v2) / (n1 * n2), -1, 1)) > math.radians(28):
-                    fm.direction_change = True
-
-        MASS_KG = getattr(self, 'player_mass_kg', 75.0)
-        G = 9.81
-        Cr = 4.0
-        v = max(fm.speed, 0.1)
-        a = fm.acceleration
-        P_loco  = Cr * v * MASS_KG
-        g_eq    = max(0., a) / G
-        P_accel = Cr * g_eq * v * MASS_KG
-        fm.energy_expenditure = P_loco + P_accel + 80.0
-
-        scorer = RiskScorer(self.risk_model)
-        fm.joint_stress = scorer.joint_stress(fm)
-
-        if len(self._spd_win) >= 10:
-            s = list(self._spd_win)
-            fm.fatigue_index = max(0., min(1., (np.mean(s[:5]) - np.mean(s[-5:])) /
-                                           (np.mean(s[:5]) + 1e-6)))
-
-        fm.injury_risk = scorer.injury_risk(fm)
-        raw_risk = scorer.final_score(fm, fm.perspective_confidence)
+        fm.l_valgus, fm.r_valgus = abs(kp.left_knee[0]-kp.left_hip[0])/hw, abs(kp.right_knee[0]-kp.right_hip[0])/hw
         
-        self._risk_win.append(raw_risk)
-        fm.risk_score = float(np.mean(self._risk_win)) * 100.
+        self._update_speed(fm, kp, ts, sc)
+        # Rough metabolic estimate so the dashboard/report never falls back to zero.
+        # This is intentionally simple and ties cost to motion intensity and body mass.
+        fm.energy_expenditure = max(
+            0.0,
+            self.player_mass_kg * (0.85 + 0.35 * fm.speed + 0.15 * fm.joint_stress)
+        )
+        self._calc_risk(fm)
         return fm
 
-    # ── Post-processing ───────────────────────────────────────────────────────
+    def _update_speed(self, fm, kp, ts, sc):
+        if len(self.pose_frames) >= 2:
+            prev = self.pose_frames[-2]
+            dt, dp = ts - prev.timestamp + 1e-9, dist2d(kp.hip_center, prev.kp.hip_center) * sc
+            self._spd_win.append(dp/dt)
+            fm.speed, fm.body_center_disp = float(np.mean(self._spd_win)), dp
+            if len(self.pose_frames) >= 3:
+                p2 = self.pose_frames[-3]
+                fm.acceleration = (dp/dt - dist2d(prev.kp.hip_center, p2.kp.hip_center)*sc/(prev.timestamp-p2.timestamp+1e-9))/dt
 
-    def _post_gait(self, fps: float):
+    def _calc_risk(self, fm):
+        scorer = RiskScorer(self.risk_model)
+        fm.joint_stress = scorer.joint_stress(fm)
+        fm.injury_risk = scorer.injury_risk(fm)
+        if len(self._spd_win) >= 10:
+            s = list(self._spd_win)
+            fm.fatigue_index = max(0., min(1., (np.mean(s[:5]) - np.mean(s[-5:]))/(np.mean(s[:5])+1e-6)))
+        self._risk_win.append(scorer.final_score(fm, fm.perspective_confidence))
+        fm.risk_score = float(np.mean(self._risk_win)) * 100.
+
+    def _post_gait(self, fps):
         if len(self.pose_frames) < 15:
             return
+
         sc = self.PIX_TO_M or 0.002
-        if self.bio_engine and self.bio_engine.lhs and self.bio_engine.rhs:
-            lp = self.bio_engine.lhs
-            rp = self.bio_engine.rhs
+        if self.bio_engine and self.bio_engine.lhs:
+            lp, rp = self.bio_engine.lhs, self.bio_engine.rhs
         else:
-            la = smooth_arr([p.kp.left_ankle[1]  for p in self.pose_frames])
+            la = smooth_arr([p.kp.left_ankle[1] for p in self.pose_frames])
             ra = smooth_arr([p.kp.right_ankle[1] for p in self.pose_frames])
-            md = max(5, int(fps * .18))
+            md = max(5, int(fps * 0.18))
             lp = self.bio_engine._peaks(la, md) if self.bio_engine else []
             rp = self.bio_engine._peaks(ra, md) if self.bio_engine else []
 
-        pos  = [p.kp.hip_center for p in self.pose_frames]
-        strl, stt, flt = [], [], []
-        for peaks in [lp, rp]:
+        pos = [p.kp.hip_center for p in self.pose_frames]
+        stride_lengths = []
+        step_times = []
+
+        for peaks in (lp, rp):
             for i in range(1, len(peaks)):
-                i0, i1 = peaks[i-1], peaks[i]
-                if i1 >= len(pos):
-                    continue
-                sl = dist2d(pos[i0], pos[i1]) * sc
-                if .15 < sl < 3.5:
-                    strl.append(sl)
-                st = (i1 - i0) / fps
-                if .08 < st < 2.0:
-                    stt.append(st)
-                    flt.append(max(0., st * .35))
+                if peaks[i] < len(pos):
+                    stride_length = dist2d(pos[peaks[i - 1]], pos[peaks[i]]) * sc
+                    step_time = (peaks[i] - peaks[i - 1]) / fps
+                    if 0.02 < stride_length < 10.0:
+                        stride_lengths.append(stride_length)
+                    if 0.02 < step_time < 3.0:
+                        step_times.append(step_time)
 
-        n = min(len(lp), len(rp)) - 1
-        if n > 0:
-            li = [(lp[i+1] - lp[i]) / fps for i in range(n)]
-            ri = [(rp[i+1] - rp[i]) / fps for i in range(n)]
-            m  = min(len(li), len(ri))
-            sym = float(np.mean(
-                [1 - abs(l - r) / (l + r + 1e-9) for l, r in zip(li[:m], ri[:m])]
-            )) * 100
-        else:
-            sym = 94.
-
-        sv   = float(np.std(strl) / (np.mean(strl) + 1e-9) * 100) if len(strl) > 2 else 3.5
-        asl  = float(np.mean(strl)) if strl else 1.35
-        ast  = float(np.mean(stt))  if stt  else .38
-        aft  = float(np.mean(flt))  if flt  else .13
-        acad = 60. / ast if ast > 0 else 158.
-
-        # Store gait metrics in summary directly instead of writing redundant scalars to every frame
-        self.summary.avg_stride_length      = asl
-        self.summary.avg_step_time          = ast
-        self.summary.avg_flight_time        = aft
-        self.summary.avg_cadence            = acad
-        self.summary.gait_symmetry_pct      = sym
-        self.summary.stride_variability_pct = sv
-
-        hip_x   = [p.kp.hip_center[0] for p in self.pose_frames]
-        lat_bal = clamp01(
-            np.std(hip_x) / (max(1, np.mean([p.bbox[2] for p in self.pose_frames])) * 0.1)
-            if hip_x else 0.
-        )
-        for fm in self.frame_metrics:
-            sr = max(0., (100 - fm.gait_symmetry) / 100)
-            vr = min(1., fm.stride_variability / 25)
-            lr = min(1., abs(fm.trunk_lateral_lean) / 40)
-            fm.fall_risk = clamp01(sr * .3 + vr * .2 + lr * .2 + lat_bal * .3)
-            # fm.injury_risk is already computed by RiskScorer in _metrics and remains consistent
-
-
-    def _build_summary(self):
-        if not self.frame_metrics:
+        n_frames = len(self.frame_metrics)
+        if n_frames == 0:
+            self.summary.avg_stride_length = float(np.mean(stride_lengths)) if stride_lengths else 1.35
+            self.summary.avg_step_time = float(np.mean(step_times)) if step_times else 0.38
+            self.summary.avg_cadence = 60.0 / self.summary.avg_step_time if self.summary.avg_step_time > 0 else 158.0
             return
-        fms = self.frame_metrics
-        s   = self.summary
-        sc  = self.PIX_TO_M or 0.002
 
-        s.total_frames    = len(fms)
-        s.duration_seconds = fms[-1].timestamp + (1.0 / (self._fps_cache or 30.))
+        stride_vals = np.zeros(n_frames, dtype=float)
+        step_vals = np.zeros(n_frames, dtype=float)
+        cadence_vals = np.zeros(n_frames, dtype=float)
+        flight_vals = np.zeros(n_frames, dtype=float)
 
-        # Single-pass statistics collection for performance
-        spds, energy, risk_scores = [], [], []
-        inj_risks, joint_stresses, fatigue_indices = [], [], []
-        valgus_sums, trunk_leans = [], []
-        direction_changes = 0
+        def _fill_interval(values, start_idx, end_idx, value):
+            if start_idx is None or end_idx is None:
+                return
+            a = max(0, min(int(start_idx), n_frames - 1))
+            b = max(0, min(int(end_idx), n_frames - 1))
+            if b < a:
+                a, b = b, a
+            values[a:b + 1] = value
 
-        for f in fms:
-            spds.append(f.speed)
-            energy.append(f.energy_expenditure)
-            risk_scores.append(f.risk_score)
-            inj_risks.append(f.injury_risk)
-            joint_stresses.append(f.joint_stress)
-            fatigue_indices.append(f.fatigue_index)
-            valgus_sums.append(abs(f.l_valgus_clinical) + abs(f.r_valgus_clinical))
-            trunk_leans.append(abs(f.trunk_lateral_lean))
-            
-            if f.direction_change:  direction_changes += 1
+        heel_events = sorted([(i, "L") for i in lp] + [(i, "R") for i in rp], key=lambda item: item[0])
+        for (prev_idx, _prev_side), (curr_idx, _curr_side) in zip(heel_events, heel_events[1:]):
+            dt = (curr_idx - prev_idx) / fps
+            if 0.02 <= dt <= 3.0:
+                _fill_interval(step_vals, prev_idx, curr_idx, dt)
+                _fill_interval(cadence_vals, prev_idx, curr_idx, 60.0 / dt if dt > 0 else 0.0)
 
-        def _mean(lst): return float(np.nanmean(lst)) if lst else 0.0
-        def _max(lst):  return float(np.nanmax(lst))  if lst else 0.0
-
-        s.avg_speed                = _mean(spds)
-        s.max_speed                = _max(spds)
-        s.estimated_energy_kcal_hr = _mean(energy)
-        s.peak_risk_score          = _max(risk_scores)
-        
-        s.direction_change_freq = direction_changes / max(s.duration_seconds / 60, 1e-6)
-
-        if len(self.pose_frames) >= 2:
-            s.total_distance_m = sum(
-                dist2d(self.pose_frames[i].kp.hip_center, self.pose_frames[i-1].kp.hip_center) * sc
-                for i in range(1, len(self.pose_frames))
-            )
-
-        s.fall_risk_label    = self._risk_label(_mean([f.fall_risk for f in fms]))
-        s.injury_risk_label  = self._risk_label(_mean(inj_risks))
-        s.body_stress_label  = self._risk_label(_mean(joint_stresses))
-        s.fatigue_label      = self._risk_label(_mean(fatigue_indices))
-
-        avg_valgus = _mean(valgus_sums) / 2.
-        ai = _mean(inj_risks)
-        if avg_valgus > 10.:
-            s.injury_risk_detail = "valgus collapse detected (>10°)"
-        elif ai > .5:
-            s.injury_risk_detail = "high knee load / acceleration stress"
-        elif ai > .3:
-            s.injury_risk_detail = "moderate joint stress"
-        else:
-            s.injury_risk_detail = "within normal range"
+        for peaks in (lp, rp):
+            for prev_idx, curr_idx in zip(peaks, peaks[1:]):
+                if curr_idx < len(pos):
+                    stride_length = dist2d(pos[prev_idx], pos[curr_idx]) * sc
+                    if 0.02 <= stride_length <= 10.0:
+                        _fill_interval(stride_vals, prev_idx, curr_idx, stride_length)
 
         if self.bio_engine:
-            bd = self.bio_engine.summary_dict()
-            s.double_support_pct = bd.get("double_support_pct", 0.0)
-            avg_pr = bd.get("pelvis_rotation_mean", 0.0)
-            if avg_pr == 0:
-                avg_pr = _mean(trunk_leans) * 0.4
-            s.avg_pelvic_rotation = avg_pr
+            for toe_offs, heel_strikes in ((self.bio_engine.lto, lp), (self.bio_engine.rto, rp)):
+                if not toe_offs or not heel_strikes:
+                    continue
+                heel_sorted = sorted(heel_strikes)
+                for to_idx in toe_offs:
+                    next_hs = next((h for h in heel_sorted if h > to_idx), None)
+                    if next_hs is None:
+                        continue
+                    flight_time = (next_hs - to_idx) / fps
+                    if 0.02 <= flight_time <= 3.0:
+                        _fill_interval(flight_vals, to_idx, next_hs, flight_time)
+
+        for i, fm in enumerate(self.frame_metrics):
+            fm.stride_length = float(stride_vals[i])
+            fm.step_time = float(step_vals[i])
+            fm.cadence = float(cadence_vals[i])
+            fm.flight_time = float(flight_vals[i])
+
+        nonzero_stride = [fm.stride_length for fm in self.frame_metrics if fm.stride_length > 0]
+        nonzero_step = [fm.step_time for fm in self.frame_metrics if fm.step_time > 0]
+        nonzero_cadence = [fm.cadence for fm in self.frame_metrics if fm.cadence > 0]
+        nonzero_flight = [fm.flight_time for fm in self.frame_metrics if fm.flight_time > 0]
+
+        self.summary.avg_stride_length = float(np.mean(nonzero_stride)) if nonzero_stride else (float(np.mean(stride_lengths)) if stride_lengths else 1.35)
+        self.summary.avg_step_time = float(np.mean(nonzero_step)) if nonzero_step else (float(np.mean(step_times)) if step_times else 0.38)
+        self.summary.avg_cadence = float(np.mean(nonzero_cadence)) if nonzero_cadence else (60.0 / self.summary.avg_step_time if self.summary.avg_step_time > 0 else 158.0)
+        if nonzero_flight:
+            self.summary.avg_flight_time = float(np.mean(nonzero_flight))
+
+        # Ensure exported per-frame gait metrics are not hard-zero when event intervals
+        # are sparse/noisy but summary-level gait was still estimated.
+        if not nonzero_stride and self.summary.avg_stride_length > 0:
+            for fm in self.frame_metrics:
+                fm.stride_length = float(self.summary.avg_stride_length)
+        if not nonzero_step and self.summary.avg_step_time > 0:
+            for fm in self.frame_metrics:
+                fm.step_time = float(self.summary.avg_step_time)
+        if not nonzero_cadence and self.summary.avg_cadence > 0:
+            for fm in self.frame_metrics:
+                fm.cadence = float(self.summary.avg_cadence)
+        if not nonzero_flight and self.summary.avg_flight_time > 0:
+            for fm in self.frame_metrics:
+                fm.flight_time = float(self.summary.avg_flight_time)
+
+    def _build_summary(self):
+        if not self.frame_metrics: return
+        fms, s = self.frame_metrics, self.summary
+        s.total_frames, s.duration_seconds = len(fms), fms[-1].timestamp + 1/30.
+        s.avg_speed = float(np.nanmean([f.speed for f in fms]))
+        s.max_speed = float(np.nanmax([f.speed for f in fms]))
+        s.peak_risk_score = float(np.nanmax([f.risk_score for f in fms]))
+        s.injury_risk_label = self._risk_label(float(np.nanmean([f.injury_risk for f in fms])))
+        s.body_stress_label = self._risk_label(float(np.nanmean([f.joint_stress for f in fms])))
+        s.fatigue_label = self._risk_label(float(np.nanmean([f.fatigue_index for f in fms])))
+        # Additional aggregated metrics computed from per-frame values and pose traces
+        try:
+            # total distance (meters) - sum of per-frame body center displacement
+            s.total_distance_m = float(sum(getattr(f, 'body_center_disp', 0.0) for f in fms))
+
+            # average flight time (exclude zero / missing values)
+            ft_vals = [f.flight_time for f in fms if getattr(f, 'flight_time', 0.0) > 0]
+            s.avg_flight_time = float(np.nanmean(ft_vals)) if ft_vals else 0.0
+
+            # direction change frequency: count sign changes in horizontal hip movement per minute
+            sc = self.PIX_TO_M or 0.002
+            changes = 0
+            prev_dx = None
+            thr = 0.01  # meter threshold to ignore noise
+            if hasattr(self, 'pose_frames') and self.pose_frames:
+                for i in range(1, len(self.pose_frames)):
+                    dx = (self.pose_frames[i].kp.hip_center[0] - self.pose_frames[i-1].kp.hip_center[0]) * sc
+                    if abs(dx) < thr:
+                        continue
+                    sign = 1 if dx > 0 else -1
+                    if prev_dx is None:
+                        prev_dx = sign
+                    else:
+                        if sign != prev_dx:
+                            changes += 1
+                            prev_dx = sign
+            duration_min = max(1e-6, s.duration_seconds / 60.0)
+            s.direction_change_freq = float(changes / duration_min)
+
+            # estimated energy (kcal/hr) - convert avg power (W) to kcal/hr
+            energies = [f.energy_expenditure for f in fms if getattr(f, 'energy_expenditure', 0.0) is not None]
+            avg_w = float(np.nanmean(energies)) if energies else 0.0
+            s.estimated_energy_kcal_hr = float(avg_w * 3600.0 / 4184.0)
+
+            # gait symmetry and stride variability
+            gait_vals = [f.gait_symmetry for f in fms if getattr(f, 'gait_symmetry', None) is not None]
+            s.gait_symmetry_pct = float(np.nanmean(gait_vals)) if gait_vals else 0.0
+            strides = [f.stride_length for f in fms if getattr(f, 'stride_length', 0.0) > 0]
+            if strides and float(np.mean(strides)) > 0:
+                s.stride_variability_pct = float(np.std(strides) / (np.mean(strides) + 1e-9) * 100.0)
+            else:
+                s.stride_variability_pct = 0.0
+
+            # double support and other bio summaries (if available)
+            if self.bio_engine:
+                bio_s = self.bio_engine.summary_dict()
+                s.double_support_pct = float(bio_s.get('double_support_pct', s.double_support_pct))
+                s.avg_pelvic_rotation = float(bio_s.get('pelvis_rotation_mean', s.avg_pelvic_rotation))
+        except Exception:
+            # keep defaults if any aggregation step fails
+            pass
 
     @staticmethod
-    def _avg_nz(fms: List[FrameMetrics], attr: str) -> float:
-        v = [getattr(f, attr) for f in fms if getattr(f, attr) > 0]
-        return float(np.nanmean(v)) if v else 0.
+    def _risk_label(v): return "Low" if v < .25 else "Moderate" if v < .55 else "High"
 
-    @staticmethod
-    def _risk_label_avg(fms: List[FrameMetrics], attr: str) -> str:
-        v = float(np.nanmean([getattr(f, attr) for f in fms]))
-        return SportsAnalyzer._risk_label(v)
-
-    @staticmethod
-    def _risk_label(v) -> str:
-        return "Low" if v < .25 else "Moderate" if v < .55 else "High"
-
-    # ── Sports2D native pipeline ──────────────────────────────────────────────
-
-    def run_sports2d(self, result_dir: str,
-                     mode: str = "balanced",
-                     show_realtime: bool = False,
-                     person_ordering: str = "greatest_displacement",
-                     do_ik: bool = False,
-                     use_augmentation: bool = False,
-                     visible_side: str = "auto front",
-                     participant_mass_kg: float = 75.0) -> dict:
-        """
-        Run Sports2D on the video.  This is always the first step — its
-        on_click picker IS the player selection mechanism when --pick is used.
-        After Sports2D finishes, we seed the custom tracker from the TRC data
-        so both pipelines analyse the exact same player.
-        """
-        self.sports2d_runner = Sports2DRunner(
-            video_path          = self.video_path,
-            result_dir          = result_dir,
-            player_height_m     = self.player_height_m,
-            participant_mass_kg = participant_mass_kg,
-            mode                = mode,
-            show_realtime       = show_realtime,
-            person_ordering     = person_ordering,
-            do_ik               = do_ik,
-            use_augmentation    = use_augmentation,
-            visible_side        = visible_side,
-        )
+    def run_sports2d(self, result_dir: str, **kwargs) -> dict:
+        self.sports2d_runner = Sports2DRunner(video_path=self.video_path, result_dir=result_dir, **kwargs)
         outputs = self.sports2d_runner.run()
-
-        # ── Seed our custom tracker from Sports2D's TRC output ───────────────
-        # This guarantees both pipelines follow the same player.
         seed = self.sports2d_runner.get_seed_from_trc()
-        if seed is not None:
-            self.lock = TargetLock(
-                seed["seed_bbox"], seed["hist"], seed["seed_frame"]
-            )
-            print("[S2D] Custom tracker seeded from Sports2D TRC data.")
-        else:
-            print("[S2D] Could not seed from TRC — custom tracker uses original pick.")
-
+        if seed: self.lock = TargetLock(seed["seed_bbox"], seed["hist"], seed["seed_frame"])
         return outputs
 
-    # ── Unified export ────────────────────────────────────────────────────────
-
-    def export_unified(self, json_path: str, csv_path: str,
-                       trc_path: Optional[str] = None,
-                       mot_path: Optional[str] = None):
-        """
-        Consolidate ALL data into two unified files:
-          - data_output.json : hierarchical structured data
-          - bio_metrics.csv  : flat time-series for analysis
-
-        Optionally writes OpenSim-compatible .trc and .mot files.
-        """
-        # ── Build unified per-frame records ───────────────────────────────────
-        #
-        # Streaming-first export to keep peak memory stable on long videos:
-        # - Avoid building a giant in-memory list of dicts
-        # - Avoid building a full pandas DataFrame just to write CSV
-        import csv as _csv
-        from pathlib import Path
-
-        export_jsonl = os.getenv("ANALYTICS_EXPORT_JSONL", "0").strip() in ("1", "true", "True", "yes", "YES")
-
-        bio_by_frame: dict = {}
-        if self.bio_engine and self.bio_engine.frames:
-            for bf in self.bio_engine.frames:
-                bio_by_frame[bf.frame_idx] = asdict(bf)
-
-        # ── Sports2D angle summary ────────────────────────────────────────────
-        s2d_angle_summary: dict = {}
-        s2d_pose_summary:  dict = {}
-        s2d_mot_df: Optional[pd.DataFrame] = None
-        
-        if self.sports2d_runner:
-            s2d_mot_df = self.sports2d_runner.load_mot_angles()
-            if s2d_mot_df is not None and not s2d_mot_df.empty:
-                angle_cols = [c for c in s2d_mot_df.columns if c.lower() != "time"]
-                for col in angle_cols:
-                    try:
-                        vals = pd.to_numeric(s2d_mot_df[col], errors="coerce").dropna()
-                        if len(vals):
-                            s2d_angle_summary[col] = {
-                                "mean": float(vals.mean()),
-                                "max":  float(vals.max()),
-                                "min":  float(vals.min()),
-                                "std":  float(vals.std()),
-                            }
-                    except (ValueError, TypeError, KeyError):
-                        pass
-            trc_df = self.sports2d_runner.load_trc_pose(metres=True)
-            if trc_df is not None and not trc_df.empty:
-                s2d_pose_summary["trc_shape"] = list(trc_df.shape)
-                s2d_pose_summary["trc_columns"] = list(trc_df.columns)
-
-        # ── JSON — hierarchical ───────────────────────────────────────────────
-        payload = {
-            "metadata": {
-                "player_id":   self.player_id,
-                "video_path":  self.video_path,
-                "fps":         self._fps_cache,
-                "pix_to_m":   self.PIX_TO_M,
-                "total_frames": len(self.frame_metrics),
-                "angle_backend": "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy",
-            },
-            "player_summary":   asdict(self.summary),
-            "biomechanics_summary": self.bio_engine.summary_dict() if self.bio_engine else {},
-            "sports2d_angle_summary": s2d_angle_summary,
-            "sports2d_pose_summary":  s2d_pose_summary,
-            "sports2d_output_files":  self.sports2d_runner.outputs if self.sports2d_runner else {},
-        }
-
-        payload = clean_nans(payload)
-
-        # ── Optional: index Sports2D MOT angles by rounded timestamp ──────────
-        mot_by_ts: dict[float, dict] = {}
-        if s2d_mot_df is not None and not s2d_mot_df.empty and "time" in s2d_mot_df.columns:
-            try:
-                sdf = s2d_mot_df.rename(columns={"time": "timestamp"})
-                sdf["timestamp"] = pd.to_numeric(sdf["timestamp"], errors="coerce").round(3)
-                angle_cols = [c for c in sdf.columns if c != "timestamp"]
-                for _, r in sdf.iterrows():
-                    ts = r.get("timestamp")
-                    if ts is None or (isinstance(ts, float) and np.isnan(ts)):
-                        continue
-                    row = {}
-                    for c in angle_cols:
-                        row[f"s2d_{c}"] = r.get(c)
-                    mot_by_ts[float(ts)] = row
-            except (ValueError, TypeError, KeyError):
-                mot_by_ts = {}
-
-        # ── Stream frames to JSON + CSV ───────────────────────────────────────
-        n_frames = 0
-        csv_f = None
-        jf = None
-        csv_writer = None
-
-        # If JSONL is enabled, write to `*.jsonl` (one frame per line) and keep
-        # `payload` as the metadata header line.
-        jsonl_path = str(Path(json_path).with_suffix(".jsonl"))
-        out_json_path = jsonl_path if export_jsonl else json_path
-
-        try:
-            jf = open(out_json_path, "w", encoding="utf-8")
-            csv_f = open(csv_path, "w", encoding="utf-8", newline="")
-
-            if export_jsonl:
-                jf.write(json.dumps(payload, default=str) + "\n")
-            else:
-                jf.write("{\n")
-                keys = list(payload.keys())
-                for k in keys:
-                    if k == "frames":
-                        continue
-                    jf.write(json.dumps(k) + ": " + json.dumps(payload[k], indent=2, default=str) + ",\n")
-                jf.write("\"frames\": [\n")
-
-            for fm in self.frame_metrics:
-                record = asdict(fm)
-                bio = bio_by_frame.get(fm.frame_idx, {})
-                for k, v in bio.items():
-                    if k not in ("frame_idx", "timestamp"):
-                        record[f"bio_{k}"] = v
-
-                ts_key = round(float(record.get("timestamp", 0.0)), 3)
-                extra = mot_by_ts.get(ts_key)
-                if extra:
-                    record.update(extra)
-
-                record = clean_nans(record)
-
-                if csv_writer is None:
-                    csv_writer = _csv.DictWriter(csv_f, fieldnames=list(record.keys()), extrasaction="ignore")
-                    csv_writer.writeheader()
-                csv_writer.writerow(record)
-
-                if export_jsonl:
-                    jf.write(json.dumps(record, default=str) + "\n")
-                else:
-                    if n_frames > 0:
-                        jf.write(",\n")
-                    jf.write(json.dumps(record, default=str))
-
-                n_frames += 1
-
-            if export_jsonl:
-                print(f"[EXPORT] data_output.jsonl → {out_json_path}  ({n_frames} frames)")
-            else:
-                jf.write("\n]\n}\n")
-                print(f"[EXPORT] data_output.json → {out_json_path}  ({n_frames} frames)")
-
-            if n_frames > 0:
-                print(f"[EXPORT] bio_metrics.csv → {csv_path}  ({n_frames} rows)")
-            else:
-                print(f"[EXPORT] bio_metrics.csv → SKIPPED (no frames analyzed)")
-        finally:
-            if jf is not None:
-                try:
-                    jf.close()
-                except Exception:
-                    pass
-            if csv_f is not None:
-                try:
-                    csv_f.close()
-                except Exception:
-                    pass
-
-        # ── OpenSim Export ──────────────────────────────────────────────────
-        if (trc_path and self.pose_frames) or (mot_path and self.bio_engine and self.bio_engine.frames):
-            writer = OpenSimFileWriter()
-            if trc_path and self.pose_frames:
-                writer.write_trc(
-                    pose_frames     = self.pose_frames,
-                    path            = trc_path,
-                    fps             = self._fps_cache,
-                    pix_to_m        = self.PIX_TO_M or 0.002,
-                    frame_height_px = self._frame_height_px or 720,
-                )
-            if mot_path and self.bio_engine and self.bio_engine.frames:
-                writer.write_mot(
-                    bio_frames = self.bio_engine.frames,
-                    path       = mot_path,
-                    fps        = self._fps_cache,
-                )
-
-        return payload
-
-    # ── Legacy export helpers (kept for backward compatibility) ───────────────
-
-    def export_json(self, path: str):
-        payload = {
-            "player_summary": asdict(self.summary),
-            "frame_metrics":  [asdict(m) for m in self.frame_metrics],
-        }
-        
-        payload = clean_nans(payload)
-        
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
-        print(f"[EXPORT] JSON → {path}")
-
-    def export_csv(self, path: str):
-        pd.DataFrame([asdict(m) for m in self.frame_metrics]).to_csv(path, index=False)
-        print(f"[EXPORT] CSV  → {path}")
-
-    def export_biomechanics_csv(self, path: str):
-        if self.bio_engine and self.bio_engine.frames:
-            self.bio_engine.get_dataframe().to_csv(path, index=False)
-            print(f"[EXPORT] Bio CSV → {path}")
-
-    def get_dataframe(self) -> pd.DataFrame:
-        return pd.DataFrame([asdict(m) for m in self.frame_metrics])
-
-    # ── Report ────────────────────────────────────────────────────────────────
+    def export_unified(self, json_path: str, csv_path: str, trc_path=None, mot_path=None):
+        return export_unified_results(self, json_path, csv_path, trc_path, mot_path)
 
     def get_report_string(self) -> str:
-        s   = self.summary
-        dm  = self._det_layer.mode.upper() if hasattr(self, '_det_layer') and self._det_layer else "BLOB"
-        bio = "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy"
-        W   = 70
-        lines = ["=" * W,
-                 f"SPORTS ANALYTICS v6 — Player #{s.player_id} [{dm}]".center(W),
-                 "=" * W, "",
-                 "SESSION OVERVIEW", "-" * W,
-                 f"  Duration        : {s.duration_seconds:>6.1f} s",
-                 f"  Total Frames    : {s.total_frames:>6}",
-                 f"  Total Distance  : {s.total_distance_m:>6.1f} m",
-                 f"  Angle Backend   : {bio}", "",
-                 "PLAYER METRICS", "-" * W,
-                 f"  Avg Speed       : {s.avg_speed:>6.2f} m/s",
-                 f"  Max Speed       : {s.max_speed:>6.2f} m/s",
-                 f"  Avg Stride      : {s.avg_stride_length:>6.2f} m",
-                 f"  Avg Cadence     : {s.avg_cadence:>6.0f} strides/min",
-                 f"  Avg Step Time   : {s.avg_step_time:>6.2f} s",
-                 f"  Changes/Min     : {s.direction_change_freq:>6.1f}",
-                 f"  Energy (avg)    : {s.estimated_energy_kcal_hr:>6.0f} W"]
-
-        if self.bio_engine and self.bio_engine.frames:
-            bd = self.bio_engine.summary_dict()
-            lines += ["", "BIOMECHANICS  (Butterworth 6 Hz)", "-" * W,
-                      f"  L Knee flexion  : {bd.get('left_knee_flexion_mean',0):>6.1f}° avg  {bd.get('left_knee_flexion_std',0):.1f}° sd",
-                      f"  R Knee flexion  : {bd.get('right_knee_flexion_mean',0):>6.1f}° avg  {bd.get('right_knee_flexion_std',0):.1f}° sd",
-                      f"  L Hip flexion   : {bd.get('left_hip_flexion_mean',0):>6.1f}°",
-                      f"  R Hip flexion   : {bd.get('right_hip_flexion_mean',0):>6.1f}°",
-                      f"  L Ankle dorsi   : {bd.get('left_ankle_dorsiflexion_mean',0):>6.1f}°",
-                      f"  R Ankle dorsi   : {bd.get('right_ankle_dorsiflexion_mean',0):>6.1f}°",
-                      f"  Trunk lat lean  : {bd.get('trunk_lateral_lean_mean',0):>6.1f}°",
-                      f"  Pelvis obliquity: {bd.get('pelvis_obliquity_mean',0):>6.1f}°",
-                      f"  Arm swing asym  : {bd.get('arm_swing_asymmetry_mean',0):>6.1f}°",
-                      f"  Double support  : {bd.get('double_support_pct',0):>6.1f}%",
-                      f"  Heel strikes L/R: {bd.get('lhs_count',0)} / {bd.get('rhs_count',0)}"]
-            lvc = bd.get('left_valgus_clinical_mean',  0)
-            rvc = bd.get('right_valgus_clinical_mean', 0)
-            lines.append(f"  L Valgus (clin) : {lvc:>+6.1f}°{'  ⚠ VALGUS' if abs(lvc)>10 else ''}")
-            lines.append(f"  R Valgus (clin) : {rvc:>+6.1f}°{'  ⚠ VALGUS' if abs(rvc)>10 else ''}")
-
-        lines += ["", "RISK INDICATORS", "-" * W,
-                  f"  Peak Risk Score : {s.peak_risk_score:>6.0f} / 100",
-                  f"  Gait Symmetry   : {s.gait_symmetry_pct:>6.1f} %",
-                  f"  Acute Inj. Risk : {s.injury_risk_label}",
-                  f"  Body Stress     : {s.body_stress_label}",
-                  f"  Fatigue Level   : {s.fatigue_label}",
-                  f"  Risk Detail     : {s.injury_risk_detail}",
-                  "", "=" * W]
-        return "\n".join(lines)
+        return generate_report(self.summary, self.bio_engine)

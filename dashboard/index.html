@@ -15,70 +15,11 @@
         .fade-in { animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
         
-        .upload-card {
-            max-width: 800px;
-            margin: 2rem auto;
-            width: 100%;
-        }
-
-        .step-indicator {
-            display: flex;
-            gap: 2rem;
-            margin-bottom: 2.5rem;
-            justify-content: center;
-        }
-
-        .step {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            color: var(--text-secondary);
-            font-weight: 600;
-            font-size: 0.9rem;
-        }
-
-        .step.active { color: var(--accent-neon); }
-        .step-num {
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            border: 2px solid currentColor;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 0.75rem;
-        }
-
-        .processing-view {
-            display: none;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            flex: 1;
-            text-align: center;
-        }
-
-        .loading-ring-large {
-            width: 150px;
-            height: 150px;
-            border: 4px solid rgba(0, 240, 255, 0.05);
-            border-top: 4px solid var(--accent-neon);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-bottom: 3rem;
-            position: relative;
-            box-shadow: 0 0 40px rgba(0, 240, 255, 0.1);
-        }
-
-        .loading-ring-large::after {
-            content: '';
-            position: absolute;
-            inset: 15px;
-            border: 4px solid rgba(0, 153, 255, 0.05);
-            border-bottom: 4px solid #0099ff;
-            border-radius: 50%;
-            animation: spin 1.5s linear reverse infinite;
-        }
+        .upload-card { max-width: 800px; margin: 2rem auto; width: 100%; }
+        .processing-view { display: none; flex-direction: column; align-items: center; justify-content: center; flex: 1; text-align: center; }
+        .loading-ring-large { width: 150px; height: 150px; border: 4px solid rgba(0, 240, 255, 0.05); border-top: 4px solid var(--accent-neon); border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 3rem; position: relative; box-shadow: 0 0 40px rgba(0, 240, 255, 0.1); }
+        .loading-ring-large::after { content: ''; position: absolute; inset: 15px; border: 4px solid rgba(0, 153, 255, 0.05); border-bottom: 4px solid #0099ff; border-radius: 50%; animation: spin 1.5s linear reverse infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -115,21 +56,15 @@
         <!-- Main Content -->
         <main class="main-content">
             
-            <!-- STEP 1: UPLOAD INTERFACE -->
+            <!-- UPLOAD INTERFACE -->
             <div id="uploadView" class="fade-in" style="width: 100%;">
                 <header class="analysis-header" style="margin-bottom: 3rem;">
                     <div>
                         <a href="dashboard.html" class="back-link"><i class="fa-solid fa-chevron-left"></i> Back to Dashboard</a>
                         <h1 style="font-size: 2.5rem; margin-top: 0.5rem;">New CV Analysis</h1>
-                        <p style="color: var(--text-secondary);">Initialize the AI biomechanics pipeline by uploading a session recording.</p>
+                        <p style="color: var(--text-secondary);">Upload a session recording for biomechanical analysis.</p>
                     </div>
                 </header>
-
-                <div class="step-indicator">
-                    <div class="step active"><div class="step-num">1</div> Session Config</div>
-                    <div class="step"><div class="step-num">2</div> AI Processing</div>
-                    <div class="step"><div class="step-num">3</div> Results</div>
-                </div>
 
                 <div class="upload-card card glass">
                     <form id="analysisForm">
@@ -140,54 +75,45 @@
                                     <label>Session Title</label>
                                     <input type="text" id="session_tags" name="session_tags" placeholder="e.g., Sprint Test - AC Milan" value="Match Performance">
                                 </div>
-                                <div class="form-grid" style="margin-bottom: 20px;">
-                                    <div class="form-group span-12">
-                                        <label for="player_id">Subject ID</label>
-                                        <input type="number" id="player_id" name="player_id" value="1" min="1">
-                                    </div>
-                                    <div class="form-group span-12" style="margin-top: 1rem;">
-                                        <label for="yolo_size">AI Engine Precision</label>
-                                        <select id="yolo_size" name="yolo_size" style="width: 100%;">
-                                            <option value="n">Nano (Real-time speed)</option>
-                                            <option value="s" selected>Standard (Balanced)</option>
-                                            <option value="m">Advanced (Clinical precision)</option>
-                                            <option value="l">Elite (Maximum depth)</option>
-                                        </select>
-                                    </div>
-                                    <!-- <div class="form-group span-12" style="margin-top: 1rem;">
-                                        <label for="email">Send results to Email (Optional)</label>
-                                        <input type="email" id="email" name="email" placeholder="e.g. coach@team.com" style="width: 100%;">
-                                    </div> -->
+                                <div class="form-group" style="margin-top: 1rem;">
+                                    <label for="yolo_size">AI Engine Precision</label>
+                                    <select id="yolo_size" name="yolo_size" style="width: 100%;">
+                                        <option value="n">Nano (Real-time speed)</option>
+                                        <option value="m">Medium</option>
+                                        <option value="l">Large (Best accuracy)</option>
+                                    </select>
                                 </div>
-                                <div class="checkbox-group" style="padding: 1rem; background: rgba(255,255,255,0.02); border-radius: 12px; border: 1px solid rgba(255,255,255,0.05);">
-                                    <input type="checkbox" id="run_sports2d" name="run_sports2d">
-                                    <div style="display: flex; flex-direction: column;">
-                                        <label for="run_sports2d" style="margin: 0; color: white;">Deep Biomechanics Pipeline</label>
-                                        <span style="font-size: 0.7rem; color: var(--text-secondary);">Enables joint torque and force estimation.</span>
-                                    </div>
+                                <div class="form-group" style="display: flex; align-items: center; gap: 1rem; margin-top: 1rem;">
+                                    <input type="checkbox" id="run_sports2d" name="run_sports2d" checked>
+                                    <label for="run_sports2d" style="margin: 0;">Enable 3D Joint Analysis</label>
+                                </div>
+                                <div class="form-group" style="display: flex; align-items: center; gap: 1rem;">
+                                    <input type="checkbox" id="pick" name="pick">
+                                    <label for="pick" style="margin: 0;">Manual Athlete Selection</label>
                                 </div>
                             </div>
 
-                            <!-- Right Column: Upload Area -->
-                            <div class="span-6">
-                                <div class="form-group" style="height: 100%;">
-                                    <label>Recording Source (.MP4)</label>
-                                    <div class="file-drop-zone" id="dropZone" style="height: calc(100% - 25px); min-height: 250px; display: flex; align-items: center; justify-content: center;">
-                                        <input type="file" id="file" name="file" accept="video/mp4" required>
-                                        <div class="drop-zone-text">
-                                            <div style="width: 60px; height: 60px; border-radius: 50%; background: rgba(0,240,255,0.1); display: flex; align-items: center; justify-content: center; margin-bottom: 1rem;">
-                                                <i class="fa-solid fa-upload" style="font-size: 1.5rem; color: var(--accent-neon);"></i>
-                                            </div>
-                                            <span style="font-weight: 600; color: white;">Drop video or click to browse</span>
-                                            <p style="font-size: 0.75rem; margin-top: 5px;">H.264 / MP4 up to 500MB</p>
-                                        </div>
+                            <!-- Right Column: File Upload -->
+                            <div class="span-6" style="display: flex; flex-direction: column; justify-content: space-between;">
+                                <div class="form-group">
+                                    <label>Video File (MP4, MOV, AVI)</label>
+                                    <div style="
+                                        border: 2px dashed rgba(0, 240, 255, 0.3);
+                                        border-radius: 12px;
+                                        padding: 2rem;
+                                        text-align: center;
+                                        cursor: pointer;
+                                        transition: all 0.3s ease;
+                                        background: rgba(0, 240, 255, 0.02);
+                                    " id="dropZone">
+                                        <i class="fa-solid fa-cloud-arrow-up" style="font-size: 2rem; color: var(--accent-neon); margin-bottom: 0.5rem; display: block;"></i>
+                                        <p style="color: var(--text-secondary); margin: 0.5rem 0;">Drag video here or <strong style="color: var(--accent-neon);">browse</strong></p>
+                                        <small style="color: rgba(255,255,255,0.4);">Max 500 MB</small>
+                                        <input type="file" id="file" name="file" accept="video/*" style="display: none;">
                                     </div>
                                 </div>
-                            </div>
-
-                            <div class="span-12" style="margin-top: 1rem;">
-                                <button type="submit" id="submitBtn" class="btn btn-primary" style="width: 100%; padding: 1.25rem; font-size: 1rem;">
-                                    <i class="fa-solid fa-play" style="margin-right: 10px;"></i> Start AI Analysis
+                                <button type="submit" id="submitBtn" class="btn btn-primary" style="width: 100%; margin-top: 1rem;">
+                                    <i class="fa-solid fa-play"></i> Start Analysis
                                 </button>
                             </div>
                         </div>
@@ -195,38 +121,40 @@
                 </div>
             </div>
 
-            <!-- STEP 2: PROCESSING STATE -->
-            <div id="processingView" class="processing-view fade-in">
+            <!-- PROCESSING INTERFACE -->
+            <div id="processingView" class="processing-view">
                 <div class="loading-ring-large"></div>
-                <h1 id="loaderTitle" style="font-size: 2.5rem; margin-bottom: 1rem;">Neural Network Active</h1>
-                <p id="loaderText" style="color: var(--text-secondary); font-size: 1.1rem; max-width: 500px; line-height: 1.6;">
-                    The Mitus AI Engine is currently processing your video frames. This includes pose estimation, trajectory mapping, and biomechanical modeling.
-                </p>
+                <h2 style="color: var(--text-secondary); margin-bottom: 1rem;">Processing Your Video</h2>
+                <p id="currentStatus" style="font-size: 1.2rem; color: var(--accent-neon); margin-bottom: 2rem;">Initializing AI Engine...</p>
                 
-                <div style="width: 100%; max-width: 600px; margin-top: 4rem;">
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 0.85rem; font-weight: 600;">
-                        <span id="currentStatus" style="color: var(--accent-neon);">INITIALIZING PIPELINE</span>
-                        <span id="progressPercent">0%</span>
+                <div style="width: 100%; max-width: 600px; margin: 0 auto 2rem;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
+                        <span style="color: var(--text-secondary); font-size: 0.9rem;">Progress</span>
+                        <span id="progressPercent" style="color: var(--accent-neon); font-weight: 600;">0%</span>
                     </div>
-                    <div class="progress-track" style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden;">
-                        <div class="progress-fill" id="progressBar" style="height: 100%; background: linear-gradient(90deg, var(--accent-neon), #0099ff); width: 0%; box-shadow: 0 0 20px rgba(0,240,255,0.3); transition: width 0.5s ease;"></div>
+                    <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 10px; overflow: hidden;">
+                        <div id="progressBar" style="width: 0%; height: 100%; background: linear-gradient(90deg, var(--accent-neon), #0099ff); transition: width 0.3s ease;"></div>
                     </div>
                 </div>
 
-                <div style="margin-top: 2rem;">
-                    <button id="cancelBtn" class="btn btn-secondary" style="border: 1px solid #ef4444; color: #ef4444; background: rgba(239, 68, 68, 0.05);">
-                        <i class="fa-solid fa-stop-circle" style="margin-right: 8px;"></i> Cancel Analysis
-                    </button>
-                </div>
+                <div id="logItems" style="
+                    width: 100%;
+                    max-width: 600px;
+                    max-height: 300px;
+                    overflow-y: auto;
+                    background: rgba(0, 0, 0, 0.3);
+                    border-radius: 8px;
+                    padding: 1rem;
+                    margin-bottom: 2rem;
+                    border: 1px solid rgba(0, 240, 255, 0.1);
+                "></div>
 
-                <div id="eventStream" class="glass" style="margin-top: 3rem; width: 100%; max-width: 600px; border-radius: 16px; padding: 1.5rem; text-align: left;">
-                    <h4 style="margin-bottom: 1rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-secondary); letter-spacing: 1px;">Telemetry Log</h4>
-                    <div id="logItems" style="display: flex; flex-direction: column; gap: 8px;">
-                        <!-- Logs will appear here -->
-                    </div>
-                </div>
+                <div id="loaderText" style="color: var(--text-secondary); margin-bottom: 2rem; min-height: 24px;"></div>
+
+                <button id="cancelBtn" class="btn btn-danger" style="padding: 0.75rem 1.5rem;">
+                    <i class="fa-solid fa-stop-circle"></i> Cancel Analysis
+                </button>
             </div>
-
         </main>
     </div>
 
@@ -241,6 +169,8 @@
         const logItems = document.getElementById('logItems');
         const loaderText = document.getElementById('loaderText');
         const cancelBtn = document.getElementById('cancelBtn');
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('file');
 
         function toggleSidebar() {
             document.querySelector('.sidebar').classList.toggle('collapsed');
@@ -317,13 +247,11 @@
                     currentStatus.style.color = "#ef4444";
                     loaderText.innerText = data.error || (data.status === 'cancelled' ? "Job stopped by user." : "A critical error occurred in the AI engine.");
                     
-                    // Show reset button or similar
                     submitBtn.disabled = false;
                     cancelBtn.style.display = 'none';
                     
                     addLog(data.status === 'cancelled' ? "JOB STOPPED: User Aborted" : "CRITICAL ERROR: " + (data.error || "Engine Stopped"));
                     
-                    // Allow returning to upload view after 3 seconds
                     setTimeout(() => {
                         if (confirm("Job " + data.status + ". Return to upload?")) {
                             window.location.reload();
@@ -363,56 +291,61 @@
             }
         };
 
+        // Drag and drop
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.style.borderColor = 'var(--accent-neon)';
+            dropZone.style.background = 'rgba(0, 240, 255, 0.05)';
+        });
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.style.borderColor = 'rgba(0, 240, 255, 0.3)';
+            dropZone.style.background = 'rgba(0, 240, 255, 0.02)';
+        });
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.style.borderColor = 'rgba(0, 240, 255, 0.3)';
+            dropZone.style.background = 'rgba(0, 240, 255, 0.02)';
+            fileInput.files = e.dataTransfer.files;
+        });
+        dropZone.addEventListener('click', () => fileInput.click());
+
         form.onsubmit = async (e) => {
             e.preventDefault();
             
-            const fileInput = document.getElementById('file');
             if (fileInput.files.length === 0) {
                 alert("Please select a video file.");
                 return;
             }
 
             submitBtn.disabled = true;
-            uploadView.style.display = 'none';
-            processingView.style.display = 'flex';
+            submitBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Uploading...';
             
-            addLog("Uploading high-resolution capture...");
+            const fd = new FormData(form);
+            const runSports2D = document.getElementById('run_sports2d').checked;
+            const pickManual = document.getElementById('pick').checked;
+            fd.set('run_sports2d', runSports2D ? 'true' : 'false');
+            fd.set('pick', pickManual ? 'true' : 'false');
             
-            const formData = new FormData(form);
             try {
-                const response = await fetch('/analyze', {
-                    method: 'POST',
-                    body: formData
-                });
-
+                const response = await fetch('/analyze', { method: 'POST', body: fd });
                 const data = await response.json();
+                
                 if (response.status === 202 || response.ok) {
+                    uploadView.style.display = 'none';
+                    processingView.style.display = 'flex';
+                    
                     addLog("Stream accepted by AI gateway.");
                     addLog("Job UUID: " + data.job_id);
+                    
                     localStorage.setItem('mitus_active_job_id', data.job_id);
                     pollInterval = setInterval(() => pollStatus(data.job_id), 2500);
                 } else {
                     throw new Error(data.detail || 'Analysis failed to start');
                 }
             } catch (err) {
-                processingView.style.display = 'none';
-                uploadView.style.display = 'block';
-                alert("Error initializing pipeline: " + err.message);
+                alert("Error: " + err.message);
                 submitBtn.disabled = false;
-            }
-        };
-
-        // File drop zone logic
-        const dropZone = document.getElementById('dropZone');
-        const fileInput = document.getElementById('file');
-
-        fileInput.onchange = () => {
-            if (fileInput.files.length > 0) {
-                const name = fileInput.files[0].name;
-                dropZone.querySelector('span').innerText = name;
-                dropZone.querySelector('span').style.color = "var(--accent-neon)";
-                dropZone.style.borderColor = "var(--accent-neon)";
-                addLog("File selected: " + name);
+                submitBtn.innerHTML = '<i class="fa-solid fa-play"></i> Start Analysis';
             }
         };
     </script>

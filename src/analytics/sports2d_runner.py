@@ -111,10 +111,10 @@ class Sports2DRunner:
             "pose": {
                 "pose_model":    "Body_with_feet",
                 "mode":          self.mode,
-                "det_frequency": 6,
+                "det_frequency": int(os.getenv("S2D_DET_FREQ", "6")),
                 "slowmo_factor": 1,
                 "backend":       "auto",
-                "device":        "auto",
+                "device":        os.getenv("S2D_DEVICE", "auto"),
                 "tracking_mode": "sports2d",
                 "keypoint_likelihood_threshold": 0.3,
                 "average_likelihood_threshold":  0.5,
