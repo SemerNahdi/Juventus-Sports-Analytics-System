@@ -1,6 +1,6 @@
 from .core import HAS_SPORTS2D, HAS_SCIPY
 
-def generate_report(s, bio_engine=None) -> str:
+def generate_report(s, bio_engine=None, mat_summary=None) -> str:
     """Generates a detailed summary report string."""
     dm  = "YOLO" # Default if not passed, but we can refine this
     bio = "sports2d" if HAS_SPORTS2D else "scipy" if HAS_SCIPY else "numpy"
@@ -12,16 +12,29 @@ def generate_report(s, bio_engine=None) -> str:
              f"  Duration        : {s.duration_seconds:>6.1f} s",
              f"  Total Frames    : {s.total_frames:>6}",
              f"  Total Distance  : {s.total_distance_m:>6.1f} m",
-             f"  Angle Backend   : {bio}", "",
-             "PLAYER METRICS", "-" * W,
-             f"  Avg Speed       : {s.avg_speed:>6.2f} m/s",
-             f"  Max Speed       : {s.max_speed:>6.2f} m/s",
-             f"  Avg Stride      : {s.avg_stride_length:>6.2f} m",
-             f"  Avg Cadence     : {s.avg_cadence:>6.0f} strides/min",
-             f"  Avg Step Time   : {s.avg_step_time:>6.2f} s",
-             f"  Avg Flight Time : {s.avg_flight_time:>6.2f} s",
-             f"  Changes/Min     : {s.direction_change_freq:>6.1f}",
-             f"  Energy (avg)    : {s.estimated_energy_kcal_hr:>6.0f} kcal/hr"]
+             f"  Angle Backend   : {bio}", ""]
+
+    if mat_summary:
+        lines += ["MAT PROTOCOL RESULTS", "-" * W,
+                  f"  Protocol        : {mat_summary.protocol_id}",
+                  f"  LSI Symmetry Index: {mat_summary.limb_symmetry_index:>6.1f} %", ""]
+        for i, ev in enumerate(mat_summary.events):
+            lines += [f"  Event #{i+1} ({ev.event_type})",
+                      f"    Flight Time   : {ev.flight_time:>6.2f} s",
+                      f"    Landing Valgus: {ev.landing_valgus_left:>6.1f}°",
+                      f"    Peak Flexion  : {ev.peak_knee_flexion_landing:>6.1f}°",
+                      f"    Stabilization : {ev.time_to_stabilization:>6.2f} s",
+                      f"    Hop Distance  : {ev.hop_distance_m:>6.2f} m", ""]
+
+    lines += ["PLAYER METRICS", "-" * W,
+              f"  Avg Speed       : {s.avg_speed:>6.2f} m/s",
+              f"  Max Speed       : {s.max_speed:>6.2f} m/s",
+              f"  Avg Stride      : {s.avg_stride_length:>6.2f} m",
+              f"  Avg Cadence     : {s.avg_cadence:>6.0f} strides/min",
+              f"  Avg Step Time   : {s.avg_step_time:>6.2f} s",
+              f"  Avg Flight Time : {s.avg_flight_time:>6.2f} s",
+              f"  Changes/Min     : {s.direction_change_freq:>6.1f}",
+              f"  Energy (avg)    : {s.estimated_energy_kcal_hr:>6.0f} kcal/hr"]
 
     if bio_engine and bio_engine.frames:
         bd = bio_engine.summary_dict()

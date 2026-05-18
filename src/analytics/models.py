@@ -1,5 +1,5 @@
 import numpy as np
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional, List, Tuple
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -191,4 +191,26 @@ class BioFrame:
     stance_right: bool = False
     double_support: bool = False
     step_width: float = 0.
-    foot_progression_angle: float = 0.
+@dataclass
+class MATEventKPIs:
+    """Key Performance Indicators for one MAT event."""
+    event_type: str  # "single_hop_left", "drop_vertical_jump", "sebt_reach_right"
+    flight_time: float = 0.
+    landing_valgus_left: float = 0.
+    landing_valgus_right: float = 0.
+    peak_knee_flexion_landing: float = 0.
+    time_to_stabilization: float = 0.
+    hop_distance_m: float = 0.
+    balance_score: float = 0.
+
+
+@dataclass
+class MATSummary:
+    """Session summary for MAT protocol testing."""
+    protocol_id: str
+    participant_id: int
+    limb_symmetry_index: float
+    events: List[MATEventKPIs] = field(default_factory=list)
+    average_landing_valgus: float = 0.
+    worst_landing_valgus: float = 0.
+    stability_trend: str = "stable"

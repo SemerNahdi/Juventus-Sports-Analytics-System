@@ -798,6 +798,100 @@ video {
 .checkbox-group {
     flex-direction: row !important;
     align-items: center;
+}
+
+/* Section Dividers */
+.section-divider {
+    font-size: 1.4rem;
+    font-weight: 800;
+    font-family: var(--font-heading);
+    color: var(--text-primary);
+    padding: 2rem 0 0.5rem 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    margin-bottom: 0.5rem;
+}
+
+.section-divider i {
+    color: var(--accent-neon);
+}
+
+.mat-divider {
+    color: var(--accent-neon);
+    text-shadow: 0 0 15px rgba(0, 240, 255, 0.3);
+}
+
+/* MAT Analysis Section */
+.mat-section {
+    background: linear-gradient(135deg, rgba(20, 22, 32, 0.7) 0%, rgba(10, 11, 16, 0.8) 100%) !important;
+    border-left: 4px solid var(--accent-neon) !important;
+}
+
+.mat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1.5rem;
+    margin-top: 1rem;
+}
+
+.mat-kpi-box {
+    background: rgba(255, 255, 255, 0.03);
+    padding: 1.25rem;
+    border-radius: 12px;
+    border: 1px solid var(--border-glass);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+    transition: all 0.3s ease;
+}
+
+.mat-kpi-box:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: var(--accent-neon);
+    transform: translateY(-2px);
+}
+
+.mat-kpi-box label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.5rem;
+}
+
+.mat-kpi-box .value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    font-family: var(--font-heading);
+    color: white;
+}
+
+.mat-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#matSymmetryBadge {
+    background: rgba(16, 185, 129, 0.2);
+    color: var(--risk-low);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.status-indicator {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    position: absolute;
+    top: 12px;
+    right: 12px;
+}
+
+.status-success { background: var(--risk-low); box-shadow: 0 0 8px var(--risk-low); }
+.status-warning { background: var(--risk-high); box-shadow: 0 0 8px var(--risk-high); }
     gap: 0.75rem !important;
     margin-top: 0.5rem;
 }

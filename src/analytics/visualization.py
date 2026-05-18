@@ -473,6 +473,57 @@ class AnalyticsPlotter:
         _plt.tight_layout()
         self._save(fig, "metabolic_power")
 
+    def plot_mat_results(self, mat_summary: "MATSummary"):
+        if not mat_summary or not mat_summary.events or not HAS_MPL:
+            return
+        import matplotlib.pyplot as _plt
+        
+        # ── MAT Performance Dashboard ─────────────────────────────────────────
+        fig = _plt.figure(figsize=(PlotStyle.FIG_WIDTH_SINGLE, PlotStyle.FIG_HEIGHT_DOUBLE),
+                          facecolor=PlotColors.BACKGROUND)
+        gs = fig.add_gridspec(1, 3, wspace=0.3)
+        ax1 = fig.add_subplot(gs[0]) # Valgus
+        ax2 = fig.add_subplot(gs[1]) # Flexion
+        ax3 = fig.add_subplot(gs[2]) # Flight/TTS
+
+        fig.suptitle(f"MAT Analysis — {mat_summary.protocol_id.replace('_', ' ').upper()}", 
+                    fontsize=PlotStyle.TITLE_SIZE + 2, color=PlotColors.TEXT, y=1.05)
+
+        event = mat_summary.events[0]
+        
+        # 1. Landing Valgus Bar
+        valgus_labels = ['Landing Valgus']
+        valgus_vals = [event.landing_valgus_left]
+        colors = [PlotColors.PRIMARY_RED if abs(v) > 10 else PlotColors.PRIMARY_GREEN for v in valgus_vals]
+        ax1.bar(valgus_labels, valgus_vals, color=colors, width=0.5, alpha=0.8)
+        ax1.axhline(10, color=PlotColors.ACCENT_WARNING, linestyle='--', linewidth=1, alpha=0.6)
+        ax1.set_ylim(0, max(15, event.landing_valgus_left + 5))
+        ax1.set_ylabel("Degrees (°)")
+        ax1.set_title("Knee Stability", fontsize=PlotStyle.SUBTITLE_SIZE)
+        self._style_ax(ax1, grid=False)
+
+        # 2. Peak Flexion Bar
+        flex_labels = ['Peak Flexion']
+        # Note: 180 is straight, so 180 - flexion = amount of bend
+        bend_val = 180 - event.peak_knee_flexion_landing
+        ax2.bar(flex_labels, [bend_val], color=PlotColors.PRIMARY_BLUE, width=0.5, alpha=0.8)
+        ax2.set_ylim(0, 90)
+        ax2.set_ylabel("Degrees of Bend (°)")
+        ax2.set_title("Impact Absorption", fontsize=PlotStyle.SUBTITLE_SIZE)
+        self._style_ax(ax2, grid=False)
+
+        # 3. Flight Time & TTS
+        metrics = ['Flight Time', 'TTS']
+        m_vals = [event.flight_time, event.time_to_stabilization]
+        ax3.bar(metrics, m_vals, color=PlotColors.PRIMARY_ORANGE, width=0.5, alpha=0.8)
+        ax3.set_ylim(0, 1.2)
+        ax3.set_ylabel("Time (s)")
+        ax3.set_title("Dynamic Balance", fontsize=PlotStyle.SUBTITLE_SIZE)
+        self._style_ax(ax3, grid=False)
+
+        _plt.tight_layout()
+        self._save(fig, "mat_performance_dashboard")
+
     def generate_all(self, frame_metrics: List[FrameMetrics], bio_engine: Optional["BiomechanicsEngine"]):
         """Generate and save all standard plots."""
         if not HAS_MPL:

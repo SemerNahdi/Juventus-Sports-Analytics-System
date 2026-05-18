@@ -1,6 +1,7 @@
 # .dockerignore
 .git
 .env
+template.env
 __pycache__/
 *.pyc
 *.pyo
@@ -9,6 +10,7 @@ __pycache__/
 env/
 venv/
 .venv/
+.venv12/
 bin/
 lib/
 share/
@@ -20,4 +22,9 @@ htmlcov/
 .idea/
 docs/
 assets/
+Output/
+videos/
+runs/
 dashboard/image.png
+fly.toml
+Procfile

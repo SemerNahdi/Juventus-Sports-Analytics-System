@@ -53,6 +53,10 @@
                     <p class="subtitle" id="sessionInfo">Biometric performance & risk report</p>
                 </div>
                 <div class="actions">
+                    <div class="email-share-container" style="display: flex; gap: 8px; background: rgba(255,255,255,0.03); padding: 4px; border-radius: 8px; border: 1px solid var(--border-glass);">
+                        <input type="email" id="shareEmailInput" placeholder="Enter recipient email" style="background: transparent; border: none; outline: none; color: white; padding: 0 10px; width: 180px; font-size: 0.85rem;">
+                        <button class="btn btn-secondary" onclick="shareResultsByEmail()" id="shareEmailBtn" style="padding: 6px 12px; font-size: 0.85rem;"><i class="fa-solid fa-paper-plane"></i> Send</button>
+                    </div>
                     <button class="btn btn-secondary" onclick="toggleHistory()"><i class="fa-solid fa-clock-rotate-left"></i> History</button>
                     <a href="/" class="btn btn-primary" style="text-decoration: none; display: inline-flex; align-items: center; gap: 8px;">
                         <i class="fa-solid fa-plus"></i> New Analysis
@@ -147,6 +151,11 @@
                     </div>
                 </section>
 
+                <!-- Category Header: Gait -->
+                <div class="span-12 section-divider">
+                    <i class="fa-solid fa-person-walking"></i> Biomechanical Gait Analysis
+                </div>
+
                 <!-- Detailed Gait Biometrics as Individual Cards -->
                 <section class="span-4 card glass gait-metric-card">
                     <div class="card-header"><h4>Step Width</h4></div>
@@ -187,6 +196,52 @@
                 <section class="span-4 card glass gait-metric-card">
                     <div class="card-header"><h4>Flight Time</h4></div>
                     <div class="gait-value" id="valFlightTime">-- s</div>
+                </section>
+
+                <!-- Category Header: MAT -->
+                <div class="span-12 section-divider mat-divider" id="matDivider" style="display: none;">
+                    <i class="fa-solid fa-person-falling-burst"></i> Movement Assessment Tool (MAT)
+                </div>
+
+                <!-- MAT Analysis Section (Hidden if not available) -->
+                <section class="span-12 card glass mat-section" id="matSection" style="display: none; margin-bottom: 2rem;">
+                    <div class="card-header">
+                        <h3><i class="fa-solid fa-person-falling-burst"></i> MAT Test Protocol: <span id="matProtocolName">--</span></h3>
+                        <div class="mat-status">
+                            <span class="badge" id="matSymmetryBadge">LSI: --%</span>
+                        </div>
+                    </div>
+                    <div id="matContent">
+                        <div class="mat-grid">
+                            <div class="mat-kpi-box">
+                                <label>Landing Valgus</label>
+                                <div class="value" id="matValgus">--°</div>
+                                <div class="status-indicator" id="matValgusStatus"></div>
+                            </div>
+                            <div class="mat-kpi-box">
+                                <label>Peak Flexion</label>
+                                <div class="value" id="matFlexion">--°</div>
+                                <div class="status-indicator" id="matFlexionStatus"></div>
+                            </div>
+                            <div class="mat-kpi-box">
+                                <label>Flight Time</label>
+                                <div class="value" id="matFlight">--s</div>
+                            </div>
+                            <div class="mat-kpi-box">
+                                <label>Stabilization</label>
+                                <div class="value" id="matStabilization">--s</div>
+                            </div>
+                            <div class="mat-kpi-box">
+                                <label>Hop Distance</label>
+                                <div class="value" id="matDistance">--m</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="matNoData" style="display: none; padding: 3rem; text-align: center; color: var(--text-secondary); background: rgba(0,0,0,0.2); border-radius: 12px; margin-top: 1rem;">
+                        <i class="fa-solid fa-circle-info" style="font-size: 2.5rem; margin-bottom: 1.5rem; color: var(--border-glass); display: block;"></i>
+                        <h4 style="color: white; margin-bottom: 0.5rem;">No MAT Events Detected</h4>
+                        <p>The movement assessment tool did not detect any valid takeoff/landing sequences in this analysis.</p>
+                    </div>
                 </section>
 
                 <!-- Charts Section -->

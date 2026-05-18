@@ -332,6 +332,7 @@ function displayAnalysis(analysis) {
 
     // Update KPIs and Charts
     updateSummary(analysis);
+    updateMATSummary(analysis);
     
     // Update Resources
     populateResources(analysis);
@@ -522,6 +523,71 @@ function updateSummary(analysis) {
     }
 }
 
+function updateMATSummary(analysis) {
+    if (!analysis) return;
+    const envelope = getAnalysisEnvelope(analysis);
+    
+    // Look for mat_summary in multiple potential locations
+    const mat = analysis.mat_summary || envelope.summary.mat_summary || analysis.summary?.mat_summary;
+    console.log('[Dashboard] updateMATSummary: mat_summary found =', !!mat);
+    
+    const matSection = document.getElementById('matSection');
+    const matDivider = document.getElementById('matDivider');
+    const matContent = document.getElementById('matContent');
+    const matNoData = document.getElementById('matNoData');
+    
+    if (matSection) matSection.style.display = 'block';
+    if (matDivider) matDivider.style.display = 'flex';
+
+    if (!mat || !mat.events || mat.events.length === 0) {
+        console.log('[Dashboard] No MAT events found in data.');
+        if (matContent) matContent.style.display = 'none';
+        if (matNoData) matNoData.style.display = 'block';
+        document.getElementById('matProtocolName').textContent = 'NONE';
+        document.getElementById('matSymmetryBadge').textContent = 'LSI: N/A';
+        return;
+    }
+
+    console.log('[Dashboard] Displaying MAT results for protocol:', mat.protocol_id);
+    if (matContent) matContent.style.display = 'block';
+    if (matNoData) matNoData.style.display = 'none';
+    const event = mat.events[0];
+    
+    document.getElementById('matProtocolName').textContent = (mat.protocol_id || 'Unknown').replace(/_/g, ' ').toUpperCase();
+    const lsiScore = toNumber(mat.limb_symmetry_index, 100);
+    const lsiBadge = document.getElementById('matSymmetryBadge');
+    lsiBadge.textContent = `LSI: ${lsiScore.toFixed(1)}%`;
+    
+    // Color code LSI: < 85% is a clinical red flag
+    lsiBadge.style.background = lsiScore < 85 ? 'rgba(239, 68, 68, 0.2)' : 'rgba(16, 185, 129, 0.2)';
+    lsiBadge.style.color = lsiScore < 85 ? 'var(--risk-high)' : 'var(--risk-low)';
+    lsiBadge.style.borderColor = lsiScore < 85 ? 'rgba(239, 68, 68, 0.3)' : 'rgba(16, 185, 129, 0.3)';
+    
+    const setMATVal = (id, val, unit, threshold = null, isInverse = false) => {
+        const el = document.getElementById(id);
+        const statusEl = document.getElementById(id + 'Status');
+        if (!el) return;
+        const num = toNumber(val, 0);
+        el.textContent = `${num.toFixed(1)}${unit}`;
+        
+        if (statusEl && threshold !== null) {
+            statusEl.className = 'status-indicator';
+            const isWarning = isInverse ? (num < threshold) : (Math.abs(num) > threshold);
+            if (isWarning) {
+                statusEl.classList.add('status-warning');
+            } else {
+                statusEl.classList.add('status-success');
+            }
+        }
+    };
+
+    setMATVal('matValgus', event.landing_valgus_left, '°', 10);
+    setMATVal('matFlexion', event.peak_knee_flexion_landing, '°', 150, true); // Stiff if > 150 (meaning < 30 deg bend)
+    setMATVal('matFlight', event.flight_time, 's');
+    setMATVal('matStabilization', event.time_to_stabilization, 's');
+    setMATVal('matDistance', event.hop_distance_m, 'm');
+}
+
 function renderCharts(frames) {
     if (!frames || frames.length === 0) return;
 
@@ -640,4 +706,42 @@ function renderCharts(frames) {
         },
         options: { responsive: true, maintainAspectRatio: false }
     });
+}
+
+async function shareResultsByEmail() {
+    const email = document.getElementById('shareEmailInput').value;
+    const btn = document.getElementById('shareEmailBtn');
+    
+    if (!email || !email.includes('@')) {
+        alert("Please enter a valid email address.");
+        return;
+    }
+
+    const jobId = currentJobId; // Assumes currentJobId is tracked globally
+    if (!jobId) {
+        alert("No active analysis to share.");
+        return;
+    }
+
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Sending...';
+
+    try {
+        const res = await fetch(`/analyses/${jobId}/email?email=${encodeURIComponent(email)}`, {
+            method: 'POST'
+        });
+        const data = await res.json();
+        
+        if (res.ok) {
+            alert(`Results successfully sent to ${email}`);
+            document.getElementById('shareEmailInput').value = '';
+        } else {
+            alert(`Error: ${data.message || 'Failed to send email'}`);
+        }
+    } catch (err) {
+        alert(`Network error: ${err.message}`);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="paper-plane"></i> Send';
+    }
 }

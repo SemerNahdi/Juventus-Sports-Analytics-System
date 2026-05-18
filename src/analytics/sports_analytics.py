@@ -10,7 +10,7 @@ from .core import *  # noqa: F401,F403
 from .sports2d_runner import Sports2DRunner
 from .output_manager import OpenSimFileWriter
 from .visualization import AnalyticsPlotter
-from .analysis_engine import SportsAnalyzer
+from .analysis_engine import SportsAnalyzer, ProtocolHandler
 
 __all__ = [
     # Primary public API
@@ -18,6 +18,7 @@ __all__ = [
     "AnalyticsPlotter",
     "Sports2DRunner",
     "OpenSimFileWriter",
+    "ProtocolHandler",
     # Compatibility flags from core
     "HAS_SPORTS2D",
     "HAS_SCIPY",

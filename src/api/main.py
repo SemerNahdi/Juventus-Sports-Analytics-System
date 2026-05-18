@@ -4,7 +4,7 @@ import json
 import shutil
 import tempfile
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,18 +64,21 @@ async def health() -> Dict[str, str]:
 async def analyze_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    player_id: int = 1,
-    yolo_size: str = DEFAULT_YOLO_SIZE,
-    player_height: float = 1.75,
-    mass_kg: float = 75.0,
-    session_tags: str = "performance-match",
-    run_sports2d: bool = False,
-    email: Optional[str] = None,
-    stride: int = DEFAULT_STRIDE,
-    target_height: int = DEFAULT_TARGET_HEIGHT,
-    seed_bbox: Optional[str] = None,
-    seed_frame_idx: int = 0
+    player_id: int = Form(1),
+    yolo_size: str = Form(DEFAULT_YOLO_SIZE),
+    player_height: float = Form(1.75),
+    mass_kg: float = Form(75.0),
+    session_tags: str = Form("performance-match"),
+    run_sports2d: bool = Form(False),
+    email: Optional[str] = Form(None),
+    stride: int = Form(DEFAULT_STRIDE),
+    target_height: int = Form(DEFAULT_TARGET_HEIGHT),
+    seed_bbox: Optional[str] = Form(None),
+    seed_frame_idx: int = Form(0),
+    protocol_id: str = Form("continuous_gait"),
+    mat_grid_spacing_cm: float = Form(10.0)
 ) -> JSONResponse:
+    print(f"[API] New Analysis Request: email={email}")
     """
     Async analysis endpoint:
     1. Verify database connection + schema.
@@ -166,7 +169,9 @@ async def analyze_video(
         stride,
         target_height,
         parsed_seed_bbox,
-        seed_frame_idx
+        seed_frame_idx,
+        protocol_id,
+        mat_grid_spacing_cm
     )
 
     return JSONResponse(
@@ -271,6 +276,35 @@ async def get_analysis(job_id: str) -> JSONResponse:
                 "detail": detail
             }
         )
+
+
+@app.post("/analyses/{job_id}/email")
+async def email_analysis_results(job_id: str, email: str) -> JSONResponse:
+    """Send analysis results to specified email."""
+    if supabase is None:
+        return JSONResponse(status_code=503, content={"status": "error", "message": "Supabase not configured."})
+    
+    from .utils.email_utils import send_analysis_email
+    
+    try:
+        result = get_analysis_by_id(job_id)
+        if not result:
+            return JSONResponse(status_code=404, content={"status": "error", "message": "Job not found."})
+            
+        summary = result.get("summary", {})
+        if isinstance(summary, str):
+            summary = json.loads(summary)
+            
+        player_summary = summary.get("player_summary", {})
+        risk_score = player_summary.get("peak_risk_score", 0.0)
+        player_id = result.get("player_id", 1)
+        video_url = result.get("video_url", "")
+        
+        send_analysis_email(email, job_id, player_id, video_url, risk_score=risk_score)
+        
+        return JSONResponse(status_code=200, content={"status": "success", "message": f"Results sent to {email}"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
 # Final Catch-all for Static Assets

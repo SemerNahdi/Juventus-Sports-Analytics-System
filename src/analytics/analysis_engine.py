@@ -9,6 +9,97 @@ from .scoring import RiskScorer
 from .rendering import annotate_frame, draw_player_aura
 from .reporting import generate_report
 
+class ProtocolHandler:
+    """Route between continuous (gait) and discrete (MAT) analysis."""
+
+    def __init__(self, protocol_id: Optional[str] = None):
+        self.protocol_id = protocol_id or "continuous_gait"
+        self.is_mat = self.protocol_id.startswith("mat_")
+
+    def process_video(self, analyzer: 'SportsAnalyzer', stride: int = 2, 
+                     target_height: int = 640, cancel_event: Optional[threading.Event] = None):
+        if self.is_mat:
+            return self._process_mat_protocol(analyzer, stride, target_height, cancel_event)
+        else:
+            return analyzer.process_video(stride, target_height, cancel_event)
+
+    def _process_mat_protocol(self, analyzer: 'SportsAnalyzer', stride: int, 
+                             target_height: int, cancel_event: Optional[threading.Event]):
+        """Runs discrete event detection instead of frame-by-frame analysis."""
+        # 1. First run the standard pipeline to get all pose data
+        # We can temporarily disable some rendering if we want it to be "silent"
+        print(f" * RUNNING MAT PROTOCOL: {self.protocol_id}")
+        analyzer.process_video(stride, target_height, cancel_event)
+        
+        # 2. Extract events
+        detector = MATEventDetector()
+        fps = analyzer._fps_cache / stride
+        
+        # Use ankle Y trajectory for takeoff/landing
+        # We'll use the left ankle as a default or try to find the active limb
+        ankle_y = np.array([p.kp.left_ankle[1] for p in analyzer.pose_frames])
+        takeoff, landing = detector.detect_takeoff_landing(ankle_y, fps)
+        
+        # 3. Compute MAT KPIs
+        event_data = detector.extract_hop_event(analyzer.pose_frames, takeoff, landing, fps)
+        
+        # 4. Map to MATSummary
+        event_kpi = MATEventKPIs(
+            event_type=self.protocol_id,
+            flight_time=event_data["flight_time"],
+            landing_valgus_left=event_data["landing_valgus"],
+            peak_knee_flexion_landing=event_data["peak_knee_flexion_landing"],
+            time_to_stabilization=event_data["time_to_stabilization"],
+            hop_distance_m=0.0 # Will be calculated if grid calibration worked
+        )
+        
+        summary = self._build_mat_summary_internal(analyzer, takeoff, landing, fps)
+        analyzer.mat_summary = summary
+        return summary
+
+    def _build_mat_summary_internal(self, analyzer, takeoff, landing, fps):
+        detector = MATEventDetector()
+        event_data = detector.extract_hop_event(analyzer.pose_frames, takeoff, landing, fps)
+        
+        event_kpi = MATEventKPIs(
+            event_type=self.protocol_id,
+            flight_time=event_data["flight_time"],
+            landing_valgus_left=event_data["landing_valgus"],
+            peak_knee_flexion_landing=event_data["peak_knee_flexion_landing"],
+            time_to_stabilization=event_data["time_to_stabilization"],
+            hop_distance_m=0.0
+        )
+        
+        lsi = self._calculate_lsi([event_kpi])
+        
+        return MATSummary(
+            protocol_id=self.protocol_id,
+            participant_id=analyzer.player_id,
+            limb_symmetry_index=lsi,
+            events=[event_kpi]
+        )
+
+    def _calculate_lsi(self, events: List[MATEventKPIs]) -> float:
+        """
+        Calculate LSI (Limb Symmetry Index).
+        Formula: (Symmetry of performance across limbs).
+        """
+        if not events: return 100.0
+        e = events[0]
+        
+        # 1. Bilateral Comparison (e.g. Drop Vertical Jump)
+        if e.landing_valgus_left != 0 and e.landing_valgus_right != 0:
+            # For Valgus, lower is better, so we compare the magnitudes
+            v_l = abs(e.landing_valgus_left)
+            v_r = abs(e.landing_valgus_right)
+            if max(v_l, v_r) < 1e-6: return 100.0
+            return (min(v_l, v_r) / max(v_l, v_r)) * 100.0
+            
+        # 2. Single-Limb comparison (Placeholder for cross-event logic)
+        # In a real system, this would query the DB for the 'other' limb's recent result.
+        return 100.0
+
+
 class SportsAnalyzer:
     PIX_TO_M = None
     _TRC_COLUMN_ALIASES = {
@@ -40,7 +131,8 @@ class SportsAnalyzer:
                  player_mass_kg: float = 75.0,
                  seed_bbox: Optional[Tuple[int, int, int, int]] = None,
                  seed_frame_idx: int = 0,
-                 risk_model: Optional[dict] = None):
+                 risk_model: Optional[dict] = None,
+                 protocol_id: str = "continuous_gait"):
         self.video_path         = video_path
         self.output_video_path  = output_video_path
         self.player_id          = player_id
@@ -72,11 +164,15 @@ class SportsAnalyzer:
         if risk_model:
             self.risk_model.update(risk_model)
 
+        self.protocol_id = protocol_id
+        self.is_mat = protocol_id.startswith("mat_")
+
         self.pose_est   = HybridPoseEstimator()
         self.smoother   = PoseKalmanSmoother()
         self.pose_frames:    List[PoseFrame]    = []
         self.frame_metrics:  List[FrameMetrics] = []
         self.summary = PlayerSummary(player_id=player_id)
+        self.mat_summary: Optional[MATSummary] = None
 
         self._spd_win         = deque(maxlen=30)
         self._risk_win        = deque(maxlen=15)
@@ -162,6 +258,14 @@ class SportsAnalyzer:
             if scale != 1.0:
                 frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
 
+            # MAT Grid Calibration (First 5 frames)
+            if self.is_mat and idx < 5:
+                grid_sc = MATGridCalibrator.detect_grid(frame)
+                if grid_sc:
+                    self.PIX_TO_M = grid_sc
+                    if self.bio_engine: self.bio_engine.pix_to_m = grid_sc
+                    print(f" * MAT GRID DETECTED: {grid_sc:.6f} m/px")
+
             ts   = idx / fps
             bbox = self.lock.update(frame)
 
@@ -169,6 +273,12 @@ class SportsAnalyzer:
                 target = next((t for t in self.lock.bt.active_tracks.values() if t.id == self.lock._target_id), None)
                 yolo_kp = getattr(target, '_yolo_kp', None)
                 spd     = self.frame_metrics[-1].speed if self.frame_metrics else 0.
+
+                # Optimization: Cache orientation confidence to avoid re-calculating every frame
+                if idx % 10 == 0 or not self.frame_metrics:
+                    persp_conf = estimate_player_orientation(yolo_kp) if yolo_kp is not None else 1.0
+                else:
+                    persp_conf = self.frame_metrics[-1].perspective_confidence
 
                 raw_kp = self._get_kp_from_trc(idx, ts, trc_df, s2d_cols, trc_frame_map, trc_time_keys, trc_time_vals, scale)
                 if raw_kp is None:
@@ -198,7 +308,20 @@ class SportsAnalyzer:
 
         if self.bio_engine: self.bio_engine.post_process()
         self._post_gait(fps)
+        
+        # Integrated MAT Calculation (even in continuous mode)
+        if not self.mat_summary:
+            try:
+                from .biomechanics import MATEventDetector
+                detector = MATEventDetector()
+                ankle_y = np.array([p.kp.left_ankle[1] for p in self.pose_frames])
+                takeoff, landing = detector.detect_takeoff_landing(ankle_y, fps / stride)
+                self.mat_summary = ProtocolHandler(self.protocol_id)._build_mat_summary_internal(self, takeoff, landing, fps / stride)
+            except Exception:
+                pass
+
         self._build_summary()
+        import gc; gc.collect()
         return self.summary
 
     def _init_s2d_lookup(self, scale):
@@ -515,4 +638,4 @@ class SportsAnalyzer:
         return export_unified_results(self, json_path, csv_path, trc_path, mot_path)
 
     def get_report_string(self) -> str:
-        return generate_report(self.summary, self.bio_engine)
+        return generate_report(self.summary, self.bio_engine, self.mat_summary)

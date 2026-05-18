@@ -29,7 +29,9 @@ def run_full_analysis_job(
     stride: int = DEFAULT_STRIDE,
     target_height: int = DEFAULT_TARGET_HEIGHT,
     seed_bbox: Optional[List[int]] = None,
-    seed_frame_idx: int = 0
+    seed_frame_idx: int = 0,
+    protocol_id: str = "continuous_gait",
+    mat_grid_spacing_cm: float = 10.0
 ) -> None:
     """Heavy-lifting background task: AI analysis + results upload."""
     job_logs: List[str] = []
@@ -42,7 +44,7 @@ def run_full_analysis_job(
             log_step(job_id, msg, job_logs, cancel_event)
 
         step("Initializing AI environment...")
-        from src.analytics.sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D
+        from src.analytics.sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D, ProtocolHandler
 
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = os.path.join(temp_dir, "input_" + original_filename)
@@ -78,7 +80,8 @@ def run_full_analysis_job(
                     player_height_m=player_height,
                     pick=False,
                     seed_bbox=seed_bbox_tuple,
-                    seed_frame_idx=seed_frame_idx
+                    seed_frame_idx=seed_frame_idx,
+                    protocol_id=protocol_id
                 )
 
                 s2d_dir = None
@@ -94,7 +97,8 @@ def run_full_analysis_job(
                     gc.collect()
 
                 step("Commencing Pose Estimation & Tracking...")
-                summary = analyzer.process_video(stride=stride, target_height=target_height, cancel_event=cancel_event)
+                handler = ProtocolHandler(protocol_id=protocol_id)
+                summary = handler.process_video(analyzer, stride=stride, target_height=target_height, cancel_event=cancel_event)
                 step(f"Tracking concluded. {len(analyzer.frame_metrics)} frames analyzed.")
                 gc.collect()
 
@@ -151,6 +155,7 @@ def run_full_analysis_job(
                 step("Job finalized successfully.")
                 full_summary = {
                     "player_summary": asdict(summary),
+                    "mat_summary": asdict(analyzer.mat_summary) if analyzer.mat_summary else None,
                     "biomechanics_summary": analyzer.bio_engine.summary_dict() if analyzer.bio_engine else {},
                     "frame_metrics": unified_frames,
                     "sports2d_output_files": sports2d_urls,
@@ -165,16 +170,19 @@ def run_full_analysis_job(
                     "player_height": player_height,
                     "mass_kg": mass_kg,
                     "yolo_size": yolo_size,
-                    "run_sports2d": run_sports2d
+                    "run_sports2d": run_sports2d,
+                    "protocol_id": protocol_id
                 })
 
+                print(f"[JOB {job_id[:8]}] Finalizing job. Notification email parameter: '{email}'")
                 if email:
                     print(f"[JOB {job_id[:8]}] Queuing email notification...")
                     safe_supabase_update(job_id, {
                         "logs": job_logs + [f"[{datetime.datetime.now().isoformat()}] - Dispatching report email to {email}..."]
                     })
                     try:
-                        send_analysis_email(email, job_id, player_id, video_url)
+                        risk_score = summary.peak_risk_score if summary else 0.0
+                        send_analysis_email(email, job_id, player_id, video_url, risk_score=risk_score)
                         job_logs.append(f"[{datetime.datetime.now().isoformat()}] - Email report delivered successfully.")
                     except Exception as e:
                         job_logs.append(f"[{datetime.datetime.now().isoformat()}] - Email Error: {str(e)}")

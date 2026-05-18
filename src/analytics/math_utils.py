@@ -52,27 +52,30 @@ except ImportError:
     pass
 
 def s2d_joint_angle(p_prox, p_vertex, p_dist) -> float:
-    if _s2d_angle is not None:
-        try:
-            pp  = np.array(p_prox,   dtype=float).reshape(1, 2)
-            pv  = np.array(p_vertex, dtype=float).reshape(1, 2)
-            pd_ = np.array(p_dist,   dtype=float).reshape(1, 2)
-            return float(_s2d_angle(pp, pv, pd_)[0])
-        except Exception:
-            pass
-    return angle_3pts(p_prox, p_vertex, p_dist)
+    # Optimize: fallback to native math early if s2d is not available
+    if _s2d_angle is None:
+        return angle_3pts(p_prox, p_vertex, p_dist)
+    try:
+        pp  = np.array(p_prox,   dtype=float).reshape(1, 2)
+        pv  = np.array(p_vertex, dtype=float).reshape(1, 2)
+        pd_ = np.array(p_dist,   dtype=float).reshape(1, 2)
+        return float(_s2d_angle(pp, pv, pd_)[0])
+    except Exception:
+        return angle_3pts(p_prox, p_vertex, p_dist)
 
 def s2d_seg_angle(p_from, p_to) -> float:
-    if _s2d_seg is not None:
-        try:
-            pf = np.array(p_from, dtype=float).reshape(1, 2)
-            pt = np.array(p_to,   dtype=float).reshape(1, 2)
-            return float(_s2d_seg(pf, pt)[0])
-        except Exception:
-            pass
-    dx = p_to[0] - p_from[0]
-    dy = p_to[1] - p_from[1]
-    return float(math.degrees(math.atan2(dx, abs(dy) + 1e-9)))
+    if _s2d_seg is None:
+        dx = p_to[0] - p_from[0]
+        dy = p_to[1] - p_from[1]
+        return float(math.degrees(math.atan2(dx, abs(dy) + 1e-9)))
+    try:
+        pf = np.array(p_from, dtype=float).reshape(1, 2)
+        pt = np.array(p_to,   dtype=float).reshape(1, 2)
+        return float(_s2d_seg(pf, pt)[0])
+    except Exception:
+        dx = p_to[0] - p_from[0]
+        dy = p_to[1] - p_from[1]
+        return float(math.degrees(math.atan2(dx, abs(dy) + 1e-9)))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MATH HELPERS
@@ -82,10 +85,23 @@ def midpoint(a, b) -> Tuple[float, float]:
     return ((a[0] + b[0]) / 2., (a[1] + b[1]) / 2.)
 
 def angle_3pts(a, b, c) -> float:
-    ba = np.array(a) - np.array(b)
-    bc = np.array(c) - np.array(b)
-    n = np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-9
-    return float(np.degrees(np.arccos(np.clip(np.dot(ba, bc) / n, -1, 1))))
+    """Optimized native math for 3-point angle calculation."""
+    v1 = (a[0] - b[0], a[1] - b[1])
+    v2 = (c[0] - b[0], c[1] - b[1])
+    
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+    mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+    
+    denom = mag1 * mag2
+    if denom < 1e-9: return 0.0
+    
+    # cos(theta) = (v1 . v2) / (|v1| * |v2|)
+    cos_theta = dot / denom
+    # Clamp to avoid precision errors outside [-1, 1]
+    cos_theta = max(-1.0, min(1.0, cos_theta))
+    
+    return math.degrees(math.acos(cos_theta))
 
 def dist2d(p1, p2) -> float:
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
@@ -145,15 +161,30 @@ def hist_sim(h1, h2) -> float:
         return 0.
     return float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
 
-def estimate_player_orientation(kp: PoseKeypoints) -> float:
-    sh_w = abs(kp.left_shoulder[0] - kp.right_shoulder[0])
-    hp_w = abs(kp.left_hip[0] - kp.right_hip[0])
-    body_h = abs(kp.head[1] - kp.left_ankle[1]) + 1e-6
-    expected_sh = 0.22 * body_h
-    expected_hp = 0.18 * body_h
-    conf_sh = clamp01(sh_w / (expected_sh + 1e-6))
-    conf_hp = clamp01(hp_w / (expected_hp + 1e-6))
-    return float((conf_sh + conf_hp) / 2.0)
+def estimate_player_orientation(kp) -> float:
+    """Estimate how 'front-on' a player is based on shoulder/hip width ratios."""
+    try:
+        if hasattr(kp, 'left_shoulder'):
+            sh_l, sh_r = kp.left_shoulder, kp.right_shoulder
+            hp_l, hp_r = kp.left_hip, kp.right_hip
+            head, ank_l = kp.head, kp.left_ankle
+        else:
+            # Assume COCO 17-point array (shape: 17x2 or 17x3)
+            sh_l, sh_r = kp[5], kp[6]
+            hp_l, hp_r = kp[11], kp[12]
+            head, ank_l = kp[0], kp[15]
+        
+        sh_w = abs(sh_l[0] - sh_r[0])
+        hp_w = abs(hp_l[0] - hp_r[0])
+        body_h = abs(head[1] - ank_l[1]) + 1e-6
+        
+        expected_sh = 0.22 * body_h
+        expected_hp = 0.18 * body_h
+        conf_sh = clamp01(sh_w / (expected_sh + 1e-6))
+        conf_hp = clamp01(hp_w / (expected_hp + 1e-6))
+        return float((conf_sh + conf_hp) / 2.0)
+    except Exception:
+        return 1.0 # Default to full confidence on failure
 
 def clean_nans(obj):
     """Recursively convert NaN/Inf into standard JSON null."""

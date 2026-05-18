@@ -48,6 +48,8 @@ def create_parser() -> argparse.ArgumentParser:
                       help="Player height in metres (default: 1.75)")
     core.add_argument("--mass", type=float, default=75.0,
                       help="Player mass in kg (default: 75.0)")
+    core.add_argument("--protocol", default="continuous_gait",
+                      help="Analysis protocol: 'continuous_gait' or 'mat_*' (e.g., mat_single_hop_left)")
 
     # Tracker
     tracker = parser.add_argument_group("Tracking Options")
@@ -150,6 +152,7 @@ def main():
         yolo_size=args.yolo_size,
         player_height_m=args.height,
         player_mass_kg=args.mass,
+        protocol_id=args.protocol,
     )
     perf_breakdown["Step 1: Initialise Engine"] = time.time() - step1_start
 
@@ -197,7 +200,11 @@ def main():
     # Now run the custom tracker (potentially seeded by Sports2D above)
     print("\n[STEP 3/5] Running Custom Tracker + Biomechanics Engine")
     step3_start = time.time()
-    analyzer.process_video(stride=args.stride, target_height=args.target_height)
+    
+    from src.analytics.analysis_engine import ProtocolHandler
+    handler = ProtocolHandler(protocol_id=args.protocol)
+    handler.process_video(analyzer, stride=args.stride, target_height=args.target_height)
+    
     perf_breakdown["Step 3: Custom Tracking"] = time.time() - step3_start
 
     # ── Step 4: Unified Export ───────────────────────────────────────────────
@@ -224,18 +231,19 @@ def main():
     perf_breakdown["Step 4: Unified Export"] = time.time() - step4_start
 
     # ── Step 5: Generate Plots & Report ──────────────────────────────────────
-    # print("\n[STEP 5/5] Generating Analytical Plots & Report")
-    # step5_start = time.time()
-    # plotter = AnalyticsPlotter(results_dir=str(analytics_plots_dir), player_id=args.player)
-    # plotter.generate_all(
-    #     frame_metrics=analyzer.frame_metrics,
-    #     bio_engine=analyzer.bio_engine,
-    # )
+    print("\n[STEP 5/5] Generating Analytical Plots & Report")
+    step5_start = time.time()
+    plotter = AnalyticsPlotter(results_dir=str(analytics_plots_dir), player_id=args.player)
+    plotter.generate_all(
+        frame_metrics=analyzer.frame_metrics,
+        bio_engine=analyzer.bio_engine,
+        mat_summary=analyzer.mat_summary,
+    )
 
     report_str = analyzer.get_report_string()
     with open(report_out, "w", encoding="utf-8") as f:
         f.write(report_str)
-    # perf_breakdown["Step 5: Generate Plots & Report"] = time.time() - step5_start
+    perf_breakdown["Step 5: Generate Plots & Report"] = time.time() - step5_start
 
     # ── Final Summary ────────────────────────────────────────────────────────
     stop_cpu_sampler.set()

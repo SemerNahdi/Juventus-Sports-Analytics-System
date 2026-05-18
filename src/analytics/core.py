@@ -63,4 +63,7 @@ __all__ = [
 
     # Rendering & Reporting
     "annotate_frame", "draw_player_aura", "generate_report",
+
+    # MAT (Movement Assessment Tool)
+    "MATEventKPIs", "MATSummary", "MATEventDetector", "MATGridCalibrator",
 ]

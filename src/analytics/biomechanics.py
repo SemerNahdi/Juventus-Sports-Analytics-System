@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 from dataclasses import asdict
 from typing import Optional, List, Tuple
-from .models import BioFrame, PoseKeypoints, BIO_ANGLE_FIELDS
+import cv2
+from .models import BioFrame, PoseKeypoints, BIO_ANGLE_FIELDS, PoseFrame
 from .math_utils import (
     s2d_joint_angle, s2d_seg_angle, dist2d, 
     HAS_SCIPY
@@ -219,3 +220,88 @@ class BiomechanicsEngine:
             for i in range(h, min(end + 1, n)):
                 m[i] = True
         return m
+
+
+class MATEventDetector:
+    """Detects discrete events for Single Leg Hop, Drop Jump, SEBT protocols."""
+
+    def detect_takeoff_landing(self, ankle_y_trajectory: np.ndarray, fps: float):
+        """Find takeoff (negative velocity peak) and landing (positive velocity peak)."""
+        # Vertical velocity: diff of Y coordinates. 
+        # Note: in screen space Y increases downwards, so jumping up is negative velocity.
+        vel = np.diff(ankle_y_trajectory) * fps
+        takeoff_idx = np.argmin(vel)  # Peak upward velocity (lowest Y change)
+        landing_idx = np.argmax(vel[takeoff_idx:]) + takeoff_idx  # Peak downward velocity
+        return int(takeoff_idx), int(landing_idx)
+
+    def extract_hop_event(self, frames: List[PoseFrame],
+                         takeoff_idx: int, landing_idx: int, fps: float) -> dict:
+        """Extract biomechanics for one hop cycle."""
+        event_frames = frames[takeoff_idx:landing_idx+1]
+        bio_engine = BiomechanicsEngine(fps=fps)
+        for pf in event_frames:
+            bio_engine.process_frame(pf.frame_idx, pf.timestamp, pf.kp)
+        bio_engine.post_process()
+
+        return {
+            "takeoff_idx": takeoff_idx,
+            "landing_idx": landing_idx,
+            "flight_time": (landing_idx - takeoff_idx) / fps,
+            "peak_knee_flexion_landing": self._peak_at_landing(bio_engine),
+            "landing_valgus": self._valgus_at_landing(bio_engine),
+            "time_to_stabilization": self._compute_tts(bio_engine),
+        }
+
+    def _peak_at_landing(self, bio_engine: BiomechanicsEngine) -> float:
+        if not bio_engine.frames: return 0.0
+        # Peak knee flexion usually occurs shortly after landing
+        flexions = [f.left_knee_flexion for f in bio_engine.frames] + [f.right_knee_flexion for f in bio_engine.frames]
+        return float(np.max(flexions)) if flexions else 0.0
+
+    def _valgus_at_landing(self, bio_engine: BiomechanicsEngine) -> float:
+        if not bio_engine.frames: return 0.0
+        # Landing valgus is the value at the moment of impact or shortly after
+        valgus = [abs(f.left_valgus_clinical) for f in bio_engine.frames] + [abs(f.right_valgus_clinical) for f in bio_engine.frames]
+        return float(np.mean(valgus[:5])) if valgus else 0.0
+
+    def _compute_tts(self, bio_engine: BiomechanicsEngine) -> float:
+        """Time to stabilization based on oscillation threshold."""
+        # Simplified: time until velocity stays below threshold
+        return 0.5 # Placeholder for now as per plan draft
+
+
+class MATGridCalibrator:
+    """Auto-detect floor grid markings for scale calibration."""
+
+    @staticmethod
+    def detect_grid(frame: np.ndarray, known_spacing_cm: float = 10.0) -> Optional[float]:
+        """Use Hough Line Transform to find floor markings. Returns pix_to_m."""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 50, 150)
+            lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=100, maxLineGap=10)
+
+            if lines is None:
+                return None
+
+            # Filter for horizontal-ish lines
+            horizontal_lines = []
+            for l in lines:
+                x1, y1, x2, y2 = l[0]
+                if abs(y2 - y1) < 10:
+                    horizontal_lines.append(l)
+
+            if len(horizontal_lines) >= 2:
+                y_positions = sorted([l[0][1] for l in horizontal_lines])
+                # Find most common spacing
+                spacings = [y_positions[i+1] - y_positions[i]
+                            for i in range(len(y_positions)-1) 
+                            if y_positions[i+1] - y_positions[i] > 5]
+                if not spacings: return None
+                spacing_px = np.median(spacings)
+                pix_to_m = (known_spacing_cm / 100.0) / spacing_px
+                return float(pix_to_m)
+        except Exception:
+            pass
+        return None
