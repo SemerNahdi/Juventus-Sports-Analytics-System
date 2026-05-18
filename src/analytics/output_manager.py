@@ -1,10 +1,49 @@
 """OpenSim/TRC/MOT output writing utilities."""
 
-from .core import *  # noqa: F401,F403
+import json
+import os
+import logging
+import csv as _csv
+from pathlib import Path
+from typing import List, Optional
+from dataclasses import asdict
+from io import StringIO
+
+import pandas as pd
+import numpy as np
+
+from .models import PoseFrame, BioFrame, BIO_ANGLE_FIELDS
+from .math_utils import clean_nans
+from .core import HAS_SPORTS2D, HAS_SCIPY
+
+logger = logging.getLogger(__name__)
 
 
 # TO DO 
 # Remove the Opensim caalcultion as i get them in sports2S natively 
+
+def _validate_output_path(path: str, base_dir: Optional[str] = None) -> str:
+    """
+    Validate that output path is safe and create parent directories if needed.
+    If base_dir is provided, ensures path is within it.
+    """
+    try:
+        target = Path(path).resolve()
+        
+        if base_dir:
+            base = Path(base_dir).resolve()
+            # Ensure target is within base directory
+            target.relative_to(base)
+            
+        # Ensure parent directory exists
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return str(target)
+    except (ValueError, RuntimeError, OSError) as e:
+        if base_dir:
+            raise ValueError(
+                f"Invalid output path '{path}': attempts to escape base directory '{base_dir}'"
+            ) from e
+        raise ValueError(f"Invalid output path '{path}': {e}") from e
 
 class OpenSimFileWriter:
     """
@@ -58,7 +97,8 @@ class OpenSimFileWriter:
     }
 
     def write_trc(self, pose_frames: List[PoseFrame], path: str,
-                  fps: float, pix_to_m: float, frame_height_px: int) -> bool:
+                  fps: float, pix_to_m: float, frame_height_px: int,
+                  base_output_dir: Optional[str] = None) -> bool:
         """
         Write a .trc file with 3-D marker trajectories.
 
@@ -76,7 +116,9 @@ class OpenSimFileWriter:
             return False
 
         try:
-            with open(path, "w", newline="\r\n") as f:
+            # Validate path to prevent traversal attacks
+            validated_path = _validate_output_path(path, base_output_dir)
+            with open(validated_path, "w", newline="\r\n") as f:
                 # ── Header ────────────────────────────────────────────────────
                 # Line 0: file-type header
                 f.write(f"PathFileType\t4\t(X/Y/Z)\t{os.path.basename(path)}\n")
@@ -109,8 +151,11 @@ class OpenSimFileWriter:
                         z = 0.0
                         row += f"\t{x:.6f}\t{y:.6f}\t{z:.6f}"
                     f.write(row + "\n")
-            print(f"[TRC] Written: {path}  ({n_frames} frames, {n_markers} markers)")
+            print(f"[TRC] Written: {validated_path}  ({n_frames} frames, {n_markers} markers)")
             return True
+        except ValueError as e:
+            print(f"[TRC] Security error: {e}")
+            return False
         except Exception as e:
             print(f"[TRC] Failed to write {path}: {e}")
             return False
@@ -242,13 +287,14 @@ def export_unified_results(analyzer, json_path: str, csv_path: str,
     csv_f = None
     jf = None
     csv_writer = None
+    csv_buffer = StringIO()  # Buffered CSV writing for better performance
 
     jsonl_path = str(Path(json_path).with_suffix(".jsonl"))
     out_json_path = jsonl_path if export_jsonl else json_path
 
     try:
-        jf = open(out_json_path, "w", encoding="utf-8")
-        csv_f = open(csv_path, "w", encoding="utf-8", newline="")
+        jf = open(out_json_path, "w", encoding="utf-8", newline="")  # Explicit newline for Windows compat
+        csv_f = open(csv_path, "w", encoding="utf-8", newline="")    # Explicit newline for Windows compat
 
         if export_jsonl:
             jf.write(json.dumps(payload, default=str) + "\n")
@@ -276,7 +322,7 @@ def export_unified_results(analyzer, json_path: str, csv_path: str,
             record = clean_nans(record)
 
             if csv_writer is None:
-                csv_writer = _csv.DictWriter(csv_f, fieldnames=list(record.keys()), extrasaction="ignore")
+                csv_writer = _csv.DictWriter(csv_buffer, fieldnames=list(record.keys()), extrasaction="ignore")
                 csv_writer.writeheader()
             csv_writer.writerow(record)
 
@@ -288,9 +334,16 @@ def export_unified_results(analyzer, json_path: str, csv_path: str,
                 jf.write(json.dumps(record, default=str))
 
             n_frames += 1
+        
+        # Flush buffered CSV to actual file with consistent line endings
+        if csv_writer is not None:
+            csv_content = csv_buffer.getvalue()
+            csv_f.write(csv_content)
+            logger.info(f"Exported {n_frames} frames to {out_json_path} and {csv_path}")
+
 
         if export_jsonl:
-            print(f"[EXPORT] data_output.jsonl → {out_json_path}  ({n_frames} frames)")
+            logger.info(f"Exported {n_frames} frames to {out_json_path}")
         else:
             jf.write("\n]\n}\n")
             print(f"[EXPORT] data_output.json → {out_json_path}  ({n_frames} frames)")

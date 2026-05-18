@@ -1,6 +1,19 @@
 from typing import Optional, Dict, Any
 from .supabase_client import supabase
+import time
+import re
 
+def _execute_with_retry(query_builder, max_retries=5):
+    """Execute a Supabase query with retries for Windows socket errors (10035)."""
+    for attempt in range(max_retries):
+        try:
+            return query_builder.execute()
+        except Exception as e:
+            err_str = str(e)
+            if "10035" in err_str and attempt < max_retries - 1:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise e
 
 def get_first_row(query_result: Any) -> Optional[Dict[str, Any]]:
     """Extract first row from Supabase query result safely."""
@@ -18,18 +31,17 @@ def safe_supabase_update(job_id: str, data: Dict[str, Any], table: str = "analys
         return
 
     remaining = dict(data)
-    for _attempt in range(len(remaining) + 1):
+    for attempt in range(len(remaining) + 2):
         if not remaining:
             break
         try:
-            supabase.table(table).update(remaining).eq("id", job_id).execute()
+            _execute_with_retry(supabase.table(table).update(remaining).eq("id", job_id))
             return  # success
         except Exception as e:
             err_str = str(e)
+            
             # PGRST204: column does not exist — find and drop it, then retry
             if "PGRST204" in err_str and remaining:
-                # Try to extract the bad column name from the error message
-                import re
                 m = re.search(r"find the '(\w+)' column", err_str)
                 bad_key = m.group(1) if m else None
                 if bad_key and bad_key in remaining:
@@ -46,12 +58,12 @@ def create_job_record(job_id: str, player_id: int, session_tags: str) -> bool:
         return False
     
     try:
-        supabase.table("analyses").insert({
+        _execute_with_retry(supabase.table("analyses").insert({
             "id": job_id,
             "player_id": player_id,
             "status": "processing",
             "session_tags": session_tags
-        }).execute()
+        }))
         return True
     except Exception as e:
         error_str = str(e)
@@ -71,7 +83,7 @@ def get_job_status(job_id: str) -> Optional[str]:
         return None
     
     try:
-        res = supabase.table("analyses").select("status").eq("id", job_id).execute()
+        res = _execute_with_retry(supabase.table("analyses").select("status").eq("id", job_id))
         row = get_first_row(res)
         return row.get("status") if row else None
     except Exception as e:
@@ -85,7 +97,7 @@ def list_analyses(limit: int = 20) -> Any:
         return []
     
     try:
-        response = supabase.table("analyses").select("*").order("created_at", desc=True).limit(limit).execute()
+        response = _execute_with_retry(supabase.table("analyses").select("*").order("created_at", desc=True).limit(limit))
         return response.data
     except Exception as e:
         raise RuntimeError(f"Failed to fetch analyses: {str(e)}")
@@ -97,7 +109,7 @@ def get_latest_analysis() -> Any:
         return None
     
     try:
-        response = supabase.table("analyses").select("*").order("created_at", desc=True).limit(1).execute()
+        response = _execute_with_retry(supabase.table("analyses").select("*").order("created_at", desc=True).limit(1))
         if not response.data:
             return None
         return response.data[0]
@@ -111,7 +123,7 @@ def get_analysis_by_id(job_id: str) -> Optional[Dict[str, Any]]:
         return None
     
     try:
-        res = supabase.table("analyses").select("*").eq("id", job_id).execute()
+        res = _execute_with_retry(supabase.table("analyses").select("*").eq("id", job_id))
         return get_first_row(res)
     except Exception as e:
         print(f"[Supabase Query Error] {job_id}: {str(e)}")

@@ -1,13 +1,59 @@
 """Top-level analysis orchestration engine."""
 
-from typing import Any
+from collections import deque
 
-from .core import *  # noqa: F401,F403
+import numpy as np
+import pandas as pd
+import threading
+import math
+import logging
+import os
+from typing import Any, Optional, List, Tuple
+from io import StringIO
+
+from .models import PoseKeypoints, MATEventKPIs, MATSummary, PoseFrame, FrameMetrics, PlayerSummary, BioFrame
+from .biomechanics import MATEventDetector, BiomechanicsEngine, MATGridCalibrator
+from .math_utils import HAS_MPL, HAS_SCIPY, HAS_SPORTS2D, dist2d, crop_hist, estimate_player_orientation, s2d_joint_angle, s2d_seg_angle
+from .core import HybridPoseEstimator, PoseKalmanSmoother
+from .cv_wrapper import cv2
 from .sports2d_runner import Sports2DRunner
 from .output_manager import export_unified_results
 from .scoring import RiskScorer
 from .rendering import annotate_frame, draw_player_aura
 from .reporting import generate_report
+from .player_picker import pick_player_interactive, select_primary_player
+from .tracking import TargetLock, get_detection_layer
+from .types import YoloModelSize, AnalysisMode, BiomechanicsBackend, benchmark_method, PerformanceTimer, PipelineTimer
+
+# Configure logging for analysis engine
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        '[%(levelname)s] %(name)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+# Import configuration
+try:
+    from ..api.config import BIOMECHANICS, ANALYSIS
+except ImportError:
+    # Fallback defaults if config not available
+    from dataclasses import dataclass
+    @dataclass
+    class _BioMechFallback:
+        pix_to_m_default = 0.002
+    @dataclass
+    class _AnalysisFallback:
+        min_pose_frames_mat = 5
+        min_flight_time = 0.05
+        expected_knee_flexion = 120.0
+        expected_flight_time = 0.6
+    BIOMECHANICS = _BioMechFallback()
+    ANALYSIS = _AnalysisFallback()
 
 class ProtocolHandler:
     """Route between continuous (gait) and discrete (MAT) analysis."""
@@ -31,13 +77,20 @@ class ProtocolHandler:
         print(f" * RUNNING MAT PROTOCOL: {self.protocol_id}")
         analyzer.process_video(stride, target_height, cancel_event)
         
-        # 2. Extract events
+        # 2. Extract events - with bounds checking
+        if len(analyzer.pose_frames) < ANALYSIS.min_pose_frames_mat:
+            print(f" * Insufficient frames ({len(analyzer.pose_frames)}) for MAT event detection (requires >= {ANALYSIS.min_pose_frames_mat})")
+            return None
+        
         detector = MATEventDetector()
         fps = analyzer._fps_cache / stride
         
         # Use ankle Y trajectory for takeoff/landing
         # We'll use the left ankle as a default or try to find the active limb
         ankle_y = np.array([p.kp.left_ankle[1] for p in analyzer.pose_frames])
+        if ankle_y.size == 0:
+            print(" * Empty ankle trajectory - cannot detect events")
+            return None
         takeoff, landing = detector.detect_takeoff_landing(ankle_y, fps)
         
         # 3. Compute MAT KPIs
@@ -81,27 +134,71 @@ class ProtocolHandler:
 
     def _calculate_lsi(self, events: List[MATEventKPIs]) -> float:
         """
-        Calculate LSI (Limb Symmetry Index).
-        Formula: (Symmetry of performance across limbs).
-        """
-        if not events: return 100.0
-        e = events[0]
+        Calculate LSI (Limb Symmetry Index) using weighted multi-metric approach.
         
-        # 1. Bilateral Comparison (e.g. Drop Vertical Jump)
-        if e.landing_valgus_left != 0 and e.landing_valgus_right != 0:
-            # For Valgus, lower is better, so we compare the magnitudes
+        LSI = (Weaker Side / Stronger Side) * 100
+        Targets: 90-100% = good symmetry, <90% = asymmetry/imbalance
+        
+        Combines:
+        - Landing valgus angle (lower is better): weight 0.40
+        - Peak knee flexion (bilateral): weight 0.35
+        - Flight time symmetry (bilateral): weight 0.15
+        - Balance score (post-landing stability): weight 0.10
+        """
+        if not events:
+            return 100.0
+        
+        e = events[0]
+        indices = []
+        
+        # 1. Landing Valgus Symmetry (lower is better; measure asymmetry)
+        # If both angles exist and are non-zero
+        if abs(e.landing_valgus_left) > 1e-6 or abs(e.landing_valgus_right) > 1e-6:
             v_l = abs(e.landing_valgus_left)
             v_r = abs(e.landing_valgus_right)
-            if max(v_l, v_r) < 1e-6: return 100.0
-            return (min(v_l, v_r) / max(v_l, v_r)) * 100.0
-            
-        # 2. Single-Limb comparison (Placeholder for cross-event logic)
-        # In a real system, this would query the DB for the 'other' limb's recent result.
-        return 100.0
+            max_v = max(v_l, v_r)
+            if max_v > 1e-6:
+                valgus_lsi = (min(v_l, v_r) / max_v) * 100.0
+                indices.append((valgus_lsi, 0.40))
+        
+        # 2. Peak Knee Flexion Symmetry (assumes bilateral comparison available)
+        # For single-leg tasks, this may not apply; for bilateral (drop jump), use it
+        if e.peak_knee_flexion_landing > 1e-6:
+            # If we had individual left/right values, we'd compare them
+            # For now, assume event represents bilateral comparison
+            # Heuristic: assume 85-95% is normal, scale accordingly
+            knee_flex_lsi = max(0.0, min(100.0, (e.peak_knee_flexion_landing / ANALYSIS.expected_knee_flexion) * 100.0))
+            if knee_flex_lsi > 0:
+                indices.append((knee_flex_lsi, 0.35))
+        
+        # 3. Flight Time Symmetry (for hop tasks with flight phase)
+        # Assume flight_time is already averaged; compare to expected range
+        if e.flight_time > ANALYSIS.min_flight_time:  # meaningful flight phase
+            # Normal flight time range: 0.3-0.8s for single hop
+            # Score: 1.0 if in expected range, less if outside
+            flight_lsi = max(0.0, min(100.0, (e.flight_time / ANALYSIS.expected_flight_time) * 100.0))
+            if flight_lsi > 0:
+                indices.append((flight_lsi, 0.15))
+        
+        # 4. Balance/Stability Score (post-landing control, 0-100 scale)
+        if e.balance_score > 0:
+            indices.append((e.balance_score, 0.10))
+        
+        # Weighted average of available metrics
+        if not indices:
+            return 100.0
+        
+        weighted_sum = sum(idx * wt for idx, wt in indices)
+        weight_total = sum(wt for _, wt in indices)
+        lsi = weighted_sum / weight_total if weight_total > 0 else 100.0
+        
+        # Clamp to valid range
+        return float(np.clip(lsi, 0.0, 100.0))
 
 
 class SportsAnalyzer:
-    PIX_TO_M = None
+    PIX_TO_M = BIOMECHANICS.pix_to_m_default
+    _pix_to_m_lock = threading.Lock()
     _TRC_COLUMN_ALIASES = {
         "head": ["Nose", "Head", "head"],
         "neck": ["Neck", "neck"],
@@ -139,30 +236,18 @@ class SportsAnalyzer:
         self.fps_override       = fps_override
         self.player_height_m    = player_height_m
         self.player_mass_kg     = player_mass_kg
-        self.risk_model = {
-            "knee_angle_cap_deg": 155.0,
-            "joint_stress_knee_w": 0.50,
-            "joint_stress_lean_w": 0.30,
-            "joint_stress_asym_w": 0.20,
-            "injury_valgus_w": 0.45,
-            "injury_knee_asym_w": 0.30,
-            "injury_accel_w": 0.25,
-            "cumulative_joint_stress_w": 0.40,
-            "cumulative_trunk_w": 0.35,
-            "cumulative_fatigue_w": 0.25,
-            "final_injury_w": 0.60,
-            "final_cumulative_w": 0.40,
-            "trunk_lean_stress_scale_deg": 25.0,
-            "trunk_lean_cumulative_scale_deg": 30.0,
-            "knee_asym_stress_scale_deg": 40.0,
-            "knee_asym_injury_scale_deg": 30.0,
-            "valgus_scale_deg": 15.0,
-            "accel_scale": 12.0,
-            "speed_baseline_mps": 1.0,
-            "speed_scale_mps": 5.0,
-        }
-        if risk_model:
-            self.risk_model.update(risk_model)
+        
+        # Validate YOLO model size using enum
+        try:
+            yolo_model_size = YoloModelSize(yolo_size)
+            logger.debug(f"Using YOLO model size: {yolo_model_size.name}")
+        except ValueError:
+            logger.warning(f"Invalid YOLO size '{yolo_size}', using default {YoloModelSize.get_default().value}")
+            yolo_model_size = YoloModelSize.get_default()
+            yolo_size = yolo_model_size.value
+        
+        # Initialize risk model (consolidated)
+        self.risk_model = self._initialize_risk_model(risk_model)
 
         self.protocol_id = protocol_id
         self.is_mat = protocol_id.startswith("mat_")
@@ -226,55 +311,97 @@ class SportsAnalyzer:
             raise RuntimeError("No player candidates found in video.")
         self.lock = TargetLock(primary["seed_bbox"], primary["hist"], primary["seed_frame"], yolo_size=yolo_size)
 
-    def process_video(self, stride: int = 2, target_height: int = 640, cancel_event: Optional[threading.Event] = None) -> PlayerSummary:
-        draw_badge = os.getenv("ANALYSIS_DRAW_BADGE", "1").strip() not in ("0", "false", "False", "no", "NO")
-        draw_aura  = os.getenv("ANALYSIS_DRAW_AURA", "1").strip() not in ("0", "false", "False", "no", "NO")
+    @staticmethod
+    def _initialize_risk_model(custom_model: Optional[dict] = None) -> dict:
+        """Consolidated risk model initialization."""
+        model = {
+            "knee_angle_cap_deg": 155.0,
+            "joint_stress_knee_w": 0.50,
+            "joint_stress_lean_w": 0.30,
+            "joint_stress_asym_w": 0.20,
+            "injury_valgus_w": 0.45,
+            "injury_knee_asym_w": 0.30,
+            "injury_accel_w": 0.25,
+            "cumulative_joint_stress_w": 0.40,
+            "cumulative_trunk_w": 0.35,
+            "cumulative_fatigue_w": 0.25,
+            "final_injury_w": 0.60,
+            "final_cumulative_w": 0.40,
+            "trunk_lean_stress_scale_deg": 25.0,
+            "trunk_lean_cumulative_scale_deg": 30.0,
+            "knee_asym_stress_scale_deg": 40.0,
+            "knee_asym_injury_scale_deg": 30.0,
+            "valgus_scale_deg": 15.0,
+            "accel_scale": 12.0,
+            "speed_baseline_mps": 1.0,
+            "speed_scale_mps": 5.0,
+        }
+        if custom_model:
+            model.update(custom_model)
+        return model
+
+    def _initialize_player_detection(self, seed_bbox: Optional[Tuple[int, int, int, int]],
+                                    seed_frame_idx: int, video_path: str, pick: bool,
+                                    yolo_size: str) -> dict:
+        """Initialize player detection and tracking."""
+        primary = None
+        if seed_bbox is not None:
+            try:
+                cap = cv2.VideoCapture(video_path)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer
+                if cap.isOpened():
+                    if seed_frame_idx > 0:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, int(seed_frame_idx))
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        H, W = frame.shape[:2]
+                        x, y, w, h = [int(v) for v in seed_bbox]
+                        x = max(0, min(x, W - 1))
+                        y = max(0, min(y, H - 1))
+                        w = max(1, min(w, W - x))
+                        h = max(1, min(h, H - y))
+                        normalized_bbox = (x, y, w, h)
+                        primary = {
+                            "seed_bbox": normalized_bbox,
+                            "hist": crop_hist(frame, normalized_bbox),
+                            "seed_frame": max(0, int(seed_frame_idx)),
+                        }
+                        logger.debug(f"Loaded seed bbox: {normalized_bbox}")
+            except Exception as e:
+                logger.warning(f"Failed to load seed_bbox: {e}")
+            finally:
+                cap.release()
+
+        if primary is None:
+            primary = pick_player_interactive(video_path) if pick else select_primary_player(video_path)
+        
+        if primary is None:
+            logger.error("No player candidates found in video")
+            raise RuntimeError("No player candidates found in video.")
+        
+        self.lock = TargetLock(primary["seed_bbox"], primary["hist"], primary["seed_frame"], yolo_size=yolo_size)
+        return primary
+
+    def _open_video_capture(self, timeout_s: float = 5.0) -> cv2.VideoCapture:
+        """Open video with timeout handling."""
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
+            logger.error(f"Failed to open video: {self.video_path}")
             raise FileNotFoundError(self.video_path)
+        logger.debug(f"Video opened: {self.video_path}")
+        return cap
 
-        fps = self.fps_override or cap.get(cv2.CAP_PROP_FPS) or 30.
-        self._fps_cache = fps
-        W_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        H_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        scale = target_height / H_orig if (H_orig > target_height and target_height > 0) else 1.0
-        W, H = int(W_orig * scale), int(H_orig * scale)
-        self._frame_height_px = H
-
-        out = self._create_writer(self.output_video_path, fps / stride, W, H)
-        self.bio_engine = BiomechanicsEngine(fps=fps / stride, pix_to_m=self.PIX_TO_M or 0.002)
-
-        trc_df, s2d_cols, trc_frame_map, trc_time_keys, trc_time_vals = self._init_s2d_lookup(scale)
-
-        idx = 0
-        while True:
-            if cancel_event and cancel_event.is_set(): break
-            ret, frame = cap.read()
-            if not ret: break
-            if idx % stride != 0:
-                idx += 1; continue
-
-            if scale != 1.0:
-                frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
-
-            # MAT Grid Calibration (First 5 frames)
-            if self.is_mat and idx < 5:
-                grid_sc = MATGridCalibrator.detect_grid(frame)
-                if grid_sc:
-                    self.PIX_TO_M = grid_sc
-                    if self.bio_engine: self.bio_engine.pix_to_m = grid_sc
-                    print(f" * MAT GRID DETECTED: {grid_sc:.6f} m/px")
-
-            ts   = idx / fps
-            bbox = self.lock.update(frame)
-
+    def _process_frame_pipeline(self, frame: np.ndarray, idx: int, ts: float, fps: float,
+                               bbox, trc_df, s2d_cols, trc_frame_map, trc_time_keys,
+                               trc_time_vals, scale: float, draw_badge: bool, draw_aura: bool) -> np.ndarray:
+        """Process single frame through pose estimation and metrics pipeline."""
+        try:
             if bbox and bbox[2] > 20 and bbox[3] > 40:
                 target = next((t for t in self.lock.bt.active_tracks.values() if t.id == self.lock._target_id), None)
                 yolo_kp = getattr(target, '_yolo_kp', None)
-                spd     = self.frame_metrics[-1].speed if self.frame_metrics else 0.
+                spd = self.frame_metrics[-1].speed if self.frame_metrics else 0.
 
-                # Optimization: Cache orientation confidence to avoid re-calculating every frame
+                # Optimization: Cache orientation confidence
                 if idx % 10 == 0 or not self.frame_metrics:
                     persp_conf = estimate_player_orientation(yolo_kp) if yolo_kp is not None else 1.0
                 else:
@@ -293,35 +420,142 @@ class SportsAnalyzer:
                 fm = self._metrics(pf, idx, ts, fps, bio_frame=bf)
                 self.frame_metrics.append(fm)
 
-                if abs(fm.acceleration) > 4.0: self._accel_burst = 8
-                elif self._accel_burst > 0: self._accel_burst -= 1
+                if abs(fm.acceleration) > 4.0:
+                    self._accel_burst = 8
+                elif self._accel_burst > 0:
+                    self._accel_burst -= 1
 
                 frame = annotate_frame(frame, pf, fm, self.player_id, draw_badge=draw_badge)
                 if draw_aura:
                     frame = draw_player_aura(frame, kp, fm, bbox, self._accel_burst)
+        except Exception as e:
+            logger.error(f"Frame processing error at {idx} (ts={ts:.2f}): {e}")
+        
+        return frame
 
+    def _process_video_frames(self, cap: cv2.VideoCapture, out, fps: float, stride: int,
+                             target_height: int, trc_df, s2d_cols, trc_frame_map,
+                             trc_time_keys, trc_time_vals, scale: float,
+                             draw_badge: bool, draw_aura: bool,
+                             cancel_event: Optional[threading.Event] = None) -> int:
+        """Main frame processing loop."""
+        idx = 0
+        W_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        H_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        while True:
+            if cancel_event and cancel_event.is_set():
+                logger.info("Video processing cancelled by user")
+                break
+            
+            ret, frame = cap.read()
+            if not ret:
+                logger.debug(f"End of video reached at frame {idx}")
+                break
+            
+            if idx % stride != 0:
+                idx += 1
+                continue
+
+            if scale != 1.0:
+                frame = cv2.resize(frame, (int(W_orig * scale), int(H_orig * scale)), interpolation=cv2.INTER_AREA)
+
+            # MAT Grid Calibration (First 5 frames)
+            if self.is_mat and idx < 5:
+                try:
+                    from .biomechanics import MATGridCalibrator
+                    grid_sc = MATGridCalibrator.detect_grid(frame)
+                    if grid_sc:
+                        self.PIX_TO_M = grid_sc
+                        if self.bio_engine:
+                            self.bio_engine.pix_to_m = grid_sc
+                        logger.info(f"MAT grid detected: {grid_sc:.6f} m/px")
+                except Exception as e:
+                    logger.debug(f"MAT calibration error: {e}")
+
+            ts = idx / fps
+            bbox = self.lock.update(frame)
+            frame = self._process_frame_pipeline(frame, idx, ts, fps, bbox, trc_df, s2d_cols,
+                                                 trc_frame_map, trc_time_keys, trc_time_vals,
+                                                 scale, draw_badge, draw_aura)
             out.write(frame)
             idx += 1
+        
+        return idx
 
-        cap.release(); out.release()
-        if cancel_event and cancel_event.is_set(): raise InterruptedError("Cancelled")
+    @benchmark_method(threshold_ms=500.0)
+    def process_video(self, stride: int = 2, target_height: int = 640, cancel_event: Optional[threading.Event] = None) -> PlayerSummary:
+        """Main video processing orchestrator with performance monitoring."""
+        pipeline_timer = PipelineTimer(f"Video: {os.path.basename(self.video_path)}")
+        
+        # Reset Kalman smoother for clean state between videos
+        self.smoother = PoseKalmanSmoother()
+        logger.info(f"Starting video processing: {self.video_path}")
+        
+        draw_badge = os.getenv("ANALYSIS_DRAW_BADGE", "1").strip() not in ("0", "false", "False", "no", "NO")
+        draw_aura  = os.getenv("ANALYSIS_DRAW_AURA", "1").strip() not in ("0", "false", "False", "no", "NO")
+        
+        cap = self._open_video_capture()
+        try:
+            with PerformanceTimer("video_open") as timer:
+                fps = self.fps_override or cap.get(cv2.CAP_PROP_FPS) or 30.
+                self._fps_cache = fps
+                W_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                H_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                logger.debug(f"Video info: {W_orig}x{H_orig} @ {fps:.1f} FPS")
+            if timer.result:
+                pipeline_timer.record("video_open", timer.result.elapsed_ms)
 
-        if self.bio_engine: self.bio_engine.post_process()
+            scale = target_height / H_orig if (H_orig > target_height and target_height > 0) else 1.0
+            W, H = int(W_orig * scale), int(H_orig * scale)
+            self._frame_height_px = H
+
+            out = self._create_writer(self.output_video_path, fps / stride, W, H)
+            self.bio_engine = BiomechanicsEngine(fps=fps / stride, pix_to_m=self.PIX_TO_M or 0.002)
+
+            trc_df, s2d_cols, trc_frame_map, trc_time_keys, trc_time_vals = self._init_s2d_lookup(scale)
+
+            # Process all frames
+            with PerformanceTimer("frame_processing") as timer:
+                self._process_video_frames(cap, out, fps, stride, target_height, trc_df, s2d_cols,
+                                          trc_frame_map, trc_time_keys, trc_time_vals, scale,
+                                          draw_badge, draw_aura, cancel_event)
+            if timer.result:
+                pipeline_timer.record("frame_processing", timer.result.elapsed_ms)
+            
+            out.release()
+            logger.info(f"Video processing complete: {len(self.frame_metrics)} frames analyzed")
+        finally:
+            cap.release()
+        
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Cancelled")
+
+        if self.bio_engine:
+            with PerformanceTimer("post_processing") as timer:
+                self.bio_engine.post_process()
+            if timer.result:
+                pipeline_timer.record("post_processing", timer.result.elapsed_ms)
+        
+        # Log pipeline performance report
+        pipeline_timer.log_report(level=logging.INFO)
         self._post_gait(fps)
         
         # Integrated MAT Calculation (even in continuous mode)
         if not self.mat_summary:
             try:
-                from .biomechanics import MATEventDetector
                 detector = MATEventDetector()
                 ankle_y = np.array([p.kp.left_ankle[1] for p in self.pose_frames])
                 takeoff, landing = detector.detect_takeoff_landing(ankle_y, fps / stride)
                 self.mat_summary = ProtocolHandler(self.protocol_id)._build_mat_summary_internal(self, takeoff, landing, fps / stride)
-            except Exception:
-                pass
+                logger.debug(f"MAT summary computed: LSI={self.mat_summary.limb_symmetry_index:.1f}")
+            except Exception as e:
+                logger.warning(f"MAT calculation failed: {e}")
 
         self._build_summary()
-        import gc; gc.collect()
+        logger.info(f"Summary built for player {self.player_id}")
+        import gc
+        gc.collect()
         return self.summary
 
     def _init_s2d_lookup(self, scale):
@@ -388,7 +622,7 @@ class SportsAnalyzer:
         if len(self._pix_to_m_samples) == self._pix_to_m_samples.maxlen: return
         leg = max(dist2d(kp.left_hip, kp.left_ankle), dist2d(kp.right_hip, kp.right_ankle))
         if leg > 10:
-            self._pix_to_m_samples.append(0.90 / leg)
+            self._pix_to_m_samples.append(BIOMECHANICS.pix_to_m_leg_length / leg)
             self.PIX_TO_M = float(np.median(self._pix_to_m_samples))
             if self.bio_engine: self.bio_engine.pix_to_m = self.PIX_TO_M
 

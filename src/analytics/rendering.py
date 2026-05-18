@@ -1,4 +1,4 @@
-import cv2
+from .cv_wrapper import cv2
 import numpy as np
 from typing import Optional, List, Tuple
 from .models import PoseKeypoints, PoseFrame, FrameMetrics

@@ -44,6 +44,12 @@ def run_full_analysis_job(
             log_step(job_id, msg, job_logs, cancel_event)
 
         step("Initializing AI environment...")
+        # Ensure OpenCV is properly initialized before any other analytics imports
+        from src.analytics.cv_wrapper import cv2
+        if cv2 is None or not hasattr(cv2, 'VideoCapture'):
+            step("CRITICAL ERROR: OpenCV (cv2) initialization failed. VideoCapture not found.")
+            raise ImportError("module 'cv2' has no attribute 'VideoCapture'")
+            
         from src.analytics.sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D, ProtocolHandler
 
         with tempfile.TemporaryDirectory() as temp_dir:

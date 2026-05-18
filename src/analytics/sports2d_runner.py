@@ -1,9 +1,38 @@
 """Sports2D execution and native output discovery."""
 
-from .core import *  # noqa: F401,F403
+import os
+import traceback
 import multiprocessing as mp
+import logging
 import re
+from .cv_wrapper import cv2
+from pathlib import Path
+from typing import Optional, List
 
+import numpy as np
+import pandas as pd
+
+from .core import HAS_SPORTS2D, SPORTS2D_PROCESS
+from .math_utils import crop_hist
+
+logger = logging.getLogger(__name__)
+
+
+def _validate_sports2d_result_path(path: str, base_dir: str) -> str:
+    """
+    Validate that result path stays within base_dir (prevent path traversal).
+    Raises ValueError if path attempts to escape base directory.
+    """
+    try:
+        base = Path(base_dir).resolve()
+        target = Path(path).resolve()
+        # Ensure target is within base directory
+        target.relative_to(base)
+        return str(target)
+    except (ValueError, RuntimeError) as e:
+        raise ValueError(
+            f"Invalid result path '{path}': attempts to escape base directory '{base_dir}'"
+        ) from e
 
 def _sports2d_worker(config: dict, result_queue):
     """Run Sports2D in a child process and report success/failure."""
@@ -186,44 +215,89 @@ class Sports2DRunner:
         ctx = mp.get_context("spawn")
         q = ctx.Queue()
         p = ctx.Process(target=_sports2d_worker, args=(config, q), daemon=True)
+        
+        logger.info(f"Starting Sports2D analysis: video={video_abs}, timeout={timeout_s}s")
         p.start()
         p.join(timeout=timeout_s)
 
-        if p.is_alive():
-            p.terminate()
-            p.join(10)
-            print(f"[S2D] Sports2D timed out after {timeout_s}s and was terminated.")
-            return {}
-
         worker_result = None
+        process_failed = False
+        process_timeout = False
+
+        # 1. Check if process is still alive (timeout)
+        if p.is_alive():
+            process_timeout = True
+            logger.warning(f"Sports2D timed out after {timeout_s}s, attempting graceful termination...")
+            p.terminate()
+            # Give 10s for graceful termination
+            p.join(timeout=10)
+            if p.is_alive():
+                # Force kill if still alive
+                logger.error("Sports2D did not respond to terminate, force killing...")
+                p.kill()
+                p.join(timeout=2)
+            logger.error(f"Sports2D process terminated after timeout")
+
+        # 2. Attempt to retrieve result from queue with timeout/error handling
         try:
+            # Use timeout to avoid indefinite blocking if queue is deadlocked
             if not q.empty():
-                worker_result = q.get_nowait()
-        except Exception:
+                try:
+                    worker_result = q.get(timeout=2)
+                    logger.debug("Sports2D worker result retrieved successfully")
+                except Exception as e:
+                    logger.error(f"Failed to retrieve worker result: {e}")
+                    worker_result = None
+        except Exception as e:
+            logger.error(f"Queue retrieval failed: {e}")
             worker_result = None
         finally:
+            # Aggressive queue cleanup to prevent resource leaks
+            try:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except Exception:
+                        break
+            except Exception:
+                pass
             try:
                 q.close()
+                q.join_thread()
             except Exception:
                 pass
 
+        # 3. Validate exit code and worker result
         if p.exitcode not in (0, None):
+            process_failed = True
             print(f"[S2D] Sports2D subprocess exited with code {p.exitcode}.")
             if worker_result and not worker_result.get("ok", False):
-                print(f"[S2D] Sports2D.process() failed: {worker_result.get('error')}")
+                print(f"[S2D] Error: {worker_result.get('error', 'Unknown error')}")
                 tb = worker_result.get("traceback")
                 if tb:
                     print(tb)
-            return {}
 
+        # 4. Check worker-reported errors (graceful process exit but execution failed)
         if worker_result and not worker_result.get("ok", False):
-            print(f"[S2D] Sports2D.process() failed: {worker_result.get('error')}")
+            process_failed = True
+            print(f"[S2D] Execution failed: {worker_result.get('error', 'Unknown error')}")
             tb = worker_result.get("traceback")
             if tb:
                 print(tb)
-            return {}
 
+        # 5. Attempt to recover partial outputs even if process failed
+        # (Sports2D may have written some results before crashing)
         self.outputs = self._collect_outputs()
+        
+        if process_failed or process_timeout:
+            # Log recovery attempt
+            recovered_count = sum(len(v) for v in self.outputs.values() if isinstance(v, list))
+            if recovered_count > 0:
+                print(f"[S2D] Recovered {recovered_count} partial output files despite process failure.")
+            elif process_failed:
+                print(f"[S2D] No partial outputs recovered.")
+                return {}
+        
         return self.outputs
 
     def _collect_outputs(self) -> dict:
@@ -247,29 +321,35 @@ class Sports2DRunner:
                 f = os.path.join(root, filename)
                 if not os.path.isfile(f):
                     continue
-                out["all"].append(f)
-                fl   = f.lower()
+                try:
+                    # Validate path to prevent traversal attacks
+                    validated_path = _validate_sports2d_result_path(f, rd)
+                except ValueError:
+                    # Skip invalid paths
+                    continue
+                out["all"].append(validated_path)
+                fl   = validated_path.lower()
                 name = os.path.basename(fl)
                 if fl.endswith((".mp4", ".avi")):
                     if "_h264" not in name:
-                        out["annotated_video"].append(f)
+                        out["annotated_video"].append(validated_path)
                 elif fl.endswith(".png"):
-                    out["angle_plots_png"].append(f)
+                    out["angle_plots_png"].append(validated_path)
                 elif fl.endswith(".trc"):
                     if "_px" in name or "pixel" in name:
-                        out["trc_pose_px"].append(f)
+                        out["trc_pose_px"].append(validated_path)
                     else:
-                        out["trc_pose_m"].append(f)
+                        out["trc_pose_m"].append(validated_path)
                 elif fl.endswith(".mot"):
-                    out["osim_mot" if "ik" in name else "mot_angles"].append(f)
+                    out["osim_mot" if "ik" in name else "mot_angles"].append(validated_path)
                 elif fl.endswith(".toml"):
-                    out["calib_toml"].append(f)
+                    out["calib_toml"].append(validated_path)
                 elif fl.endswith(".c3d"):
-                    out["c3d"].append(f)
+                    out["c3d"].append(validated_path)
                 elif fl.endswith(".osim"):
-                    out["osim_model"].append(f)
+                    out["osim_model"].append(validated_path)
                 elif fl.endswith(".xml"):
-                    out["osim_setup"].append(f)
+                    out["osim_setup"].append(validated_path)
         return out
 
     def get_seed_from_trc(self) -> Optional[dict]:
@@ -309,8 +389,11 @@ class Sports2DRunner:
             row = df.iloc[0]
             def _val(col):
                 try:
-                    return float(pd.to_numeric(row.get(col), errors="coerce"))
-                except Exception:
+                    val = row.get(col)
+                    if val is None:
+                        return float("nan")
+                    return float(val)
+                except (ValueError, TypeError):
                     return float("nan")
 
             xs: List[float] = []

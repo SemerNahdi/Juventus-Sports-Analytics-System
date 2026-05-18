@@ -1,4 +1,4 @@
-import cv2
+from .cv_wrapper import cv2
 import numpy as np
 import os
 import threading
@@ -495,6 +495,18 @@ def _get_or_load_yolo_model(model_size="m"):
             _yolo_models[model_size] = model
         return model
 
+def preload_yolo_models(sizes: Optional[List[str]] = None):
+    """Pre-load YOLO models into memory for faster first-request response."""
+    if not HAS_YOLO:
+        return
+    if sizes is None:
+        sizes = ["n", "m"] # Preload common sizes
+    for sz in sizes:
+        try:
+            print(f"[TRACKING] Pre-loading YOLOv8/11 {sz} model...")
+            _get_or_load_yolo_model(sz)
+        except Exception as e:
+            print(f"[TRACKING] Failed to pre-load YOLO {sz}: {e}")
 
 def get_detection_layer(model_size="m") -> DetectionLayer:
     shared_yolo = _get_or_load_yolo_model(model_size)

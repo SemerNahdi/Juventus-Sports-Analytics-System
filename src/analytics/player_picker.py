@@ -1,9 +1,9 @@
-import cv2
 import math
 import numpy as np
 from typing import Optional, List, Tuple
 from .math_utils import crop_hist, bbox_iou, _size_sim
 from .tracking import get_detection_layer
+from .cv_wrapper import cv2
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  INTERACTIVE PLAYER PICKER

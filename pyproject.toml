@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sports-analytics"
+version = "1.0.0"
+description = "Advanced sports performance analytics with pose estimation and biomechanics"
+authors = [{name = "Sports Analytics Team"}]
+requires-python = ">=3.9"
+dependencies = [
+    "ultralytics",
+    "opencv-python",
+    "numpy<2.0.0",
+    "pandas",
+    "scipy",
+    "matplotlib",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "python-dotenv",
+    "supabase",
+    "cloudinary",
+    "psutil",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.7.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+biomechanics = [
+    "sports2d",
+    "pose2sim",
+]
+
+[tool.mypy]
+# Global mypy configuration for Sports Analytics
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_no_return = true
+strict_optional = true
+check_untyped_defs = true
+no_implicit_optional = true
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
+
+# Per-module overrides for gradual type adoption
+[[tool.mypy.overrides]]
+module = [
+    "ultralytics",
+    "cv2",
+    "scipy",
+    "sports2d",
+    "pose2sim",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "numpy"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "--cov=src/analytics --cov-report=html --cov-report=term"
+
+[tool.coverage.run]
+source = ["src/analytics"]
+branch = true
+omit = ["*/tests/*", "*/test_*.py"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311"]
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+select = ["E", "F", "W", "I", "N", "UP", "B"]
+ignore = ["E501"]  # Line too long (handled by black)

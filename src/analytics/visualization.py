@@ -1,6 +1,25 @@
 """Analytics visualization and plot generation - Clean white theme."""
 
-from .core import *  # noqa: F401,F403
+import json
+import os
+import logging
+from typing import List, Optional
+from dataclasses import asdict
+from collections import deque
+
+import numpy as np
+import pandas as pd
+
+try:
+    import matplotlib.pyplot as _plt
+    import matplotlib.patches as mpatches
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
+from .models import FrameMetrics, BioFrame, MATSummary
+from .math_utils import clean_nans
+from .types import ExportFormat, benchmark_method, PerformanceTimer
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLEAN WHITE THEME - Professional, crisp, publication-ready
@@ -367,7 +386,10 @@ class AnalyticsPlotter:
         ax.set_yticks([])
         
         handles, labels = ax.get_legend_handles_labels()
-        unique = dict.fromkeys(zip(labels, handles))
+        unique = {}
+        for h, l in zip(handles, labels):
+            if l not in unique:
+                unique[l] = h
         ax.legend(unique.values(), unique.keys(), loc="upper right",
                   fontsize=PlotStyle.LEGEND_SIZE, ncol=2)
         
@@ -448,12 +470,25 @@ class AnalyticsPlotter:
         self._save(fig, "risk_scores")
 
     def plot_energy(self, frame_metrics: List[FrameMetrics]):
+        """Plot energy expenditure over time."""
         if not frame_metrics or not HAS_MPL:
             return
         import matplotlib.pyplot as _plt
         
         ts = [f.timestamp for f in frame_metrics]
         energy = [f.energy_expenditure for f in frame_metrics]
+        
+        fig, ax = self._setup_figure((PlotStyle.FIG_WIDTH_SINGLE, PlotStyle.FIG_HEIGHT_SINGLE),
+                                      f"Player #{self.player_id} — Energy Expenditure")
+        ax.plot(ts, energy, color=PlotColors.PRIMARY_ORANGE, linewidth=PlotStyle.LINE_WIDTH_MAIN,
+                label="Energy (kcal/min)", solid_capstyle='round')
+        ax.fill_between(ts, energy, alpha=PlotColors.FILL_ALPHA, color=PlotColors.PRIMARY_ORANGE)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Energy Expenditure (kcal/min)")
+        ax.legend(loc="upper right", fontsize=PlotStyle.LEGEND_SIZE)
+        self._style_ax(ax)
+        _plt.tight_layout()
+        self._save(fig, "energy_expenditure")
 
         fig, ax = self._setup_figure((PlotStyle.FIG_WIDTH_SINGLE, PlotStyle.FIG_HEIGHT_SINGLE),
                                       f"Player #{self.player_id} — Metabolic Power")
@@ -524,18 +559,33 @@ class AnalyticsPlotter:
         _plt.tight_layout()
         self._save(fig, "mat_performance_dashboard")
 
+    @benchmark_method(threshold_ms=200.0)
     def generate_all(self, frame_metrics: List[FrameMetrics], bio_engine: Optional["BiomechanicsEngine"]):
-        """Generate and save all standard plots."""
+        """Generate and save all standard plots with performance monitoring."""
         if not HAS_MPL:
             print("[PLOT] matplotlib not installed — skipping plot generation.")
             print("       Run: pip install matplotlib")
             return
         
         print(f"[PLOT] Generating plots with clean white theme...")
-        self.plot_speed_profile(frame_metrics)
-        self.plot_joint_angles(frame_metrics)
-        self.plot_risk_scores(frame_metrics)
-        self.plot_energy(frame_metrics)
+        
+        plot_methods = [
+            ("speed_profile", lambda: self.plot_speed_profile(frame_metrics)),
+            ("joint_angles", lambda: self.plot_joint_angles(frame_metrics)),
+            ("risk_scores", lambda: self.plot_risk_scores(frame_metrics)),
+            ("energy", lambda: self.plot_energy(frame_metrics)),
+        ]
+        
+        for plot_name, plot_func in plot_methods:
+            with PerformanceTimer(f"plot_{plot_name}") as timer:
+                plot_func()
+            if timer.result:
+                logging.debug(f"📊 {timer.result}")
+        
         if bio_engine and bio_engine.frames:
-            self.plot_biomechanics(bio_engine)
+            with PerformanceTimer("plot_biomechanics") as timer:
+                self.plot_biomechanics(bio_engine)
+            if timer.result:
+                logging.debug(f"📊 {timer.result}")
+        
         print(f"[PLOT] All plots saved to: {self.results_dir}")

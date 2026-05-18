@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from dataclasses import asdict
 from typing import Optional, List, Tuple
-import cv2
+from .cv_wrapper import cv2
 from .models import BioFrame, PoseKeypoints, BIO_ANGLE_FIELDS, PoseFrame
 from .math_utils import (
     s2d_joint_angle, s2d_seg_angle, dist2d, 
