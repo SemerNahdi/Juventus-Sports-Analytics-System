@@ -295,9 +295,9 @@ def main():
         json.dump(perf_data, f, indent=2)
     print(f"   • Performance Metrics : {perf_out}")
 
-    if args.sports2d and sports2d_runner and sports2d_runner.outputs:
+    if args.sports2d and analyzer.sports2d_runner and analyzer.sports2d_runner.outputs:
         print(f"\n🏟️  Sports2D Outputs ({sports2d_dir}):")
-        s2d = sports2d_runner.outputs
+        s2d = analyzer.sports2d_runner.outputs
         for key, files in s2d.items():
             if files:
                 if isinstance(files, list):

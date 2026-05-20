@@ -296,7 +296,7 @@
                     currentStatus.style.color = "#ef4444";
                     loaderText.innerText = data.error || (data.status === 'cancelled' ? "Job stopped by user." : "A critical error occurred in the AI engine.");
                     
-                    submitBtn.disabled = false;
+                    uploadPreviewBtn.disabled = false;
                     cancelBtn.style.display = 'none';
                     
                     addLog(data.status === 'cancelled' ? "JOB STOPPED: User Aborted" : "CRITICAL ERROR: " + (data.error || "Engine Stopped"));
@@ -435,6 +435,10 @@
         }
 
         previewImage.addEventListener('click', mapClickToCandidate);
+
+        frameSlider.addEventListener('input', () => {
+            frameLabel.textContent = String(frameSlider.value);
+        });
 
         backToUploadBtn.onclick = () => {
             previewSessionId = null;

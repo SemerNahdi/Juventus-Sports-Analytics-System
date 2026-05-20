@@ -20,6 +20,7 @@ const API_BASE = window.location.origin;
 let jobPollInterval = null;
 let jobPollLogIndex = 0;
 let activePollingJobId = null;
+let currentJobId = null;
 
 const IN_PROGRESS_STATUSES = new Set(['processing', 'pending', 'cancelling']);
 
@@ -294,6 +295,9 @@ async function pollJobUntilDone(jobId) {
 
 function routeAnalysisView(analysis, jobId) {
     if (!analysis) return;
+    if (jobId || analysis.id) {
+        currentJobId = jobId || analysis.id;
+    }
     if (isJobInProgress(analysis.status)) {
         showProcessingPanel(analysis);
         startJobPolling(jobId || analysis.id);
@@ -401,6 +405,9 @@ function displayAnalysis(analysis) {
         return;
     }
     hideProcessingPanel();
+    if (analysis.id) {
+        currentJobId = analysis.id;
+    }
     const envelope = getAnalysisEnvelope(analysis);
 
     // Update Header
