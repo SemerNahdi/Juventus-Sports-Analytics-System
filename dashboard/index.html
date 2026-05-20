@@ -16,6 +16,12 @@
         @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
         
         .upload-card { max-width: 800px; margin: 2rem auto; width: 100%; }
+        .selection-view { display: none; width: 100%; max-width: 960px; margin: 0 auto; }
+        .preview-wrap { position: relative; border-radius: 12px; overflow: hidden; border: 1px solid rgba(0, 240, 255, 0.2); cursor: crosshair; }
+        .preview-wrap img { width: 100%; display: block; vertical-align: top; }
+        .candidate-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1rem 0; }
+        .candidate-btn { padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid rgba(0, 240, 255, 0.35); background: rgba(0, 240, 255, 0.08); color: var(--text-primary); cursor: pointer; }
+        .candidate-btn.selected { border-color: var(--accent-neon); background: rgba(0, 240, 255, 0.2); }
         .processing-view { display: none; flex-direction: column; align-items: center; justify-content: center; flex: 1; text-align: center; }
         .loading-ring-large { width: 150px; height: 150px; border: 4px solid rgba(0, 240, 255, 0.05); border-top: 4px solid var(--accent-neon); border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 3rem; position: relative; box-shadow: 0 0 40px rgba(0, 240, 255, 0.1); }
         .loading-ring-large::after { content: ''; position: absolute; inset: 15px; border: 4px solid rgba(0, 153, 255, 0.05); border-bottom: 4px solid #0099ff; border-radius: 50%; animation: spin 1.5s linear reverse infinite; }
@@ -87,10 +93,6 @@
                                     <input type="checkbox" id="run_sports2d" name="run_sports2d" checked>
                                     <label for="run_sports2d" style="margin: 0;">Enable 3D Joint Analysis</label>
                                 </div>
-                                <div class="form-group" style="display: flex; align-items: center; gap: 1rem;">
-                                    <input type="checkbox" id="pick" name="pick">
-                                    <label for="pick" style="margin: 0;">Manual Athlete Selection</label>
-                                </div>
                                 <div class="form-group" style="margin-top: 1rem;">
                                     <label>Email Notification</label>
                                     <input type="email" id="email" name="email" placeholder="coach@example.com" style="width: 100%;">
@@ -117,12 +119,43 @@
                                         <input type="file" id="file" name="file" accept="video/*" style="display: none;">
                                     </div>
                                 </div>
-                                <button type="submit" id="submitBtn" class="btn btn-primary" style="width: 100%; margin-top: 1rem;">
-                                    <i class="fa-solid fa-play"></i> Start Analysis
+                                <button type="button" id="uploadPreviewBtn" class="btn btn-primary" style="width: 100%; margin-top: 1rem;">
+                                    <i class="fa-solid fa-user-check"></i> Upload &amp; Select Player
                                 </button>
                             </div>
                         </div>
                     </form>
+                </div>
+            </div>
+
+            <!-- PLAYER SELECTION -->
+            <div id="selectionView" class="selection-view fade-in">
+                <header class="analysis-header" style="margin-bottom: 1.5rem;">
+                    <div>
+                        <button type="button" id="backToUploadBtn" class="back-link" style="background:none;border:none;cursor:pointer;">
+                            <i class="fa-solid fa-chevron-left"></i> Back
+                        </button>
+                        <h1 style="font-size: 2rem; margin-top: 0.5rem;">Select Player to Track</h1>
+                        <p id="selectionStatus" style="color: var(--text-secondary);">Click a numbered box on the preview or choose a button below.</p>
+                    </div>
+                </header>
+
+                <div class="card glass" style="padding: 1.25rem;">
+                    <div class="preview-wrap" id="previewWrap">
+                        <img id="previewImage" alt="Detection preview" />
+                    </div>
+                    <div style="display:flex;align-items:center;gap:1rem;margin-top:1rem;flex-wrap:wrap;">
+                        <label style="color:var(--text-secondary);font-size:0.9rem;">Frame</label>
+                        <input type="range" id="frameSlider" min="0" max="0" value="0" style="flex:1;min-width:120px;" />
+                        <span id="frameLabel" style="color:var(--accent-neon);font-size:0.9rem;">0</span>
+                        <button type="button" id="refreshFrameBtn" class="btn" style="padding:0.4rem 0.8rem;">
+                            <i class="fa-solid fa-rotate"></i> Refresh
+                        </button>
+                    </div>
+                    <div id="candidateButtons" class="candidate-row"></div>
+                    <button type="button" id="startAnalysisBtn" class="btn btn-primary" style="width:100%;margin-top:0.5rem;" disabled>
+                        <i class="fa-solid fa-play"></i> Start Analysis on Selected Player
+                    </button>
                 </div>
             </div>
 
@@ -165,8 +198,9 @@
 
     <script>
         const form = document.getElementById('analysisForm');
-        const submitBtn = document.getElementById('submitBtn');
+        const uploadPreviewBtn = document.getElementById('uploadPreviewBtn');
         const uploadView = document.getElementById('uploadView');
+        const selectionView = document.getElementById('selectionView');
         const processingView = document.getElementById('processingView');
         const progressBar = document.getElementById('progressBar');
         const progressPercent = document.getElementById('progressPercent');
@@ -176,6 +210,16 @@
         const cancelBtn = document.getElementById('cancelBtn');
         const dropZone = document.getElementById('dropZone');
         const fileInput = document.getElementById('file');
+        const previewImage = document.getElementById('previewImage');
+        const candidateButtons = document.getElementById('candidateButtons');
+        const startAnalysisBtn = document.getElementById('startAnalysisBtn');
+        const selectionStatus = document.getElementById('selectionStatus');
+        const frameSlider = document.getElementById('frameSlider');
+        const frameLabel = document.getElementById('frameLabel');
+        const refreshFrameBtn = document.getElementById('refreshFrameBtn');
+        const backToUploadBtn = document.getElementById('backToUploadBtn');
+
+        const PREVIEW_BANNER_H = 40;
 
         function toggleSidebar() {
             document.querySelector('.sidebar').classList.toggle('collapsed');
@@ -183,16 +227,16 @@
 
         let pollInterval = null;
         let lastLogIndex = 0;
+        let previewSessionId = null;
+        let previewCandidates = [];
+        let selectedCandidateIndex = null;
+        let previewMeta = { width: 0, height: 0, frame_idx: 0 };
 
-        // Resume analysis on page load if one was in progress
+        // If a job is still running, open the dashboard (it polls until complete)
         window.addEventListener('load', () => {
             const activeJobId = localStorage.getItem('mitus_active_job_id');
             if (activeJobId) {
-                console.log("Resuming analysis for job:", activeJobId);
-                uploadView.style.display = 'none';
-                processingView.style.display = 'flex';
-                addLog("Resuming analysis for job: " + activeJobId.substring(0, 8));
-                pollInterval = setInterval(() => pollStatus(activeJobId), 2500);
+                window.location.href = `dashboard.html?job_id=${activeJobId}`;
             }
         });
 
@@ -314,43 +358,164 @@
         });
         dropZone.addEventListener('click', () => fileInput.click());
 
-        form.onsubmit = async (e) => {
-            e.preventDefault();
-            
+        form.addEventListener('submit', (e) => e.preventDefault());
+
+        function showView(name) {
+            uploadView.style.display = name === 'upload' ? 'block' : 'none';
+            selectionView.style.display = name === 'selection' ? 'block' : 'none';
+            processingView.style.display = name === 'processing' ? 'flex' : 'none';
+        }
+
+        function renderCandidateButtons() {
+            candidateButtons.innerHTML = '';
+            previewCandidates.forEach((c) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'candidate-btn' + (selectedCandidateIndex === c.index ? ' selected' : '');
+                btn.textContent = `Player ${c.index + 1}` + (c.confidence ? ` (${(c.confidence * 100).toFixed(0)}%)` : '');
+                btn.onclick = () => selectCandidate(c.index);
+                candidateButtons.appendChild(btn);
+            });
+            startAnalysisBtn.disabled = selectedCandidateIndex === null || previewCandidates.length === 0;
+        }
+
+        function selectCandidate(index) {
+            selectedCandidateIndex = index;
+            renderCandidateButtons();
+            selectionStatus.textContent = `Selected player ${index + 1}. Click "Start Analysis" to run the full pipeline.`;
+        }
+
+        function applyPreviewData(data) {
+            previewSessionId = data.session_id;
+            previewCandidates = data.candidates || [];
+            previewMeta = {
+                width: data.width,
+                height: data.height,
+                frame_idx: data.frame_idx,
+            };
+            selectedCandidateIndex = previewCandidates.length === 1 ? 0 : null;
+
+            previewImage.src = 'data:image/jpeg;base64,' + data.image_jpeg_base64;
+            selectionStatus.textContent = data.message || 'Select a player.';
+
+            frameSlider.max = Math.max(0, (data.frame_count || 1) - 1);
+            frameSlider.value = data.frame_idx || 0;
+            frameLabel.textContent = String(data.frame_idx || 0);
+
+            renderCandidateButtons();
+            showView('selection');
+        }
+
+        function mapClickToCandidate(event) {
+            if (!previewCandidates.length || !previewMeta.width) return;
+            const rect = previewImage.getBoundingClientRect();
+            const scaleX = previewMeta.width / rect.width;
+            const scaleY = (previewMeta.height + PREVIEW_BANNER_H) / rect.height;
+            const x = Math.round((event.clientX - rect.left) * scaleX);
+            const y = Math.round((event.clientY - rect.top) * scaleY);
+
+            let best = null;
+            let bestDist = Infinity;
+            const ay = y - PREVIEW_BANNER_H;
+            for (const c of previewCandidates) {
+                const [bx, by, bw, bh] = c.bbox;
+                if (bx <= x && x <= bx + bw && ay >= by && ay <= by + bh) {
+                    selectCandidate(c.index);
+                    return;
+                }
+                const cx = bx + bw / 2;
+                const cy = by + bh / 2;
+                const d = (x - cx) ** 2 + (ay - cy) ** 2;
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = c.index;
+                }
+            }
+            if (best !== null) selectCandidate(best);
+        }
+
+        previewImage.addEventListener('click', mapClickToCandidate);
+
+        backToUploadBtn.onclick = () => {
+            previewSessionId = null;
+            selectedCandidateIndex = null;
+            showView('upload');
+        };
+
+        refreshFrameBtn.onclick = async () => {
+            if (!previewSessionId) return;
+            refreshFrameBtn.disabled = true;
+            const fd = new FormData();
+            fd.append('session_id', previewSessionId);
+            fd.append('frame_idx', frameSlider.value);
+            try {
+                const res = await fetch('/analyze/preview/refresh', { method: 'POST', body: fd });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || data.message || 'Refresh failed');
+                applyPreviewData(data);
+            } catch (err) {
+                alert('Error: ' + err.message);
+            } finally {
+                refreshFrameBtn.disabled = false;
+            }
+        };
+
+        uploadPreviewBtn.onclick = async () => {
             if (fileInput.files.length === 0) {
-                alert("Please select a video file.");
+                alert('Please select a video file.');
                 return;
             }
 
-            submitBtn.disabled = true;
-            submitBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Uploading...';
-            
-            const fd = new FormData(form);
-            const runSports2D = document.getElementById('run_sports2d').checked;
-            const pickManual = document.getElementById('pick').checked;
-            fd.set('run_sports2d', runSports2D ? 'true' : 'false');
-            fd.set('pick', pickManual ? 'true' : 'false');
-            
+            uploadPreviewBtn.disabled = true;
+            uploadPreviewBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Detecting players...';
+
+            const fd = new FormData();
+            fd.append('file', fileInput.files[0]);
+            fd.append('yolo_size', document.getElementById('yolo_size').value);
+
             try {
-                const response = await fetch('/analyze', { method: 'POST', body: fd });
-                const data = await response.json();
-                
-                if (response.status === 202 || response.ok) {
-                    uploadView.style.display = 'none';
-                    processingView.style.display = 'flex';
-                    
-                    addLog("Stream accepted by AI gateway.");
-                    addLog("Job UUID: " + data.job_id);
-                    
+                const res = await fetch('/analyze/preview', { method: 'POST', body: fd });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || data.message || 'Preview failed');
+                applyPreviewData(data);
+            } catch (err) {
+                alert('Error: ' + err.message);
+            } finally {
+                uploadPreviewBtn.disabled = false;
+                uploadPreviewBtn.innerHTML = '<i class="fa-solid fa-user-check"></i> Upload &amp; Select Player';
+            }
+        };
+
+        startAnalysisBtn.onclick = async () => {
+            if (previewSessionId === null || selectedCandidateIndex === null) {
+                alert('Please select a player first.');
+                return;
+            }
+
+            startAnalysisBtn.disabled = true;
+            startAnalysisBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Starting...';
+
+            const fd = new FormData(form);
+            fd.append('session_id', previewSessionId);
+            fd.append('candidate_index', String(selectedCandidateIndex));
+            fd.set('run_sports2d', document.getElementById('run_sports2d').checked ? 'true' : 'false');
+
+            try {
+                const res = await fetch('/analyze/confirm', { method: 'POST', body: fd });
+                const data = await res.json();
+
+                if (res.status === 202 && data.job_id) {
                     localStorage.setItem('mitus_active_job_id', data.job_id);
-                    pollInterval = setInterval(() => pollStatus(data.job_id), 2500);
+                    localStorage.setItem('mitus_latest_job_id', data.job_id);
+                    window.location.href = `dashboard.html?job_id=${data.job_id}`;
+                    return;
                 } else {
-                    throw new Error(data.detail || 'Analysis failed to start');
+                    throw new Error(data.detail || data.message || 'Failed to start analysis');
                 }
             } catch (err) {
-                alert("Error: " + err.message);
-                submitBtn.disabled = false;
-                submitBtn.innerHTML = '<i class="fa-solid fa-play"></i> Start Analysis';
+                alert('Error: ' + err.message);
+                startAnalysisBtn.disabled = false;
+                startAnalysisBtn.innerHTML = '<i class="fa-solid fa-play"></i> Start Analysis on Selected Player';
             }
         };
     </script>

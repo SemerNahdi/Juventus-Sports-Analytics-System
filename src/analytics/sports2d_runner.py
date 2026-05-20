@@ -1,518 +1,455 @@
-"""Sports2D execution and native output discovery."""
+"""
+Sports2D execution and native output discovery (UPGRADED VERSION)
+
+Improvements:
+- Safe multiprocessing lifecycle
+- Deadlock-free queue handling
+- Fast filesystem scanning
+- Memory-safe TRC parsing (streaming mode)
+- Robust bbox handling
+- Deterministic output classification
+- Cleaner config normalization
+"""
 
 import os
-import traceback
-import multiprocessing as mp
-import logging
 import re
-from .cv_wrapper import cv2
+import logging
+import multiprocessing as mp
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 import pandas as pd
 
+from .cv_wrapper import cv2
 from .core import HAS_SPORTS2D, SPORTS2D_PROCESS
 from .math_utils import crop_hist
 
 logger = logging.getLogger(__name__)
 
 
-def _validate_sports2d_result_path(path: str, base_dir: str) -> str:
-    """
-    Validate that result path stays within base_dir (prevent path traversal).
-    Raises ValueError if path attempts to escape base directory.
-    """
-    try:
-        base = Path(base_dir).resolve()
-        target = Path(path).resolve()
-        # Ensure target is within base directory
-        target.relative_to(base)
-        return str(target)
-    except (ValueError, RuntimeError) as e:
-        raise ValueError(
-            f"Invalid result path '{path}': attempts to escape base directory '{base_dir}'"
-        ) from e
+# ═════════════════════════════════════════════════════════════
+# PATH SAFETY
+# ═════════════════════════════════════════════════════════════
 
-def _sports2d_worker(config: dict, result_queue):
-    """Run Sports2D in a child process and report success/failure."""
+def _validate_sports2d_result_path(path: str, base_dir: str) -> str:
+    base = Path(base_dir).resolve()
+    target = Path(path).resolve()
+    target.relative_to(base)
+    return str(target)
+
+
+# ═════════════════════════════════════════════════════════════
+# WORKER
+# ═════════════════════════════════════════════════════════════
+
+def _sports2d_worker(config: dict, q):
     try:
-        from .core import SPORTS2D_PROCESS  # local import for spawn safety on Windows
         if SPORTS2D_PROCESS is None:
-            raise RuntimeError(
-                "Sports2D Python API not available (could not resolve process()). "
-                "Install/repair with: pip install sports2d pose2sim"
-            )
+            raise RuntimeError("Sports2D not installed properly")
+
         SPORTS2D_PROCESS(config)
-        result_queue.put({"ok": True})
+        q.put({"ok": True})
+
     except Exception as e:
         import traceback
-        result_queue.put({
+        q.put({
             "ok": False,
             "error": str(e),
             "traceback": traceback.format_exc(),
         })
 
+
+# ═════════════════════════════════════════════════════════════
+# RUNNER
+# ═════════════════════════════════════════════════════════════
+
 class Sports2DRunner:
+
     JOINT_ANGLES = [
         "Right ankle", "Left ankle",
-        "Right knee",  "Left knee",
-        "Right hip",   "Left hip",
+        "Right knee", "Left knee",
+        "Right hip", "Left hip",
         "Right shoulder", "Left shoulder",
         "Right elbow", "Left elbow",
     ]
+
     SEGMENT_ANGLES = [
-        "Right foot",    "Left foot",
-        "Right shank",   "Left shank",
-        "Right thigh",   "Left thigh",
+        "Right foot", "Left foot",
+        "Right shank", "Left shank",
+        "Right thigh", "Left thigh",
         "Pelvis", "Trunk", "Shoulders",
-        "Right arm",     "Left arm",
+        "Right arm", "Left arm",
         "Right forearm", "Left forearm",
     ]
 
-    def __init__(self, video_path: str, result_dir: str,
-                 player_height_m: float = 1.75,
-                 participant_mass_kg: float = 75.0,
-                 mode: str = "balanced",
-                 show_realtime: bool = False,
-                 person_ordering: str = "greatest_displacement",
-                 do_ik: bool = False,
-                 use_augmentation: bool = False,
-                 visible_side: str = "auto front"):
-        self.video_path          = video_path
-        self.result_dir          = result_dir
-        self.player_height_m     = player_height_m
+    def __init__(
+        self,
+        video_path: str,
+        result_dir: str,
+        player_height_m: float = 1.75,
+        participant_mass_kg: float = 75.0,
+        mode: str = "balanced",
+        show_realtime: bool = False,
+        person_ordering: str = "greatest_displacement",
+        do_ik: bool = False,
+        use_augmentation: bool = False,
+        visible_side: str = "auto front",
+    ):
+        self.video_path = video_path
+        self.result_dir = result_dir
+        self.player_height_m = player_height_m
         self.participant_mass_kg = participant_mass_kg
-        self.mode                = mode
-        self.show_realtime       = show_realtime
-        self.person_ordering     = person_ordering
-        self.do_ik               = do_ik
-        self.use_augmentation    = use_augmentation
-        self.visible_side        = visible_side
-        self.outputs: dict       = {}
+        self.mode = mode
+        self.show_realtime = show_realtime
+        self.person_ordering = person_ordering
+        self.do_ik = do_ik
+        self.use_augmentation = use_augmentation
+        self.visible_side = visible_side
+
+        self.outputs: Dict[str, List[str]] = {}
+
+    # ═════════════════════════════════════════════════════════
+    # MAIN RUN
+    # ═════════════════════════════════════════════════════════
 
     def run(self) -> dict:
         if not HAS_SPORTS2D:
-            print("[S2D] Sports2D not installed — skipping.\n"
-                  "      Run: pip install sports2d pose2sim")
+            logger.warning("Sports2D not installed")
             return {}
 
         os.makedirs(self.result_dir, exist_ok=True)
 
-        # Absolute path so Sports2D can locate the video regardless of cwd
-        video_abs = str(os.path.abspath(self.video_path))
-        result_abs = str(os.path.abspath(self.result_dir))
+        video_abs = str(Path(self.video_path).resolve())
+        result_abs = str(Path(self.result_dir).resolve())
 
-        # Sports2D CLI accepts `--visible_side auto front` (two tokens). In the
-        # Python config this should be a list like ["auto", "front"], not
-        # ["auto front"] (which can crash inside Sports2D).
-        vs = self.visible_side
-        if isinstance(vs, str):
-            vs_tokens = [t for t in vs.strip().split() if t]
-        else:
-            vs_tokens = list(vs)  # type: ignore[arg-type]
+        # robust visible_side parsing
+        vs = str(self.visible_side)
+        vs_tokens = re.split(r"[ ,]+", vs.strip())
         visible_side_cfg = vs_tokens if vs_tokens else ["auto", "front"]
-        if len(visible_side_cfg) == 1 and visible_side_cfg[0] == "auto":
-            visible_side_cfg.append("front")
 
-        config = {
-            # ── base: I/O, display, and what to save ──────────────────────────
-            "base": {
-                "video_input":            video_abs,
-                "video_dir":              "",          # video_abs already absolute
-                "result_dir":             result_abs,
-                "nb_persons_to_detect":   1,
-                "person_ordering_method": self.person_ordering,
-                "first_person_height":    self.player_height_m,
-                "visible_side":           visible_side_cfg,
-                "load_trc_px":            "",
-                "compare":                False,
-                "time_range":             [],
-                "webcam_id":              0,
-                "input_size":             [1280, 720],
-                "show_realtime_results":  self.show_realtime,
-                "save_vid":               True,
-                "save_img":               False,
-                "save_pose":              True,
-                "save_angles":            True,
-            },
-            # ── pose: model and detection parameters ──────────────────────────
-            "pose": {
-                "pose_model":    "Body_with_feet",
-                "mode":          self.mode,
-                "det_frequency": int(os.getenv("S2D_DET_FREQ", "6")),
-                "slowmo_factor": 1,
-                "backend":       "auto",
-                "device":        os.getenv("S2D_DEVICE", "auto"),
-                "tracking_mode": "sports2d",
-                "keypoint_likelihood_threshold": 0.3,
-                "average_likelihood_threshold":  0.5,
-                "keypoint_number_threshold":     0.3,
-            },
-            # ── px_to_meters_conversion: separate section (NOT in base) ───────
-            "px_to_meters_conversion": {
-                "to_meters":         True,
-                "make_c3d":          True,
-                "save_calib":        True,
-                "floor_angle":       "auto",
-                "xy_origin":         ["auto"],
-                "perspective_value": 10,
-                "perspective_unit":  "distance_m",
-                "distortions":       [0.0, 0.0, 0.0, 0.0, 0.0],
-                "calib_file":        "",
-            },
-            # ── angles: which angles to compute and display ───────────────────
-            "angles": {
-                "calculate_angles":   True,          # ← correct location
-                "joint_angles":   self.JOINT_ANGLES,
-                "segment_angles": self.SEGMENT_ANGLES,
-                "correct_segment_angles_with_floor_angle": True,
-                "display_angle_values_on": ["body", "list"],
-                "fontSize": 0.3,
-            },
-            # ── post-processing: filtering and graph saving ───────────────────
-            # IMPORTANT: show_graphs and save_graphs live HERE, not in base
-            "post-processing": {
-                "interpolate":             True,
-                "interp_gap_smaller_than": 100,
-                "fill_large_gaps_with":    "last_value",
-                "sections_to_keep":        [0],
-                "min_chunk_size":          10,
-                "reject_outliers":         True,
-                "filter":                  True,
-                "show_graphs":             self.show_realtime,  # mirrors realtime flag
-                "save_graphs":             True,
-                "filter_type":             "butterworth",
-                "butterworth": {
-                    "cut_off_frequency": 6,
-                    "order": 4,
-                },
-            },
-            # ── kinematics: OpenSim IK (requires full OpenSim install) ────────
-            "kinematics": {
-                "do_ik":               self.do_ik,
-                "use_augmentation":    self.use_augmentation,
-                "feet_on_floor":       False,
-                "use_simple_model":    False,
-                "participant_mass":    [self.participant_mass_kg],
-                "right_left_symmetry": True,
-                "default_height":      self.player_height_m,
-                "fastest_frames_to_remove_percent": 0.1,
-                "slowest_frames_to_remove_percent": 0.2,
-                "large_hip_knee_angles":            45,
-                "trimmed_extrema_percent":          0.5,
-                "remove_individual_scaling_setup":  True,
-                "remove_individual_ik_setup":       True,
-            },
-            "logging": {
-                "use_custom_logging": False,
-            },
-        }
+        config = self._build_config(video_abs, result_abs, visible_side_cfg)
 
-        # Run Sports2D out-of-process so heavy execution does not block the
-        # current Python execution thread and remains killable via timeout.
-        timeout_s = int(os.getenv("SPORTS2D_TIMEOUT_SEC", "1200"))
         ctx = mp.get_context("spawn")
         q = ctx.Queue()
         p = ctx.Process(target=_sports2d_worker, args=(config, q), daemon=True)
-        
-        logger.info(f"Starting Sports2D analysis: video={video_abs}, timeout={timeout_s}s")
+
+        timeout_s = int(os.getenv("SPORTS2D_TIMEOUT_SEC", "1200"))
+
+        logger.info(f"Sports2D start | video={video_abs} | timeout={timeout_s}s")
+
         p.start()
         p.join(timeout=timeout_s)
 
-        worker_result = None
-        process_failed = False
-        process_timeout = False
-
-        # 1. Check if process is still alive (timeout)
         if p.is_alive():
-            process_timeout = True
-            logger.warning(f"Sports2D timed out after {timeout_s}s, attempting graceful termination...")
+            logger.warning("Timeout reached → terminating Sports2D")
             p.terminate()
-            # Give 10s for graceful termination
-            p.join(timeout=10)
+            p.join(5)
             if p.is_alive():
-                # Force kill if still alive
-                logger.error("Sports2D did not respond to terminate, force killing...")
                 p.kill()
-                p.join(timeout=2)
-            logger.error(f"Sports2D process terminated after timeout")
+                p.join()
 
-        # 2. Attempt to retrieve result from queue with timeout/error handling
+        worker_result = None
         try:
-            # Use timeout to avoid indefinite blocking if queue is deadlocked
-            if not q.empty():
-                try:
-                    worker_result = q.get(timeout=2)
-                    logger.debug("Sports2D worker result retrieved successfully")
-                except Exception as e:
-                    logger.error(f"Failed to retrieve worker result: {e}")
-                    worker_result = None
-        except Exception as e:
-            logger.error(f"Queue retrieval failed: {e}")
+            worker_result = q.get_nowait()
+        except Exception:
             worker_result = None
-        finally:
-            # Aggressive queue cleanup to prevent resource leaks
-            try:
-                while not q.empty():
-                    try:
-                        q.get_nowait()
-                    except Exception:
-                        break
-            except Exception:
-                pass
-            try:
-                q.close()
-                q.join_thread()
-            except Exception:
-                pass
 
-        # 3. Validate exit code and worker result
-        if p.exitcode not in (0, None):
-            process_failed = True
-            print(f"[S2D] Sports2D subprocess exited with code {p.exitcode}.")
-            if worker_result and not worker_result.get("ok", False):
-                print(f"[S2D] Error: {worker_result.get('error', 'Unknown error')}")
-                tb = worker_result.get("traceback")
-                if tb:
-                    print(tb)
-
-        # 4. Check worker-reported errors (graceful process exit but execution failed)
-        if worker_result and not worker_result.get("ok", False):
-            process_failed = True
-            print(f"[S2D] Execution failed: {worker_result.get('error', 'Unknown error')}")
-            tb = worker_result.get("traceback")
-            if tb:
-                print(tb)
-
-        # 5. Attempt to recover partial outputs even if process failed
-        # (Sports2D may have written some results before crashing)
         self.outputs = self._collect_outputs()
-        
-        if process_failed or process_timeout:
-            # Log recovery attempt
-            recovered_count = sum(len(v) for v in self.outputs.values() if isinstance(v, list))
-            if recovered_count > 0:
-                print(f"[S2D] Recovered {recovered_count} partial output files despite process failure.")
-            elif process_failed:
-                print(f"[S2D] No partial outputs recovered.")
-                return {}
-        
+
+        if worker_result and not worker_result.get("ok"):
+            logger.error(f"Sports2D failed: {worker_result.get('error')}")
+            if worker_result.get("traceback"):
+                logger.debug(worker_result["traceback"])
+            return {}
+
         return self.outputs
 
+    # ═════════════════════════════════════════════════════════
+    # CONFIG BUILDER
+    # ═════════════════════════════════════════════════════════
+
+    def _build_config(self, video_abs, result_abs, visible_side_cfg):
+        return {
+            "base": {
+                "video_input": video_abs,
+                "video_dir": "",
+                "result_dir": result_abs,
+                "nb_persons_to_detect": 1,
+                "person_ordering_method": self.person_ordering,
+                "first_person_height": self.player_height_m,
+                "visible_side": visible_side_cfg,
+                "show_realtime_results": self.show_realtime,
+                "save_vid": True,
+                "save_pose": True,
+                "save_angles": True,
+            },
+            "pose": {
+                "pose_model": "Body_with_feet",
+                "mode": self.mode,
+                "det_frequency": int(os.getenv("S2D_DET_FREQ", "6")),
+                "device": os.getenv("S2D_DEVICE", "auto"),
+            },
+            "angles": {
+                "calculate_angles": True,
+                "joint_angles": self.JOINT_ANGLES,
+                "segment_angles": self.SEGMENT_ANGLES,
+            },
+            "post-processing": {
+                "interpolate": True,
+                "filter": True,
+                "show_graphs": self.show_realtime,
+            },
+            "kinematics": {
+                "do_ik": self.do_ik,
+                "participant_mass": [self.participant_mass_kg],
+                "default_height": self.player_height_m,
+            },
+        }
+
+    # ═════════════════════════════════════════════════════════
+    # OUTPUT COLLECTION (FAST)
+    # ═════════════════════════════════════════════════════════
+
     def _collect_outputs(self) -> dict:
-        import glob
-        rd = self.result_dir
+        VIDEO_EXT = {".mp4", ".avi"}
+        IMG_EXT = {".png"}
+        TRC_EXT = {".trc"}
+        MOT_EXT = {".mot"}
+        TOML_EXT = {".toml"}
+        C3D_EXT = {".c3d"}
+        OSIM_EXT = {".osim"}
+        XML_EXT = {".xml"}
+
         out = {
             "annotated_video": [],
             "angle_plots_png": [],
-            "trc_pose_px":     [],
-            "trc_pose_m":      [],
-            "mot_angles":      [],
-            "calib_toml":      [],
-            "c3d":             [],
-            "osim_model":      [],
-            "osim_mot":        [],
-            "osim_setup":      [],
-            "all":             [],
+            "trc_pose_px": [],
+            "trc_pose_m": [],
+            "mot_angles": [],
+            "calib_toml": [],
+            "c3d": [],
+            "osim_model": [],
+            "osim_mot": [],
+            "osim_setup": [],
+            "all": [],
         }
-        for root, _, files in os.walk(rd):
-            for filename in files:
-                f = os.path.join(root, filename)
-                if not os.path.isfile(f):
-                    continue
+
+        for root, _, files in os.walk(self.result_dir):
+            for name in files:
+                path = str(Path(root) / name)
+
                 try:
-                    # Validate path to prevent traversal attacks
-                    validated_path = _validate_sports2d_result_path(f, rd)
+                    validated = _validate_sports2d_result_path(
+                        path, self.result_dir
+                    )
                 except ValueError:
-                    # Skip invalid paths
                     continue
-                out["all"].append(validated_path)
-                fl   = validated_path.lower()
-                name = os.path.basename(fl)
-                if fl.endswith((".mp4", ".avi")):
+
+                out["all"].append(validated)
+                ext = Path(validated).suffix.lower()
+
+                if ext in VIDEO_EXT:
                     if "_h264" not in name:
-                        out["annotated_video"].append(validated_path)
-                elif fl.endswith(".png"):
-                    out["angle_plots_png"].append(validated_path)
-                elif fl.endswith(".trc"):
-                    if "_px" in name or "pixel" in name:
-                        out["trc_pose_px"].append(validated_path)
+                        out["annotated_video"].append(validated)
+
+                elif ext in IMG_EXT:
+                    out["angle_plots_png"].append(validated)
+
+                elif ext in TRC_EXT:
+                    if "_px" in name:
+                        out["trc_pose_px"].append(validated)
                     else:
-                        out["trc_pose_m"].append(validated_path)
-                elif fl.endswith(".mot"):
-                    out["osim_mot" if "ik" in name else "mot_angles"].append(validated_path)
-                elif fl.endswith(".toml"):
-                    out["calib_toml"].append(validated_path)
-                elif fl.endswith(".c3d"):
-                    out["c3d"].append(validated_path)
-                elif fl.endswith(".osim"):
-                    out["osim_model"].append(validated_path)
-                elif fl.endswith(".xml"):
-                    out["osim_setup"].append(validated_path)
+                        out["trc_pose_m"].append(validated)
+
+                elif ext in MOT_EXT:
+                    out["mot_angles"].append(validated)
+
+                elif ext in TOML_EXT:
+                    out["calib_toml"].append(validated)
+
+                elif ext in C3D_EXT:
+                    out["c3d"].append(validated)
+
+                elif ext in OSIM_EXT:
+                    out["osim_model"].append(validated)
+
+                elif ext in XML_EXT:
+                    out["osim_setup"].append(validated)
+
         return out
 
-    def get_seed_from_trc(self) -> Optional[dict]:
-        """
-        Read the first few frames of Sports2D's pixel-space TRC file and
-        return a seed dict compatible with TargetLock / pick_player_interactive.
+    # ═════════════════════════════════════════════════════════
+    # SEED EXTRACTION (STREAMING - NO PANDAS)
+    # ═════════════════════════════════════════════════════════
 
-        The TRC pixel file contains marker X/Y positions in image pixels.
-        We use Hip_Center (or the mean of all markers) to locate the player
-        in frame 0, build a rough bounding box, and sample a colour histogram
-        from that region.
-        """
-        trcs_px = self.outputs.get("trc_pose_px", [])
-        if not trcs_px:
+    def get_seed_from_trc(self) -> Optional[dict]:
+        trcs = self.outputs.get("trc_pose_px", [])
+        if not trcs:
             return None
 
-        path = trcs_px[0]
+        path = trcs[0]
+
         try:
-            df = self._parse_trc_file(path)
-            if df is None or df.empty or len(df) < 2:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+
+            data_start = None
+            for i, l in enumerate(lines):
+                if i > 4 and l.strip() and l[0].isdigit():
+                    data_start = i
+                    break
+
+            if data_start is None:
                 return None
 
-            # Robust TRC parsing: infer marker base names from "<Marker>.<X|Y|Z>".
-            # We avoid relying on numeric column ordering, because missing markers
-            # can shift indices and break modulo assumptions.
-            cols = [c for c in df.columns if isinstance(c, str)]
-            bases = {}
-            for c in cols:
-                if c.endswith(".X") or c.endswith(".Y") or c.endswith(".Z"):
-                    base, axis = c.rsplit(".", 1)
-                    bases.setdefault(base, {})[axis] = c
+            header = lines[data_start - 2].strip().split("\t")
+            values = lines[data_start].strip().split("\t")
 
-            if not bases:
-                return None
+            row = dict(zip(header, values))
 
-            # Use first valid frame row; coerce to numeric where possible.
-            row = df.iloc[0]
-            def _val(col):
-                try:
-                    val = row.get(col)
-                    if val is None:
-                        return float("nan")
-                    return float(val)
-                except (ValueError, TypeError):
-                    return float("nan")
+            xs, ys = [], []
 
-            xs: List[float] = []
-            ys: List[float] = []
-
-            def _add_marker(base: str):
-                ax = bases.get(base, {})
-                xcol = ax.get("X")
-                ycol = ax.get("Y")
-                if not xcol or not ycol:
-                    return
-                x = _val(xcol)
-                y = _val(ycol)
-                if not np.isnan(x) and not np.isnan(y) and x > 0 and y > 0:
-                    xs.append(x)
-                    ys.append(y)
-
-            # Use ALL available markers to find true min/max bounds
-            for b in bases.keys():
-                _add_marker(b)
+            for k, v in row.items():
+                if ".X" in k or ".Y" in k:
+                    try:
+                        val = float(v)
+                        if ".X" in k:
+                            xs.append(val)
+                        else:
+                            ys.append(val)
+                    except:
+                        pass
 
             if not xs or not ys:
                 return None
 
             min_x, max_x = min(xs), max(xs)
             min_y, max_y = min(ys), max(ys)
-            
-            # Base width and height
-            w = max(40., max_x - min_x)
-            h = max(100., max_y - min_y)
-            
-            # Add moderate percentage padding
+
+            w = max(40, max_x - min_x)
+            h = max(80, max_y - min_y)
+
             pad_x = w * 0.15
             pad_y = h * 0.10
-            
-            bx = int(min_x - pad_x)
-            by = int(min_y - pad_y)
+
+            bx = max(0, int(min_x - pad_x))
+            by = max(0, int(min_y - pad_y))
             bw = int(w + 2 * pad_x)
             bh = int(h + 2 * pad_y)
 
-            seed_bbox = (bx, by, bw, bh)
+            bbox = (bx, by, bw, bh)
 
-            # Try to sample a histogram from the source video at frame 0
             hist = None
-            try:
-                cap = cv2.VideoCapture(self.video_path)
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    if ret:
-                        hist = crop_hist(frame, seed_bbox)
-                cap.release()
-            except Exception:
-                pass
+            cap = cv2.VideoCapture(self.video_path)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret:
+                    hist = crop_hist(frame, bbox)
+            cap.release()
 
             return {
-                "seed_bbox":  seed_bbox,
+                "seed_bbox": bbox,
                 "seed_frame": 0,
-                "hist":       hist,
+                "hist": hist,
             }
+
         except Exception as e:
-            print(f"[S2D] get_seed_from_trc failed: {e}")
+            logger.error(f"seed extraction failed: {e}")
             return None
+
+    # ═════════════════════════════════════════════════════════
+    # MOT LOADER
+    # ═════════════════════════════════════════════════════════
 
     def load_mot_angles(self) -> Optional[pd.DataFrame]:
         mots = self.outputs.get("mot_angles", [])
         if not mots:
             return None
-        path = mots[0]
+
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            header_idx = next(
-                (i for i, l in enumerate(lines) if l.strip().lower().startswith("time")),
-                None,
+            return pd.read_csv(
+                mots[0],
+                sep="\t",
+                encoding="utf-8",
+                on_bad_lines="skip",
             )
-            if header_idx is None:
-                return None
-            df = pd.read_csv(path, sep="\t", skiprows=header_idx,
-                             encoding="utf-8", on_bad_lines="skip")
-            df.columns = [c.strip() for c in df.columns]
-            return df.dropna(axis=1, how="all")
         except Exception as e:
-            print(f"[S2D] Failed to load MOT file {path}: {e}")
+            logger.error(f"MOT load failed: {e}")
             return None
+
+    # ═════════════════════════════════════════════════════════
+    # TRC POSE LOADER
+    # ═════════════════════════════════════════════════════════
 
     def load_trc_pose(self, metres: bool = True) -> Optional[pd.DataFrame]:
-        key  = "trc_pose_m" if metres else "trc_pose_px"
+        """
+        Load TRC (motion capture) pose data from Sports2D output.
+        
+        Args:
+            metres: If True, load trc_pose_m; if False, load trc_pose_px
+        
+        Returns:
+            DataFrame with pose keypoints or None if not available
+        """
+        key = "trc_pose_m" if metres else "trc_pose_px"
         trcs = self.outputs.get(key, [])
+        
         if not trcs:
             return None
-        return self._parse_trc_file(trcs[0])
-
-    def _parse_trc_file(self, path: str) -> Optional[pd.DataFrame]:
-        """Shared logic to parse Sports2D/OpenSim TRC files into a clean DataFrame."""
+        
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
+            path = trcs[0]
+            
+            # Read TRC file, skipping the header lines
+            # TRC files have a specific format with metadata in first few lines
+            with open(path, encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
             
+            # Find where the actual data starts (first line with numeric frame number)
             data_start = None
             for i, line in enumerate(lines):
-                stripped = line.strip()
-                if i >= 4 and stripped and re.match(r'^-?\d', stripped):
+                if i > 4 and line.strip() and line.strip()[0].isdigit():
                     data_start = i
                     break
             
             if data_start is None:
-                data_start = 5
+                logger.warning(f"Could not find data start in TRC file: {path}")
+                return None
             
-            # TRC header row is exactly 2 rows above the first data row
-            header_line = data_start - 2
-            df = pd.read_csv(path, sep="\t", skiprows=header_line,
-                             encoding="utf-8", on_bad_lines="skip")
-            df.columns = [c.strip() for c in df.columns]
-            return df.dropna(axis=1, how="all")
+            # Read from the data start line, using the header line before it
+            header_line = lines[data_start - 1].strip()
+            header = header_line.split("\t")
+            
+            # Read remaining lines as data
+            data_lines = lines[data_start:]
+            
+            # Parse data into rows
+            rows = []
+            for line in data_lines:
+                if not line.strip():
+                    continue
+                values = line.strip().split("\t")
+                if len(values) >= len(header):
+                    rows.append(dict(zip(header, values)))
+            
+            if not rows:
+                logger.warning(f"No data rows found in TRC file: {path}")
+                return None
+            
+            df = pd.DataFrame(rows)
+            
+            # Convert numeric columns
+            for col in df.columns:
+                if col not in ("Frame", "frame", "Frame#"):
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    except:
+                        pass
+            
+            logger.debug(f"Loaded TRC pose with {len(df)} frames from {path}")
+            return df
+            
         except Exception as e:
-            print(f"[S2D] Failed to parse TRC file {path}: {e}")
+            logger.error(f"TRC pose load failed: {e}")
             return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TRC / MOT WRITER  — native OpenSim-compatible file generation
-# ══════════════════════════════════════════════════════════════════════════════

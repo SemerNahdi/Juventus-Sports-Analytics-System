@@ -17,6 +17,16 @@ let trunkChartObj = null;
 // API Base URL (adjust if running on different port)
 const API_BASE = window.location.origin;
 
+let jobPollInterval = null;
+let jobPollLogIndex = 0;
+let activePollingJobId = null;
+
+const IN_PROGRESS_STATUSES = new Set(['processing', 'pending', 'cancelling']);
+
+function isJobInProgress(status) {
+    return IN_PROGRESS_STATUSES.has((status || '').toLowerCase());
+}
+
 function toNumber(value, fallback = 0) {
     if (value === null || value === undefined || value === '') return fallback;
     const parsed = Number(value);
@@ -166,21 +176,147 @@ function setCachedAnalysis(analysis) {
     }
 }
 
-async function loadByJobId(jobId) {
-    // 1. Try cache first
-    const cached = getCachedAnalysis(jobId);
-    if (cached) {
-        console.log("Loading analysis from cache:", jobId);
-        displayAnalysis(cached);
+function showProcessingPanel(analysis) {
+    const section = document.getElementById('jobProcessingSection');
+    const grid = document.getElementById('dashboardGrid');
+    if (section) section.style.display = 'block';
+    if (grid) grid.style.display = 'none';
+
+    const title = document.getElementById('jobProcessingTitle');
+    const statusEl = document.getElementById('jobProcessingStatus');
+    if (title) title.textContent = 'Analysis in progress';
+    if (statusEl) {
+        statusEl.textContent = 'Your results will appear here automatically when processing finishes.';
+        statusEl.style.color = '';
+    }
+    updateProcessingTelemetry(analysis);
+}
+
+function hideProcessingPanel() {
+    const section = document.getElementById('jobProcessingSection');
+    const grid = document.getElementById('dashboardGrid');
+    if (section) section.style.display = 'none';
+    if (grid) grid.style.display = '';
+}
+
+function updateProcessingTelemetry(analysis) {
+    const logs = asArray(analysis?.logs);
+    const statusEl = document.getElementById('jobProcessingStatus');
+    const bar = document.getElementById('jobProcessingBar');
+    const logBox = document.getElementById('jobProcessingLogs');
+
+    for (let i = jobPollLogIndex; i < logs.length; i++) {
+        const raw = logs[i];
+        const msg = typeof raw === 'string' ? (raw.split(' - ').pop() || raw) : String(raw);
+        if (statusEl) statusEl.textContent = msg;
+        if (logBox) {
+            const line = document.createElement('div');
+            line.style.padding = '4px 0';
+            line.textContent = msg;
+            logBox.prepend(line);
+            while (logBox.children.length > 8) logBox.lastElementChild.remove();
+        }
+        jobPollLogIndex++;
     }
 
-    // 2. Fetch fresh data in background
+    if (bar) {
+        let pct = Math.min(92, 12 + jobPollLogIndex * 6);
+        if (logs.some(l => String(l).toLowerCase().includes('finalized'))) pct = 98;
+        bar.style.width = `${pct}%`;
+    }
+}
+
+function stopJobPolling() {
+    if (jobPollInterval) {
+        clearInterval(jobPollInterval);
+        jobPollInterval = null;
+    }
+    activePollingJobId = null;
+}
+
+function startJobPolling(jobId) {
+    stopJobPolling();
+    activePollingJobId = jobId;
+    jobPollLogIndex = 0;
+    localStorage.setItem('mitus_active_job_id', jobId);
+
+    const cancelBtn = document.getElementById('dashboardCancelBtn');
+    if (cancelBtn) {
+        cancelBtn.onclick = async () => {
+            if (!confirm('Stop this analysis?')) return;
+            cancelBtn.disabled = true;
+            try {
+                await fetch(`${API_BASE}/analyses/${jobId}/cancel`, { method: 'POST' });
+            } catch (e) {
+                console.warn('Cancel request failed', e);
+            }
+        };
+    }
+
+    jobPollInterval = setInterval(() => pollJobUntilDone(jobId), 2500);
+    pollJobUntilDone(jobId);
+}
+
+async function pollJobUntilDone(jobId) {
+    try {
+        const response = await fetch(`${API_BASE}/analyses/${jobId}`);
+        if (!response.ok) return;
+
+        const analysis = await response.json();
+        setCachedAnalysis(analysis);
+
+        if (isJobInProgress(analysis.status)) {
+            showProcessingPanel(analysis);
+            return;
+        }
+
+        stopJobPolling();
+        localStorage.removeItem('mitus_active_job_id');
+
+        if (analysis.status === 'success') {
+            hideProcessingPanel();
+            displayAnalysis(analysis);
+            showToast('Analysis complete', 'Results are ready.', 'fa-circle-check');
+            return;
+        }
+
+        const title = document.getElementById('jobProcessingTitle');
+        const statusEl = document.getElementById('jobProcessingStatus');
+        if (title) title.textContent = analysis.status === 'cancelled' ? 'Analysis cancelled' : 'Analysis failed';
+        if (statusEl) {
+            statusEl.textContent = analysis.error || 'The job did not complete successfully.';
+            statusEl.style.color = '#f87171';
+        }
+    } catch (error) {
+        console.error('Job polling error:', error);
+    }
+}
+
+function routeAnalysisView(analysis, jobId) {
+    if (!analysis) return;
+    if (isJobInProgress(analysis.status)) {
+        showProcessingPanel(analysis);
+        startJobPolling(jobId || analysis.id);
+        return;
+    }
+    hideProcessingPanel();
+    stopJobPolling();
+    localStorage.removeItem('mitus_active_job_id');
+    displayAnalysis(analysis);
+}
+
+async function loadByJobId(jobId) {
+    const cached = getCachedAnalysis(jobId);
+    if (cached) {
+        routeAnalysisView(cached, jobId);
+    }
+
     try {
         const response = await fetch(`${API_BASE}/analyses/${jobId}`);
         if (response.ok) {
             const analysis = await response.json();
             setCachedAnalysis(analysis);
-            displayAnalysis(analysis);
+            routeAnalysisView(analysis, jobId);
         } else if (!cached) {
             console.error(`Analysis ${jobId} not found.`);
             loadLatest();
@@ -192,23 +328,18 @@ async function loadByJobId(jobId) {
 }
 
 async function loadLatest() {
-    // 1. Try to find the latest job ID from cache
     const latestId = localStorage.getItem('mitus_latest_job_id');
     if (latestId) {
-        const cached = getCachedAnalysis(latestId);
-        if (cached) {
-            console.log("Loading latest from cache:", latestId);
-            displayAnalysis(cached);
-        }
+        await loadByJobId(latestId);
+        return;
     }
 
-    // 2. Fetch truly latest from API
     try {
         const response = await fetch(`${API_BASE}/analyses/latest`);
         if (response.ok) {
             const analysis = await response.json();
             setCachedAnalysis(analysis);
-            displayAnalysis(analysis);
+            routeAnalysisView(analysis, analysis.id);
         } else {
             console.log("No previous analyses found.");
         }
@@ -265,6 +396,11 @@ function renderHistory(data) {
 
 function displayAnalysis(analysis) {
     if (!analysis) return;
+    if (isJobInProgress(analysis.status)) {
+        routeAnalysisView(analysis, analysis.id);
+        return;
+    }
+    hideProcessingPanel();
     const envelope = getAnalysisEnvelope(analysis);
 
     // Update Header

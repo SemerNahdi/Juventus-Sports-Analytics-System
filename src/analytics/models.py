@@ -202,6 +202,9 @@ class MATEventKPIs:
     time_to_stabilization: float = 0.
     hop_distance_m: float = 0.
     balance_score: float = 0.
+    takeoff_idx: int = 0
+    landing_idx: int = 0
+    stabilized_idx: int = 0
 
 
 @dataclass

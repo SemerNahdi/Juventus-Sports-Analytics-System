@@ -20,6 +20,9 @@ except ImportError:
 from .models import FrameMetrics, BioFrame, MATSummary
 from .math_utils import clean_nans
 from .types import ExportFormat, benchmark_method, PerformanceTimer
+from .cv_wrapper import cv2
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLEAN WHITE THEME - Professional, crisp, publication-ready
@@ -27,25 +30,37 @@ from .types import ExportFormat, benchmark_method, PerformanceTimer
 
 class PlotColors:
     """Clean white theme for professional publications."""
+    
+    # Enable colorblind-friendly mode via environment variable
+    COLORBLIND_MODE = os.getenv("ANALYTICS_COLORBLIND", "0") == "1"
+    
+    if COLORBLIND_MODE:
+        # Colorblind-friendly palette (Okabe-Ito)
+        PRIMARY_BLUE = "#0072B2"      # Blue
+        PRIMARY_ORANGE = "#D55E00"    # Vermilion
+        PRIMARY_GREEN = "#009E73"     # Bluish green
+        PRIMARY_RED = "#CC79A7"       # Reddish purple
+        COLOR_LEFT = "#E69F00"        # Orange
+        COLOR_RIGHT = "#56B4E9"       # Sky blue
+        ACCENT_WARNING = "#D55E00"    # Vermilion
+        ACCENT_ALERT = "#E69F00"      # Orange
+        ACCENT_SUCCESS = "#009E73"    # Bluish green
+    else:
+        # Standard palette
+        PRIMARY_BLUE = "#2E86AB"      # Calm blue for primary data
+        PRIMARY_ORANGE = "#F18F01"    # Warm orange for secondary data
+        PRIMARY_GREEN = "#14A085"     # Mint green for positive metrics
+        PRIMARY_RED = "#D64933"       # Clean red for warnings/alerts
+        COLOR_LEFT = "#E66A2C"        # Terracotta orange - left side
+        COLOR_RIGHT = "#2C7DA0"       # Ocean blue - right side
+        ACCENT_WARNING = "#E63946"    # Coral red for thresholds
+        ACCENT_ALERT = "#F4A261"      # Warm orange for attention
+        ACCENT_SUCCESS = "#2A9D8F"    # Teal for positive metrics
+    
     # Background & base
-    BACKGROUND = "#FFFFFF"      # Pure white background
-    TEXT = "#2C3E50"           # Dark slate for text
-    GRID = "#E8ECEF"           # Very light gray for grid lines
-    
-    # Primary data colors (vibrant but professional)
-    PRIMARY_BLUE = "#2E86AB"   # Calm blue for primary data
-    PRIMARY_ORANGE = "#F18F01" # Warm orange for secondary data
-    PRIMARY_GREEN = "#14A085"  # Mint green for positive metrics
-    PRIMARY_RED = "#D64933"    # Clean red for warnings/alerts
-    
-    # Left/Right differentiation
-    COLOR_LEFT = "#E66A2C"     # Terracotta orange - left side
-    COLOR_RIGHT = "#2C7DA0"    # Ocean blue - right side
-    
-    # Semantic colors
-    ACCENT_WARNING = "#E63946"  # Coral red for thresholds
-    ACCENT_ALERT = "#F4A261"    # Warm orange for attention
-    ACCENT_SUCCESS = "#2A9D8F"  # Teal for positive metrics
+    BACKGROUND = "#FFFFFF"            # Pure white background
+    TEXT = "#2C3E50"                 # Dark slate for text
+    GRID = "#E8ECEF"                 # Very light gray for grid lines
     
     # Opacity
     FILL_ALPHA = 0.12
@@ -55,6 +70,7 @@ class PlotColors:
 
 class PlotStyle:
     """Professional typography and styling configuration."""
+    
     # Font configuration - use system-safe fonts to avoid findfont warnings
     FONT_FAMILY = ["Segoe UI", "Arial", "Helvetica", "DejaVu Sans", "sans-serif"]
     TITLE_SIZE = 12
@@ -83,7 +99,6 @@ class PlotStyle:
             return
         import matplotlib
         import matplotlib.pyplot as plt
-        import logging
 
         # Silence persistent 'findfont: Font family not found' warnings
         logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
@@ -143,7 +158,7 @@ class AnalyticsPlotter:
         fig.savefig(base + ".png", dpi=PlotStyle.DPI_SAVE, bbox_inches="tight", 
                     facecolor=PlotColors.BACKGROUND, edgecolor='none')
         _plt.close(fig)
-        print(f"[PLOT] Saved → {base}.png")
+        logger.info(f"[PLOT] Saved → {base}.png")
 
     def _setup_figure(self, figsize: tuple, title: str = None):
         """Create clean white figure with consistent styling."""
@@ -173,6 +188,7 @@ class AnalyticsPlotter:
         ax.set_facecolor(PlotColors.BACKGROUND)
 
     def plot_speed_profile(self, frame_metrics: List[FrameMetrics]):
+        """Plot speed and acceleration over time."""
         if not frame_metrics or not HAS_MPL:
             return
         import matplotlib.pyplot as _plt
@@ -211,6 +227,7 @@ class AnalyticsPlotter:
         self._save(fig, "speed_acceleration_profile")
 
     def plot_joint_angles(self, frame_metrics: List[FrameMetrics]):
+        """Plot knee, hip, and trunk angles over time."""
         if not frame_metrics or not HAS_MPL:
             return
         import matplotlib.pyplot as _plt
@@ -268,6 +285,7 @@ class AnalyticsPlotter:
         self._save(fig, "joint_angles_timeseries")
 
     def plot_biomechanics(self, bio_engine: "BiomechanicsEngine"):
+        """Plot comprehensive biomechanics data."""
         if not bio_engine or not bio_engine.frames or not HAS_MPL:
             return
         import matplotlib.pyplot as _plt
@@ -414,6 +432,7 @@ class AnalyticsPlotter:
         self._save(fig, "arm_swing")
 
     def plot_risk_scores(self, frame_metrics: List[FrameMetrics]):
+        """Plot risk scores over time."""
         if not frame_metrics or not HAS_MPL:
             return
         import matplotlib.pyplot as _plt
@@ -509,83 +528,249 @@ class AnalyticsPlotter:
         self._save(fig, "metabolic_power")
 
     def plot_mat_results(self, mat_summary: "MATSummary"):
+        """Plot MAT (Movement Assessment Tool) results dashboard."""
         if not mat_summary or not mat_summary.events or not HAS_MPL:
             return
         import matplotlib.pyplot as _plt
         
-        # ── MAT Performance Dashboard ─────────────────────────────────────────
-        fig = _plt.figure(figsize=(PlotStyle.FIG_WIDTH_SINGLE, PlotStyle.FIG_HEIGHT_DOUBLE),
-                          facecolor=PlotColors.BACKGROUND)
-        gs = fig.add_gridspec(1, 3, wspace=0.3)
-        ax1 = fig.add_subplot(gs[0]) # Valgus
-        ax2 = fig.add_subplot(gs[1]) # Flexion
-        ax3 = fig.add_subplot(gs[2]) # Flight/TTS
-
-        fig.suptitle(f"MAT Analysis — {mat_summary.protocol_id.replace('_', ' ').upper()}", 
-                    fontsize=PlotStyle.TITLE_SIZE + 2, color=PlotColors.TEXT, y=1.05)
-
-        event = mat_summary.events[0]
+        n_events = len(mat_summary.events)
         
-        # 1. Landing Valgus Bar
-        valgus_labels = ['Landing Valgus']
-        valgus_vals = [event.landing_valgus_left]
-        colors = [PlotColors.PRIMARY_RED if abs(v) > 10 else PlotColors.PRIMARY_GREEN for v in valgus_vals]
-        ax1.bar(valgus_labels, valgus_vals, color=colors, width=0.5, alpha=0.8)
-        ax1.axhline(10, color=PlotColors.ACCENT_WARNING, linestyle='--', linewidth=1, alpha=0.6)
-        ax1.set_ylim(0, max(15, event.landing_valgus_left + 5))
-        ax1.set_ylabel("Degrees (°)")
-        ax1.set_title("Knee Stability", fontsize=PlotStyle.SUBTITLE_SIZE)
-        self._style_ax(ax1, grid=False)
-
-        # 2. Peak Flexion Bar
-        flex_labels = ['Peak Flexion']
-        # Note: 180 is straight, so 180 - flexion = amount of bend
-        bend_val = 180 - event.peak_knee_flexion_landing
-        ax2.bar(flex_labels, [bend_val], color=PlotColors.PRIMARY_BLUE, width=0.5, alpha=0.8)
-        ax2.set_ylim(0, 90)
-        ax2.set_ylabel("Degrees of Bend (°)")
-        ax2.set_title("Impact Absorption", fontsize=PlotStyle.SUBTITLE_SIZE)
-        self._style_ax(ax2, grid=False)
-
-        # 3. Flight Time & TTS
-        metrics = ['Flight Time', 'TTS']
-        m_vals = [event.flight_time, event.time_to_stabilization]
-        ax3.bar(metrics, m_vals, color=PlotColors.PRIMARY_ORANGE, width=0.5, alpha=0.8)
-        ax3.set_ylim(0, 1.2)
-        ax3.set_ylabel("Time (s)")
-        ax3.set_title("Dynamic Balance", fontsize=PlotStyle.SUBTITLE_SIZE)
-        self._style_ax(ax3, grid=False)
-
+        # Create dashboard with subplots for each event
+        fig, axes = _plt.subplots(n_events, 3, 
+                                   figsize=(PlotStyle.FIG_WIDTH_SINGLE, 
+                                           PlotStyle.FIG_HEIGHT_DOUBLE * max(1, n_events//2)),
+                                   facecolor=PlotColors.BACKGROUND)
+        
+        # Handle single event case
+        if n_events == 1:
+            axes = axes.reshape(1, -1)
+        
+        fig.suptitle(f"MAT Analysis — {mat_summary.protocol_id.replace('_', ' ').upper()}", 
+                    fontsize=PlotStyle.TITLE_SIZE + 2, color=PlotColors.TEXT, y=1.02)
+        
+        for idx, event in enumerate(mat_summary.events):
+            ax1, ax2, ax3 = axes[idx]
+            
+            # 1. Landing Valgus
+            valgus_val = event.landing_valgus_left
+            color = PlotColors.PRIMARY_RED if abs(valgus_val) > 10 else PlotColors.PRIMARY_GREEN
+            ax1.bar(['Valgus'], [valgus_val], color=color, width=0.5, alpha=0.8)
+            ax1.axhline(10, color=PlotColors.ACCENT_WARNING, linestyle='--', linewidth=1, alpha=0.6)
+            ax1.set_ylabel("Degrees (°)")
+            ax1.set_title(f"Event #{idx+1}: Knee Stability", fontsize=PlotStyle.SUBTITLE_SIZE)
+            self._style_ax(ax1, grid=False)
+            ax1.set_ylim(0, max(15, valgus_val + 5))
+            
+            # 2. Peak Flexion
+            bend_val = 180 - event.peak_knee_flexion_landing
+            ax2.bar(['Flexion'], [bend_val], color=PlotColors.PRIMARY_BLUE, width=0.5, alpha=0.8)
+            ax2.set_ylim(0, 90)
+            ax2.set_ylabel("Degrees of Bend (°)")
+            ax2.set_title("Impact Absorption", fontsize=PlotStyle.SUBTITLE_SIZE)
+            self._style_ax(ax2, grid=False)
+            
+            # 3. Flight Time & TTS
+            metrics = ['Flight Time', 'TTS']
+            m_vals = [event.flight_time, event.time_to_stabilization]
+            ax3.bar(metrics, m_vals, color=PlotColors.PRIMARY_ORANGE, width=0.5, alpha=0.8)
+            ax3.set_ylim(0, max(1.2, max(m_vals) * 1.2))
+            ax3.set_ylabel("Time (s)")
+            ax3.set_title("Dynamic Balance", fontsize=PlotStyle.SUBTITLE_SIZE)
+            self._style_ax(ax3, grid=False)
+        
         _plt.tight_layout()
         self._save(fig, "mat_performance_dashboard")
 
-    @benchmark_method(threshold_ms=200.0)
-    def generate_all(self, frame_metrics: List[FrameMetrics], bio_engine: Optional["BiomechanicsEngine"]):
-        """Generate and save all standard plots with performance monitoring."""
-        if not HAS_MPL:
-            print("[PLOT] matplotlib not installed — skipping plot generation.")
-            print("       Run: pip install matplotlib")
+    def plot_gait_cycle(self, frame_metrics: List[FrameMetrics], bio_engine: "BiomechanicsEngine"):
+        """Plot normalized gait cycle for left and right legs."""
+        if not frame_metrics or not bio_engine or not HAS_MPL:
+            return
+        import matplotlib.pyplot as _plt
+        
+        # Extract gait cycles
+        lhs_indices = bio_engine.lhs
+        if len(lhs_indices) < 2:
             return
         
-        print(f"[PLOT] Generating plots with clean white theme...")
+        # Get knee angles for full cycles
+        knee_angles_left = [f.left_knee_angle for f in frame_metrics]
+        knee_angles_right = [f.right_knee_angle for f in frame_metrics]
         
-        plot_methods = [
-            ("speed_profile", lambda: self.plot_speed_profile(frame_metrics)),
-            ("joint_angles", lambda: self.plot_joint_angles(frame_metrics)),
-            ("risk_scores", lambda: self.plot_risk_scores(frame_metrics)),
-            ("energy", lambda: self.plot_energy(frame_metrics)),
-        ]
+        # Interpolate to 100 points per cycle
+        cycles_left = []
+        cycles_right = []
         
-        for plot_name, plot_func in plot_methods:
-            with PerformanceTimer(f"plot_{plot_name}") as timer:
-                plot_func()
-            if timer.result:
-                logging.debug(f"📊 {timer.result}")
+        for start, end in zip(lhs_indices[:-1], lhs_indices[1:]):
+            if end - start > 10:  # Valid cycle
+                cycle_left = knee_angles_left[start:end]
+                cycle_right = knee_angles_right[start:end]
+                
+                # Interpolate to 100 points
+                x_old = np.linspace(0, 100, len(cycle_left))
+                x_new = np.linspace(0, 100, 100)
+                cycles_left.append(np.interp(x_new, x_old, cycle_left))
+                cycles_right.append(np.interp(x_new, x_old, cycle_right))
         
-        if bio_engine and bio_engine.frames:
-            with PerformanceTimer("plot_biomechanics") as timer:
-                self.plot_biomechanics(bio_engine)
-            if timer.result:
-                logging.debug(f"📊 {timer.result}")
+        if not cycles_left:
+            return
         
-        print(f"[PLOT] All plots saved to: {self.results_dir}")
+        # Calculate mean and std
+        mean_left = np.mean(cycles_left, axis=0)
+        std_left = np.std(cycles_left, axis=0)
+        mean_right = np.mean(cycles_right, axis=0)
+        std_right = np.std(cycles_right, axis=0)
+        
+        fig, ax = self._setup_figure((PlotStyle.FIG_WIDTH_SINGLE, PlotStyle.FIG_HEIGHT_SINGLE),
+                                      f"Player #{self.player_id} — Gait Cycle (Normalized)")
+        
+        x = np.linspace(0, 100, 100)
+        ax.plot(x, mean_left, color=PlotColors.COLOR_LEFT, linewidth=PlotStyle.LINE_WIDTH_MAIN,
+                label="Left Knee")
+        ax.fill_between(x, mean_left - std_left, mean_left + std_left,
+                        alpha=PlotColors.FILL_ALPHA, color=PlotColors.COLOR_LEFT)
+        
+        ax.plot(x, mean_right, color=PlotColors.COLOR_RIGHT, linewidth=PlotStyle.LINE_WIDTH_MAIN,
+                label="Right Knee")
+        ax.fill_between(x, mean_right - std_right, mean_right + std_right,
+                        alpha=PlotColors.FILL_ALPHA, color=PlotColors.COLOR_RIGHT)
+        
+        ax.set_xlabel("Gait Cycle (%)")
+        ax.set_ylabel("Knee Flexion (°)")
+        ax.legend(loc="upper right", fontsize=PlotStyle.LEGEND_SIZE)
+        self._style_ax(ax)
+        _plt.tight_layout()
+        self._save(fig, "gait_cycle_normalized")
+
+    def plot_mat_radar(self, mat_summary: "MATSummary"):
+        """Create radar chart for MAT performance metrics."""
+        if not mat_summary or not mat_summary.events or not HAS_MPL:
+            return
+        
+        import matplotlib.pyplot as _plt
+        import numpy as np
+        
+        # Aggregate metrics across events
+        n_events = len(mat_summary.events)
+        metrics = {
+            "Valgus\nControl": np.mean([abs(e.landing_valgus_left) for e in mat_summary.events]),
+            "Impact\nAbsorption": np.mean([180 - e.peak_knee_flexion_landing for e in mat_summary.events]),
+            "Flight\nEfficiency": np.mean([e.flight_time for e in mat_summary.events]),
+            "Stabilization": np.mean([e.time_to_stabilization for e in mat_summary.events]),
+            "LSI": mat_summary.limb_symmetry_index,
+        }
+        
+        # Normalize metrics
+        max_vals = {"Valgus\nControl": 15, "Impact\nAbsorption": 90, 
+                    "Flight\nEfficiency": 1.0, "Stabilization": 1.0, "LSI": 100}
+        normalized = {k: min(1.0, metrics[k] / max_vals[k]) for k in metrics}
+        
+        # Create radar chart
+        categories = list(normalized.keys())
+        values = list(normalized.values())
+        values += values[:1]  # Close the loop
+        
+        angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+        angles += angles[:1]
+        
+        fig, ax = _plt.subplots(figsize=(8, 8), subplot_kw={'projection': 'polar'},
+                                facecolor=PlotColors.BACKGROUND)
+        
+        ax.plot(angles, values, 'o-', linewidth=PlotStyle.LINE_WIDTH_MAIN, 
+                color=PlotColors.PRIMARY_BLUE)
+        ax.fill(angles, values, alpha=PlotColors.FILL_ALPHA, color=PlotColors.PRIMARY_BLUE)
+        
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(categories, fontsize=PlotStyle.LABEL_SIZE)
+        ax.set_ylim(0, 1)
+        ax.set_yticks([0.25, 0.5, 0.75, 1.0])
+        ax.set_yticklabels(['25%', '50%', '75%', '100%'], fontsize=PlotStyle.TICK_SIZE)
+        
+        ax.set_title(f"MAT Performance — {mat_summary.protocol_id}", 
+                    fontsize=PlotStyle.TITLE_SIZE, color=PlotColors.TEXT, pad=20)
+        
+        _plt.tight_layout()
+        self._save(fig, "mat_radar_chart")
+
+    def plot_video_overlay(self, frame: np.ndarray, metrics: FrameMetrics, 
+                           kp: "PoseKeypoints", save_name: str = "overlay"):
+        """Create annotated frame overlay with metrics."""
+        if not HAS_MPL:
+            return
+        
+        import matplotlib.pyplot as _plt
+        
+        fig, (ax_img, ax_metrics) = _plt.subplots(1, 2, 
+                                                    figsize=(14, 5),
+                                                    facecolor=PlotColors.BACKGROUND)
+        
+        # Display frame
+        ax_img.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        ax_img.set_title(f"Frame at {metrics.timestamp:.2f}s", fontsize=PlotStyle.SUBTITLE_SIZE)
+        ax_img.axis('off')
+        
+        # Display metrics as text
+        metrics_text = f"""
+    Speed: {metrics.speed:.2f} m/s
+    Risk Score: {metrics.risk_score:.1f}
+    Knee L/R: {metrics.left_knee_angle:.0f}° / {metrics.right_knee_angle:.0f}°
+    Fatigue: {metrics.fatigue_index:.2f}
+        """
+        ax_metrics.text(0.1, 0.5, metrics_text, fontsize=10, verticalalignment='center',
+                       transform=ax_metrics.transAxes, fontfamily='monospace')
+        ax_metrics.axis('off')
+        ax_metrics.set_facecolor(PlotColors.BACKGROUND)
+        
+        _plt.tight_layout()
+        self._save(fig, save_name)
+
+    @benchmark_method(threshold_ms=200.0)
+    def generate_all(self, frame_metrics: List[FrameMetrics], bio_engine: Optional["BiomechanicsEngine"] = None,
+                     mat_summary: Optional["MATSummary"] = None):
+        """Generate and save all standard plots with performance monitoring."""
+        logger.info("[PLOT] Visualization generation is disabled.")
+        return
+
+        # --- Preserved implementation (re-enable by removing early return above) ---
+        # if not HAS_MPL:
+        #     print("[PLOT] matplotlib not installed — skipping plot generation.")
+        #     print("       Run: pip install matplotlib")
+        #     return
+        #
+        # print(f"[PLOT] Generating plots with clean white theme...")
+        #
+        # plot_methods = [
+        #     ("speed_profile", lambda: self.plot_speed_profile(frame_metrics)),
+        #     ("joint_angles", lambda: self.plot_joint_angles(frame_metrics)),
+        #     ("risk_scores", lambda: self.plot_risk_scores(frame_metrics)),
+        #     ("energy", lambda: self.plot_energy(frame_metrics)),
+        # ]
+        #
+        # for plot_name, plot_func in plot_methods:
+        #     with PerformanceTimer(f"plot_{plot_name}") as timer:
+        #         plot_func()
+        #     if timer.result:
+        #         logger.debug(f"📊 {timer.result}")
+        #
+        # if bio_engine and bio_engine.frames:
+        #     with PerformanceTimer("plot_biomechanics") as timer:
+        #         self.plot_biomechanics(bio_engine)
+        #     if timer.result:
+        #         logger.debug(f"📊 {timer.result}")
+        #
+        #     with PerformanceTimer("plot_gait_cycle") as timer:
+        #         self.plot_gait_cycle(frame_metrics, bio_engine)
+        #     if timer.result:
+        #         logger.debug(f"📊 {timer.result}")
+        #
+        # if mat_summary and mat_summary.events:
+        #     with PerformanceTimer("plot_mat_results") as timer:
+        #         self.plot_mat_results(mat_summary)
+        #     if timer.result:
+        #         logger.debug(f"📊 {timer.result}")
+        #
+        #     with PerformanceTimer("plot_mat_radar") as timer:
+        #         self.plot_mat_radar(mat_summary)
+        #     if timer.result:
+        #         logger.debug(f"📊 {timer.result}")
+        #
+        # print(f"[PLOT] All plots saved to: {self.results_dir}")

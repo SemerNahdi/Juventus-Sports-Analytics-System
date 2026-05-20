@@ -92,53 +92,85 @@ def select_primary_player(video_path: str, sample_step: int = 6) -> Optional[dic
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None
+
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     tracks: List[dict] = []
     MAX_GAP = max(sample_step * 5, 30)
-    fi = 0
-    while fi < total:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+
+    frame_id = 0
+
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
+
+        if frame_id % sample_step != 0:
+            frame_id += 1
+            continue
+
+        fi = frame_id
+
         for d in det.detect(frame):
             blob = d['bbox']
             bx, by, bw, bh = blob
             matched = False
+
             for tr in tracks:
                 if fi - tr["lf"] > MAX_GAP:
                     continue
+
                 iou = bbox_iou(blob, tr["lb"])
                 rw, rh = tr["ms"]
                 ss = _size_sim(bw, bh, rw, rh)
-                if iou * 0.7 + ss * 0.3 > 0.15 and (iou > 0.10 or ss > 0.55):
+
+                score = 0.6 * iou + 0.4 * ss
+
+                if score > 0.2 and (iou > 0.10 or ss > 0.55):
                     h = crop_hist(frame, blob)
-                    tr["n"] += 1
                     if h is not None:
                         tr["hs"].append(h)
+
+                    tr["n"] += 1
                     n = tr["n"]
+
                     pw, ph = tr["ms"]
                     tr["ms"] = ((pw * (n - 1) + bw) / n, (ph * (n - 1) + bh) / n)
+
                     tr["lb"] = blob
                     tr["lf"] = fi
                     matched = True
                     break
+
             if not matched:
                 h = crop_hist(frame, blob)
                 tracks.append({
                     "n": 1,
                     "hs": [h] if h is not None else [],
                     "ms": (float(bw), float(bh)),
-                    "lb": blob, "lf": fi, "sb": blob, "sf": fi,
+                    "lb": blob,
+                    "lf": fi,
+                    "sb": blob,
+                    "sf": fi,
                 })
-        fi += sample_step
+
+        frame_id += 1
+
     cap.release()
+
     if not tracks:
         return None
+
     best = max(tracks, key=lambda t: t["n"])
+
     mh = None
     if best["hs"]:
         stacked = np.mean(best["hs"], axis=0).astype(np.float32)
         cv2.normalize(stacked, stacked)
         mh = stacked
-    return {'hist': mh, 'size': best["ms"], 'seed_bbox': best["sb"], 'seed_frame': best["sf"]}
+
+    return {
+        'hist': mh,
+        'size': best["ms"],
+        'seed_bbox': best["sb"],
+        'seed_frame': best["sf"]
+    }

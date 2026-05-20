@@ -1,83 +1,107 @@
 """
-Backward-compatible facade for the modular analytics package.
-
-Legacy imports such as:
-    from src.analytics.sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D
-continue to work after refactoring into smaller modules.
+Sports Analytics Package - Modular Biomechanical Analysis System
+Production-grade SDK facade.
 """
 
-# Re-export core symbols
-from .core import (
-    # Types & Libraries
-    cv2, math, json, os, threading, np, pd, deque,
-    dataclass, asdict, Optional, List, Tuple,
-    # Models & Dataclasses
-    PoseKeypoints, PoseFrame, FrameMetrics, PlayerSummary, BioFrame,
-    JOINT_NAMES, BIO_ANGLE_FIELDS, BONE_DEFS,
-    # Math & Utils
-    midpoint, angle_3pts, dist2d, smooth_arr, clamp01, 
-    lerp_color, risk_color, bbox_iou, bbox_centre, 
-    crop_hist, hist_sim, estimate_player_orientation,
-    s2d_joint_angle, s2d_seg_angle, clean_nans,
-    HAS_SCIPY, HAS_MPL, HAS_SPORTS2D, SPORTS2D_PROCESS, HAS_FAIRMOTION,
-    # Tracking & Detection
-    KalmanTrack, ByteTracker, TargetLock, SceneChangeDetector,
-    DetectionLayer, get_detection_layer, HAS_YOLO,
-    # Pose & Rendering
-    HybridPoseEstimator, JointKalman, PoseKalmanSmoother,
-    draw_gradient_bone, draw_glow_joint, render_skeleton,
-    # Biomechanics
-    BiomechanicsEngine, MATEventKPIs, MATSummary, MATEventDetector, MATGridCalibrator,
-    # Player Selection
-    pick_player_interactive, select_primary_player,
-    # Scoring & Risk
-    RiskScorer,
-    # Rendering & Reporting
-    annotate_frame, draw_player_aura, generate_report,
-    # System Utilities
-    preload_all_models,
+__version__ = "2.0.0"
+API_VERSION = 2
+
+
+# ─────────────────────────────────────────────
+# Lazy loader (prevents circular imports)
+# ─────────────────────────────────────────────
+def _lazy(module, name):
+    import importlib
+    return getattr(importlib.import_module(f".{module}", package=__package__), name)
+
+
+# ─────────────────────────────────────────────
+# Public API (lazy-loaded)
+# ─────────────────────────────────────────────
+SportsAnalyzer = _lazy("analysis_engine", "SportsAnalyzer")
+AnalyticsPlotter = _lazy("visualization", "AnalyticsPlotter")
+Sports2DRunner = _lazy("sports2d_runner", "Sports2DRunner")
+ProtocolHandler = _lazy("analysis_engine", "ProtocolHandler")
+
+
+# ─────────────────────────────────────────────
+# Models (safe direct export)
+# ─────────────────────────────────────────────
+from .models import (
+    PoseKeypoints,
+    PoseFrame,
+    FrameMetrics,
+    PlayerSummary,
+    BioFrame,
+    JOINT_NAMES,
 )
 
-# Re-export type system and performance monitoring
-from .types import (
-    # Enums for magic strings
-    YoloModelSize,
-    VideoCodec,
-    AnalysisMode,
-    BiomechanicsBackend,
-    RiskLevel,
-    ExportFormat,
-    # Protocols (structural typing)
-    PoseFrame as PoseFrameProtocol,
-    AnalyzerLike,
-    ExportWriter,
-    # Performance benchmarking
-    BenchmarkResult,
-    PerformanceTimer,
-    benchmark_method,
-    PipelineTimer,
-    # Type aliases
-    PixelCoordinate,
-    NormalizedCoordinate,
-    KeypointArray,
-    ConfidenceArray,
-)
+# ─────────────────────────────────────────────
+# Flags
+# ─────────────────────────────────────────────
+from .core import HAS_SPORTS2D, HAS_SCIPY, HAS_YOLO, HAS_MPL
 
-from .sports2d_runner import Sports2DRunner
-from .output_manager import OpenSimFileWriter
-from .visualization import AnalyticsPlotter
-from .analysis_engine import SportsAnalyzer, ProtocolHandler
 
+# ─────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────
+from .player_picker import pick_player_interactive, select_primary_player
+from .reporting import generate_report
+
+from .types import BenchmarkResult, PerformanceTimer, RiskLevel
+
+
+# ─────────────────────────────────────────────
+# Public API surface
+# ─────────────────────────────────────────────
 __all__ = [
-    # Primary public API
     "SportsAnalyzer",
     "AnalyticsPlotter",
     "Sports2DRunner",
-    "OpenSimFileWriter",
     "ProtocolHandler",
-    # Compatibility flags from core
+
+    "PoseKeypoints",
+    "PoseFrame",
+    "FrameMetrics",
+    "PlayerSummary",
+    "BioFrame",
+    "JOINT_NAMES",
+
     "HAS_SPORTS2D",
     "HAS_SCIPY",
-    "HAS_MPL",
     "HAS_YOLO",
+    "HAS_MPL",
+
+    "pick_player_interactive",
+    "select_primary_player",
+    "generate_report",
+
+    "BenchmarkResult",
+    "PerformanceTimer",
+    "RiskLevel",
 ]
+
+
+def __dir__():
+    return sorted(set(__all__) | set(globals().keys()))
+
+
+def __getattr__(name):
+    deprecated = {
+        "SportsAnalyst": "SportsAnalyzer",
+        "Analyzer": "SportsAnalyzer",
+    }
+
+    import warnings
+
+    if name in deprecated:
+        warnings.warn(
+            f"{name} is deprecated. Use {deprecated[name]} instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        return globals()[deprecated[name]]
+
+    raise AttributeError(
+        f"'{__name__}' has no attribute '{name}'. API v{__version__}"
+    )

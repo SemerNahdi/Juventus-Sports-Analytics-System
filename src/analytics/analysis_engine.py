@@ -14,7 +14,7 @@ from io import StringIO
 from .models import PoseKeypoints, MATEventKPIs, MATSummary, PoseFrame, FrameMetrics, PlayerSummary, BioFrame
 from .biomechanics import MATEventDetector, BiomechanicsEngine, MATGridCalibrator
 from .math_utils import HAS_MPL, HAS_SCIPY, HAS_SPORTS2D, dist2d, crop_hist, estimate_player_orientation, s2d_joint_angle, s2d_seg_angle
-from .core import HybridPoseEstimator, PoseKalmanSmoother
+from .core import HybridPoseEstimator
 from .cv_wrapper import cv2
 from .sports2d_runner import Sports2DRunner
 from .output_manager import export_unified_results
@@ -23,6 +23,7 @@ from .rendering import annotate_frame, draw_player_aura
 from .reporting import generate_report
 from .player_picker import pick_player_interactive, select_primary_player
 from .tracking import TargetLock, get_detection_layer
+from .pose import PoseKalmanSmoother
 from .types import YoloModelSize, AnalysisMode, BiomechanicsBackend, benchmark_method, PerformanceTimer, PipelineTimer
 
 # Configure logging for analysis engine
@@ -73,42 +74,76 @@ class ProtocolHandler:
                              target_height: int, cancel_event: Optional[threading.Event]):
         """Runs discrete event detection instead of frame-by-frame analysis."""
         # 1. First run the standard pipeline to get all pose data
-        # We can temporarily disable some rendering if we want it to be "silent"
+        # We'll use a temporary output path for the first pass
+        original_out_path = analyzer.output_video_path
+        temp_out_path = original_out_path.replace(".mp4", "_raw.mp4")
+        analyzer.output_video_path = temp_out_path
+        
         print(f" * RUNNING MAT PROTOCOL: {self.protocol_id}")
         analyzer.process_video(stride, target_height, cancel_event)
         
         # 2. Extract events - with bounds checking
         if len(analyzer.pose_frames) < ANALYSIS.min_pose_frames_mat:
-            print(f" * Insufficient frames ({len(analyzer.pose_frames)}) for MAT event detection (requires >= {ANALYSIS.min_pose_frames_mat})")
+            print(f" * Insufficient frames ({len(analyzer.pose_frames)}) for MAT event detection")
+            analyzer.output_video_path = original_out_path
+            if os.path.exists(temp_out_path): os.rename(temp_out_path, original_out_path)
             return None
         
         detector = MATEventDetector()
         fps = analyzer._fps_cache / stride
         
         # Use ankle Y trajectory for takeoff/landing
-        # We'll use the left ankle as a default or try to find the active limb
         ankle_y = np.array([p.kp.left_ankle[1] for p in analyzer.pose_frames])
         if ankle_y.size == 0:
-            print(" * Empty ankle trajectory - cannot detect events")
+            analyzer.output_video_path = original_out_path
             return None
         takeoff, landing = detector.detect_takeoff_landing(ankle_y, fps)
         
-        # 3. Compute MAT KPIs
-        event_data = detector.extract_hop_event(analyzer.pose_frames, takeoff, landing, fps)
-        
-        # 4. Map to MATSummary
-        event_kpi = MATEventKPIs(
-            event_type=self.protocol_id,
-            flight_time=event_data["flight_time"],
-            landing_valgus_left=event_data["landing_valgus"],
-            peak_knee_flexion_landing=event_data["peak_knee_flexion_landing"],
-            time_to_stabilization=event_data["time_to_stabilization"],
-            hop_distance_m=0.0 # Will be calculated if grid calibration worked
-        )
-        
+        # 3. Compute MAT Summary
         summary = self._build_mat_summary_internal(analyzer, takeoff, landing, fps)
         analyzer.mat_summary = summary
+        
+        # 4. Extract indices for rerendering from the first event
+        event_kpi = summary.events[0]
+        
+        # 5. Rerender with MAT badges
+        self._rerender_with_badges(analyzer, original_out_path, temp_out_path, 
+                                   event_kpi.takeoff_idx * stride, 
+                                   event_kpi.landing_idx * stride, 
+                                   event_kpi.stabilized_idx * stride)
+        
+        analyzer.output_video_path = original_out_path
         return summary
+
+    def _rerender_with_badges(self, analyzer, final_path, raw_path, takeoff, landing, stabilized):
+        """Second pass to add MAT badges to the output video."""
+        from .rendering import annotate_mat_events
+        
+        cap = cv2.VideoCapture(raw_path)
+        if not cap.isOpened(): return
+        
+        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        out = analyzer._create_writer(final_path, fps, W, H)
+        
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            
+            # Add MAT badges
+            frame = annotate_mat_events(frame, idx, takeoff, landing, stabilized)
+            out.write(frame)
+            idx += 1
+            
+        cap.release()
+        out.release()
+        
+        # Clean up raw video
+        try: os.remove(raw_path)
+        except: pass
 
     def _build_mat_summary_internal(self, analyzer, takeoff, landing, fps):
         detector = MATEventDetector()
@@ -120,7 +155,10 @@ class ProtocolHandler:
             landing_valgus_left=event_data["landing_valgus"],
             peak_knee_flexion_landing=event_data["peak_knee_flexion_landing"],
             time_to_stabilization=event_data["time_to_stabilization"],
-            hop_distance_m=0.0
+            hop_distance_m=0.0,
+            takeoff_idx=event_data["takeoff_idx"],
+            landing_idx=event_data["landing_idx"],
+            stabilized_idx=event_data["stabilized_idx"]
         )
         
         lsi = self._calculate_lsi([event_kpi])
@@ -397,7 +435,7 @@ class SportsAnalyzer:
         """Process single frame through pose estimation and metrics pipeline."""
         try:
             if bbox and bbox[2] > 20 and bbox[3] > 40:
-                target = next((t for t in self.lock.bt.active_tracks.values() if t.id == self.lock._target_id), None)
+                target = next((t for t in self.lock.bt.active.values() if t.id == self.lock._target_id), None)
                 yolo_kp = getattr(target, '_yolo_kp', None)
                 spd = self.frame_metrics[-1].speed if self.frame_metrics else 0.
 
@@ -440,6 +478,7 @@ class SportsAnalyzer:
                              cancel_event: Optional[threading.Event] = None) -> int:
         """Main frame processing loop."""
         idx = 0
+        frames_skipped = 0
         W_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         H_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
@@ -474,12 +513,19 @@ class SportsAnalyzer:
                     logger.debug(f"MAT calibration error: {e}")
 
             ts = idx / fps
-            bbox = self.lock.update(frame)
+            bbox = self.lock.update(frame, frame_idx=idx)
+            
+            if not bbox:
+                frames_skipped += 1
+            
             frame = self._process_frame_pipeline(frame, idx, ts, fps, bbox, trc_df, s2d_cols,
                                                  trc_frame_map, trc_time_keys, trc_time_vals,
                                                  scale, draw_badge, draw_aura)
             out.write(frame)
             idx += 1
+        
+        if frames_skipped > 0:
+            logger.warning(f"Skipped {frames_skipped} frames due to missing player bbox (player lost or not detected)")
         
         return idx
 
@@ -868,8 +914,9 @@ class SportsAnalyzer:
         if seed: self.lock = TargetLock(seed["seed_bbox"], seed["hist"], seed["seed_frame"])
         return outputs
 
-    def export_unified(self, json_path: str, csv_path: str, trc_path=None, mot_path=None):
-        return export_unified_results(self, json_path, csv_path, trc_path, mot_path)
+    def export_unified(self, json_path: str, csv_path: str) -> Optional[dict]:
+        """Export unified JSON/CSV. TRC/MOT come from Sports2D natively when enabled."""
+        return export_unified_results(self, json_path, csv_path)
 
     def get_report_string(self) -> str:
         return generate_report(self.summary, self.bio_engine, self.mat_summary)

@@ -44,6 +44,42 @@ def annotate_frame(frame: np.ndarray, pf: PoseFrame, fm: FrameMetrics, player_id
 
     return frame
 
+def annotate_mat_events(frame: np.ndarray, frame_idx: int, takeoff_idx: int, landing_idx: int, stabilized_idx: int = -1) -> np.ndarray:
+    """Draw MAT event badges (Takeoff, Landing, Stabilized) on the frame."""
+    H, W = frame.shape[:2]
+    
+    label = None
+    color = (0, 0, 0)
+    
+    if frame_idx == takeoff_idx:
+        label = "TAKEOFF"
+        color = (0, 255, 255) # Yellow
+    elif frame_idx == landing_idx:
+        label = "LANDING"
+        color = (0, 0, 255) # Red
+    elif stabilized_idx > 0 and frame_idx == stabilized_idx:
+        label = "STABILIZED"
+        color = (0, 255, 0) # Green
+        
+    if label:
+        # Draw a prominent badge in the top-center
+        font = cv2.FONT_HERSHEY_DUPLEX
+        scale = 1.2
+        thickness = 2
+        (tw, th), baseline = cv2.getTextSize(label, font, scale, thickness)
+        
+        tx = (W - tw) // 2
+        ty = 100
+        
+        # Background box
+        cv2.rectangle(frame, (tx - 10, ty - th - 10), (tx + tw + 10, ty + 10), (0, 0, 0), -1)
+        cv2.rectangle(frame, (tx - 10, ty - th - 10), (tx + tw + 10, ty + 10), color, 2)
+        
+        # Text
+        cv2.putText(frame, label, (tx, ty), font, scale, color, thickness, cv2.LINE_AA)
+        
+    return frame
+
 def draw_player_aura(frame: np.ndarray, kp: PoseKeypoints, fm: FrameMetrics, bbox: Tuple[int, int, int, int], accel_burst: int = 0) -> np.ndarray:
     if fm.speed < .5:
         return frame

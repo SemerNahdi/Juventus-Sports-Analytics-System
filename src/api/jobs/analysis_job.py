@@ -50,7 +50,7 @@ def run_full_analysis_job(
             step("CRITICAL ERROR: OpenCV (cv2) initialization failed. VideoCapture not found.")
             raise ImportError("module 'cv2' has no attribute 'VideoCapture'")
             
-        from src.analytics.sports_analytics import SportsAnalyzer, AnalyticsPlotter, HAS_SPORTS2D, ProtocolHandler
+        from src.analytics.sports_analytics import SportsAnalyzer, HAS_SPORTS2D, ProtocolHandler
 
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = os.path.join(temp_dir, "input_" + original_filename)
@@ -105,7 +105,14 @@ def run_full_analysis_job(
                 step("Commencing Pose Estimation & Tracking...")
                 handler = ProtocolHandler(protocol_id=protocol_id)
                 summary = handler.process_video(analyzer, stride=stride, target_height=target_height, cancel_event=cancel_event)
-                step(f"Tracking concluded. {len(analyzer.frame_metrics)} frames analyzed.")
+                
+                # Check if any frames were actually processed
+                frames_analyzed = len(analyzer.frame_metrics)
+                step(f"Tracking concluded. {frames_analyzed} frames analyzed.")
+                
+                if frames_analyzed == 0:
+                    step("⚠️  WARNING: No frames were processed. Check if the player was detected in the video.")
+                
                 gc.collect()
 
                 if check_cancel(cancel_event):
@@ -114,17 +121,19 @@ def run_full_analysis_job(
                 step("Synchronizing biomechanical datasets...")
                 json_out = os.path.join(data_dir, "analytics_unified.json")
                 csv_out = os.path.join(data_dir, "bio_metrics.csv")
-                trc_out = os.path.join(data_dir, "trajectories.trc")
-                mot_out = os.path.join(data_dir, "motions.mot")
                 report_out = os.path.join(data_dir, "report.txt")
 
                 unified_data = analyzer.export_unified(
                     json_path=json_out,
                     csv_path=csv_out,
-                    trc_path=trc_out,
-                    mot_path=mot_out,
                 )
-                unified_payload = cast(Dict[str, object], unified_data)
+                
+                if unified_data is None:
+                    step("WARNING: No frame metrics captured during video processing")
+                    unified_payload = {"metadata": {}, "frames": []}
+                else:
+                    unified_payload = cast(Dict[str, object], unified_data)
+                
                 unified_frames = unified_payload.get("frames", [])
 
                 if check_cancel(cancel_event):
@@ -133,12 +142,14 @@ def run_full_analysis_job(
                 with open(report_out, "w", encoding="utf-8") as f:
                     f.write(analyzer.get_report_string())
 
-                step("Synthesizing graphical metrics...")
-                plotter = AnalyticsPlotter(results_dir=results_dir, player_id=player_id)
-                plotter.generate_all(
-                    frame_metrics=analyzer.frame_metrics,
-                    bio_engine=analyzer.bio_engine
-                )
+                # --- Visualization disabled (preserve for future re-enable) ---
+                # from src.analytics.visualization import AnalyticsPlotter
+                # step("Synthesizing graphical metrics...")
+                # plotter = AnalyticsPlotter(results_dir=results_dir, player_id=player_id)
+                # plotter.generate_all(
+                #     frame_metrics=analyzer.frame_metrics,
+                #     bio_engine=analyzer.bio_engine,
+                # )
 
                 step("Uploading finalized assets to cloud storage...")
                 asset_prefix = f"jobs/{job_id}"
@@ -152,7 +163,8 @@ def run_full_analysis_job(
                     raise InterruptedError("Job cancelled by user.")
 
                 data_urls = upload_directory_to_supabase(data_dir, f"{asset_prefix}/data", cancel_event=cancel_event)
-                plot_urls = upload_directory_to_supabase(results_dir, f"{asset_prefix}/plots", cancel_event=cancel_event)
+                # plot_urls = upload_directory_to_supabase(results_dir, f"{asset_prefix}/plots", cancel_event=cancel_event)
+                plot_urls: Dict[str, str] = {}
                 sports2d_urls = upload_directory_to_supabase(s2d_dir, f"{asset_prefix}/Sports2D", cancel_event=cancel_event) if s2d_dir else {}
 
                 if check_cancel(cancel_event):

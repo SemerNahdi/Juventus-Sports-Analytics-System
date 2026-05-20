@@ -64,6 +64,33 @@
                 </div>
             </header>
 
+            <!-- In-progress job (shown while analysis runs on server) -->
+            <section id="jobProcessingSection" class="card glass" style="display: none; margin-bottom: 2rem;">
+                <div style="padding: 2rem; text-align: center;">
+                    <div class="job-processing-spinner" style="
+                        width: 64px; height: 64px; margin: 0 auto 1.5rem;
+                        border: 3px solid rgba(0, 240, 255, 0.15);
+                        border-top-color: var(--accent-neon, #00f0ff);
+                        border-radius: 50%;
+                        animation: spin 1s linear infinite;
+                    "></div>
+                    <h2 id="jobProcessingTitle" style="margin-bottom: 0.5rem;">Analysis in progress</h2>
+                    <p id="jobProcessingStatus" style="color: var(--text-secondary); margin-bottom: 1.25rem;">Initializing AI pipeline...</p>
+                    <div style="max-width: 480px; margin: 0 auto 1rem;">
+                        <div style="height: 6px; background: rgba(255,255,255,0.06); border-radius: 8px; overflow: hidden;">
+                            <div id="jobProcessingBar" style="width: 8%; height: 100%; background: linear-gradient(90deg, #00f0ff, #0099ff); transition: width 0.4s ease;"></div>
+                        </div>
+                    </div>
+                    <div id="jobProcessingLogs" style="
+                        max-width: 520px; margin: 0 auto 1.25rem; text-align: left;
+                        max-height: 140px; overflow-y: auto; font-size: 0.85rem; color: #94a3b8;
+                    "></div>
+                    <button type="button" class="btn btn-danger" id="dashboardCancelBtn" style="padding: 0.6rem 1.2rem;">
+                        <i class="fa-solid fa-stop-circle"></i> Cancel Analysis
+                    </button>
+                </div>
+            </section>
+
             <!-- Analysis History (Hidden by default) -->
             <section id="historySection" class="history-section card glass" style="display: none;">
                 <div class="card-header">
@@ -78,7 +105,7 @@
 
 
             <!-- Dashboard Grid -->
-            <div class="dashboard-grid">
+            <div class="dashboard-grid" id="dashboardGrid">
                 
                 <!-- Video Section -->
                 <section class="video-section card glass span-8">

@@ -23,7 +23,8 @@ import json
 import datetime
 from pathlib import Path
 
-from src.analytics.sports_analytics import SportsAnalyzer, Sports2DRunner, AnalyticsPlotter, HAS_SPORTS2D
+from src.analytics.sports_analytics import SportsAnalyzer, Sports2DRunner, HAS_SPORTS2D
+# from src.analytics.sports_analytics import AnalyticsPlotter  # visualization disabled
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -116,10 +117,9 @@ def main():
     sports2d_dir = output_dir / "Sports2D"  # keep native Sports2D folder unchanged
     media_dir = output_dir / "media"
     analytics_data_dir = output_dir / "analytics" / "data"
-    analytics_plots_dir = output_dir / "analytics" / "plots"
-    opensim_dir = output_dir / "opensim"
+    # analytics_plots_dir = output_dir / "analytics" / "plots"  # visualization disabled
 
-    for d in (output_dir, sports2d_dir, media_dir, analytics_data_dir, analytics_plots_dir, opensim_dir):
+    for d in (output_dir, sports2d_dir, media_dir, analytics_data_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     # Output paths
@@ -128,8 +128,6 @@ def main():
     csv_out = analytics_data_dir / "bio_metrics.csv"
     report_out = analytics_data_dir / "report.txt"
     perf_out = analytics_data_dir / "performance_metrics.json"
-    trc_out = opensim_dir / "player_markers.trc"
-    mot_out = opensim_dir / "joint_angles.mot"
 
     print("\n" + "=" * 70)
     print("   JUVENTUS SPORTS ANALYTICS v5")
@@ -208,42 +206,29 @@ def main():
     perf_breakdown["Step 3: Custom Tracking"] = time.time() - step3_start
 
     # ── Step 4: Unified Export ───────────────────────────────────────────────
-    print("\n[STEP 4/5] Exporting Unified Data (JSON + CSV + OpenSim)")
+    print("\n[STEP 4/5] Exporting Unified Data (JSON + CSV)")
     step4_start = time.time()
-    has_native_s2d_trc = False
-    has_native_s2d_mot = False
-    sports2d_runner = analyzer.sports2d_runner
-    if args.sports2d and sports2d_runner and sports2d_runner.outputs:
-        outputs = sports2d_runner.outputs
-        has_native_s2d_trc = bool(outputs.get("trc_pose_m") or outputs.get("trc_pose_px"))
-        has_native_s2d_mot = bool(outputs.get("mot_angles"))
-
-    # Avoid duplicate OpenSim exports when native Sports2D TRC/MOT already exist.
-    trc_export_path = None if has_native_s2d_trc else str(trc_out)
-    mot_export_path = None if has_native_s2d_mot else str(mot_out)
-
     analyzer.export_unified(
         json_path=str(json_out),
         csv_path=str(csv_out),
-        trc_path=trc_export_path,
-        mot_path=mot_export_path,
     )
     perf_breakdown["Step 4: Unified Export"] = time.time() - step4_start
 
-    # ── Step 5: Generate Plots & Report ──────────────────────────────────────
-    print("\n[STEP 5/5] Generating Analytical Plots & Report")
+    # ── Step 5: Report (plots disabled) ─────────────────────────────────────
+    print("\n[STEP 5/5] Generating Report")
     step5_start = time.time()
-    plotter = AnalyticsPlotter(results_dir=str(analytics_plots_dir), player_id=args.player)
-    plotter.generate_all(
-        frame_metrics=analyzer.frame_metrics,
-        bio_engine=analyzer.bio_engine,
-        mat_summary=analyzer.mat_summary,
-    )
+    # --- Visualization disabled (preserve for future re-enable) ---
+    # plotter = AnalyticsPlotter(results_dir=str(analytics_plots_dir), player_id=args.player)
+    # plotter.generate_all(
+    #     frame_metrics=analyzer.frame_metrics,
+    #     bio_engine=analyzer.bio_engine,
+    #     mat_summary=analyzer.mat_summary,
+    # )
 
     report_str = analyzer.get_report_string()
     with open(report_out, "w", encoding="utf-8") as f:
         f.write(report_str)
-    perf_breakdown["Step 5: Generate Plots & Report"] = time.time() - step5_start
+    perf_breakdown["Step 5: Generate Report"] = time.time() - step5_start
 
     # ── Final Summary ────────────────────────────────────────────────────────
     stop_cpu_sampler.set()
@@ -273,17 +258,13 @@ def main():
     print(f"   • Annotated Video     : {video_out}")
     print(f"   • Unified JSON        : {json_out}")
     print(f"   • Unified CSV         : {csv_out}")
-    if trc_export_path:
-        print(f"   • OpenSim TRC         : {trc_out}")
-    else:
-        print("   • OpenSim TRC         : reused native Sports2D TRC (not duplicated)")
-    if mot_export_path:
-        print(f"   • OpenSim MOT         : {mot_out}")
-    else:
-        print("   • OpenSim MOT         : reused native Sports2D MOT (not duplicated)")
     print(f"   • Report              : {report_out}")
-
-    print(f"\n📊 Plots saved to: {analytics_plots_dir}")
+    if args.sports2d and analyzer.sports2d_runner and analyzer.sports2d_runner.outputs:
+        s2d = analyzer.sports2d_runner.outputs
+        if s2d.get("trc_pose_m") or s2d.get("trc_pose_px"):
+            print(f"   • Sports2D TRC        : {sports2d_dir} (native)")
+        if s2d.get("mot_angles"):
+            print(f"   • Sports2D MOT        : {sports2d_dir} (native)")
 
     # ── Performance Logging ──────────────────────────────────────────────────
     perf_data = {

@@ -29,16 +29,6 @@ from .rendering import *
 from .reporting import *
 # from .mesh_generator import get_smpl_model
 
-try:
-    from .mesh_generator import get_smpl_model
-except ImportError:
-    def get_smpl_model(): return None
-
-try:
-    import fairmotion
-    HAS_FAIRMOTION = True
-except ImportError:
-    HAS_FAIRMOTION = False
 
 # Re-exporting flags specifically for clarity and compatibility
 # Some of these are already in the * imports above
@@ -63,7 +53,7 @@ __all__ = [
     "DetectionLayer", "get_detection_layer", "HAS_YOLO",
     
     # Pose & Rendering
-    "HybridPoseEstimator", "JointKalman", "PoseKalmanSmoother",
+    "HybridPoseEstimator", "PoseKalmanSmoother", "TemporalPoseModel",
     "draw_gradient_bone", "draw_glow_joint", "render_skeleton",
     
     # Biomechanics
@@ -101,14 +91,7 @@ def preload_all_models():
     except Exception as e:
         print(f" [!] YOLO Preload Failed: {e}")
 
-    # 2. SMPL Mesh Model
-    try:
-        print(" [SMPL] Pre-loading 3D Mesh model...")
-        get_smpl_model()
-    except Exception as e:
-        print(f" [!] SMPL Preload Failed: {e}")
-
-    # 3. Sports2D Warm-up
+    # 2. Sports2D Warm-up
     if HAS_SPORTS2D:
         try:
             print(" [S2D] Warming up Sports2D pipeline...")

@@ -236,38 +236,79 @@ class MATEventDetector:
 
     def extract_hop_event(self, frames: List[PoseFrame],
                          takeoff_idx: int, landing_idx: int, fps: float) -> dict:
-        """Extract biomechanics for one hop cycle."""
-        event_frames = frames[takeoff_idx:landing_idx+1]
+        """Extract biomechanics for one hop cycle, including stabilization phase."""
+        # Biomechanics for the jump phase (takeoff to landing)
+        jump_frames = frames[takeoff_idx:landing_idx+1]
+        
+        # Biomechanics for the stabilization phase (landing to end or +2 seconds)
+        stab_end_idx = min(len(frames), landing_idx + int(fps * 2.5))
+        full_event_frames = frames[takeoff_idx:stab_end_idx]
+        
         bio_engine = BiomechanicsEngine(fps=fps)
-        for pf in event_frames:
+        for pf in full_event_frames:
             bio_engine.process_frame(pf.frame_idx, pf.timestamp, pf.kp)
         bio_engine.post_process()
+
+        tts, stabilized_rel_idx = self._compute_tts(bio_engine, full_event_frames)
 
         return {
             "takeoff_idx": takeoff_idx,
             "landing_idx": landing_idx,
+            "stabilized_idx": takeoff_idx + stabilized_rel_idx,
             "flight_time": (landing_idx - takeoff_idx) / fps,
             "peak_knee_flexion_landing": self._peak_at_landing(bio_engine),
             "landing_valgus": self._valgus_at_landing(bio_engine),
-            "time_to_stabilization": self._compute_tts(bio_engine),
+            "time_to_stabilization": tts,
         }
 
     def _peak_at_landing(self, bio_engine: BiomechanicsEngine) -> float:
         if not bio_engine.frames: return 0.0
-        # Peak knee flexion usually occurs shortly after landing
-        flexions = [f.left_knee_flexion for f in bio_engine.frames] + [f.right_knee_flexion for f in bio_engine.frames]
-        return float(np.max(flexions)) if flexions else 0.0
+        # Peak knee flexion usually occurs shortly after landing (amortization phase)
+        # We look for the maximum flexion reached in the entire event window
+        l_flex = [f.left_knee_flexion for f in bio_engine.frames]
+        r_flex = [f.right_knee_flexion for f in bio_engine.frames]
+        all_flex = l_flex + r_flex
+        return float(np.max(all_flex)) if all_flex else 0.0
 
     def _valgus_at_landing(self, bio_engine: BiomechanicsEngine) -> float:
         if not bio_engine.frames: return 0.0
-        # Landing valgus is the value at the moment of impact or shortly after
-        valgus = [abs(f.left_valgus_clinical) for f in bio_engine.frames] + [abs(f.right_valgus_clinical) for f in bio_engine.frames]
-        return float(np.mean(valgus[:5])) if valgus else 0.0
+        # Landing valgus is the peak absolute valgus encountered during the landing phase
+        # High valgus (>10°) indicates increased risk of ACL injury
+        l_val = [abs(f.left_valgus_clinical) for f in bio_engine.frames]
+        r_val = [abs(f.right_valgus_clinical) for f in bio_engine.frames]
+        all_val = l_val + r_val
+        return float(np.max(all_val)) if all_val else 0.0
 
-    def _compute_tts(self, bio_engine: BiomechanicsEngine) -> float:
-        """Time to stabilization based on oscillation threshold."""
-        # Simplified: time until velocity stays below threshold
-        return 0.5 # Placeholder for now as per plan draft
+    def _compute_tts(self, bio_engine: BiomechanicsEngine, frames: List[PoseFrame]) -> Tuple[float, int]:
+        """
+        Time to stabilization (TTS) based on ankle vertical velocity stabilization.
+        Returns (seconds from window start, frame index relative to window start).
+        """
+        if len(frames) < 10:
+            return 0.0, 0
+
+        fps = bio_engine.fps
+
+        la_y = np.array([f.kp.left_ankle[1] for f in frames])
+        ra_y = np.array([f.kp.right_ankle[1] for f in frames])
+
+        la_v = np.abs(np.diff(la_y) * fps)
+        ra_v = np.abs(np.diff(ra_y) * fps)
+        v_mag = (la_v + ra_v) / 2.0
+
+        if len(v_mag) == 0:
+            return 0.0, 0
+
+        peak_v = np.max(v_mag)
+        threshold = max(peak_v * 0.05, 15.0)
+
+        stabilized_idx = len(v_mag) - 1
+        for i in range(len(v_mag) - 1, -1, -1):
+            if v_mag[i] > threshold:
+                stabilized_idx = i
+                break
+
+        return float(stabilized_idx / fps), int(stabilized_idx)
 
 
 class MATGridCalibrator:
